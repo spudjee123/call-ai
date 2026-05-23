@@ -19,7 +19,7 @@ function registerWebSocket(fastify) {
 
     console.log(`[WS] Connected callSid=${callSid}`)
 
-    // ส่งเสียง AI กลับ Twilio แล้วรอ mark กลับมาก่อนจึง unlock isSpeaking
+    // ส่งเสียง AI กลับ Twilio แล้ว unlock isSpeaking หลัง playback จบ
     async function speakAndWait(text, session, markName) {
       if (!callActive || socket.readyState !== socket.OPEN) return
 
@@ -35,10 +35,20 @@ function registerWebSocket(fastify) {
       }
       console.log(`[Audio] Sent ${sent}/${audioChunks.length} chunks`)
 
-      // ส่ง mark — isSpeaking จะถูก unlock เมื่อ Twilio ส่ง mark กลับมา
       if (socket.readyState === socket.OPEN) {
         socket.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: markName } }))
       }
+
+      // Fallback: unlock isSpeaking หลัง expected playback duration
+      // Twilio ไม่ส่ง mark กลับมาเสมอ → ใช้ timer เป็น safety net
+      // 160 bytes/chunk × 8000 bytes/sec = 20ms/chunk
+      const playbackMs = sent * 20 + 1500  // actual duration + 1.5s buffer
+      setTimeout(() => {
+        if (isSpeaking) {
+          console.log(`[Audio] Fallback unlock after ${playbackMs}ms (mark not received)`)
+          isSpeaking = false
+        }
+      }, playbackMs)
     }
 
     socket.on('message', async (rawMsg) => {
