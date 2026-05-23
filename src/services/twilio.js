@@ -1,7 +1,7 @@
 const twilio = require('twilio')
 const callSessions = require('../utils/callSessions')
 const { askClaude } = require('./claude')
-const { synthesizeSpeech } = require('./elevenlabs')
+const { synthesizeSpeech } = require('./tts')
 
 const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
 

@@ -1,7 +1,7 @@
 const callSessions = require('../utils/callSessions')
 const { transcribeStream } = require('../services/googleSTT')
 const { askClaude } = require('../services/claude')
-const { synthesizeSpeech } = require('../services/elevenlabs')
+const { synthesizeSpeech } = require('../services/tts')
 
 function registerWebSocket(fastify) {
   fastify.get('/stream', { websocket: true }, (connection, req) => {
