@@ -1,24 +1,40 @@
 const axios = require('axios')
+const { pcm16BufferToMulaw } = require('../utils/audioConverter')
 
 const API_KEY = process.env.ELEVENLABS_API_KEY
 const BASE_URL = 'https://api.elevenlabs.io/v1'
 
-// ulaw 8kHz — ตรงกับ Twilio Media Streams โดยไม่ต้องแปลง
-const OUTPUT_FORMAT = 'ulaw_8000'
+// ขอ 16kHz PCM จาก ElevenLabs แทน ulaw_8000 โดยตรง
+// เพราะ ElevenLabs model สร้างเสียงคุณภาพสูงกว่าที่ 16kHz
+// แล้วเรา downsample 16k→8k เอง ได้คุณภาพดีกว่า
+const OUTPUT_FORMAT = 'pcm_16000'
+
+// Downsample 16kHz PCM → 8kHz PCM โดย average ทุก 2 samples
+// integer ratio 2:1 = clean, ไม่มี interpolation artifact
+// การ average เป็น low-pass filter ตัด frequency > 4kHz (Nyquist สำหรับ 8kHz)
+function downsample16to8(pcm16k) {
+  const outSamples = Math.floor(pcm16k.length / 4)  // 2 bytes/sample, 2:1 ratio
+  const out = Buffer.alloc(outSamples * 2)
+  for (let i = 0; i < outSamples; i++) {
+    const s1 = pcm16k.readInt16LE(i * 4)
+    const s2 = pcm16k.readInt16LE(i * 4 + 2)
+    out.writeInt16LE(Math.round((s1 + s2) / 2), i * 2)
+  }
+  return out
+}
 
 async function synthesizeSpeech(text, voiceId) {
   voiceId = voiceId || process.env.ELEVENLABS_VOICE_ID
-  console.log(`[ElevenLabs] Requesting voiceId=${voiceId} format=${OUTPUT_FORMAT} text="${text.substring(0, 60)}"`)
+  console.log(`[ElevenLabs] Requesting voiceId=${voiceId} text="${text.substring(0, 60)}"`)
 
-  // output_format MUST be a query parameter — ElevenLabs ignores it in the body
   const response = await axios.post(
     `${BASE_URL}/text-to-speech/${voiceId}?output_format=${OUTPUT_FORMAT}`,
     {
       text,
       model_id: 'eleven_multilingual_v2',
       voice_settings: {
-        stability: 0.75,
-        similarity_boost: 0.85,
+        stability: 0.85,        // สูง = เสียงสม่ำเสมอ ไม่สั่น เหมาะกับ cloned voice
+        similarity_boost: 0.90, // สูง = ใกล้เสียงต้นฉบับที่ clone มา
         style: 0.0,
         use_speaker_boost: true
       },
@@ -32,34 +48,21 @@ async function synthesizeSpeech(text, voiceId) {
     }
   )
 
-  const contentType = response.headers['content-type'] || ''
-  let audioBuffer = Buffer.from(response.data)
-  const first4 = audioBuffer.slice(0, 4).toString('ascii')
-  console.log(`[ElevenLabs] Got ${audioBuffer.length} bytes, contentType="${contentType}", first4="${first4.replace(/[^\x20-\x7E]/g, '?')}"`)
+  const pcm16k = Buffer.from(response.data)
+  console.log(`[ElevenLabs] Got ${pcm16k.length} bytes PCM@16kHz`)
 
-  // Strip WAV header if ElevenLabs returned a WAV container instead of raw μ-law
-  if (first4 === 'RIFF') {
-    let offset = 12
-    while (offset < audioBuffer.length - 8) {
-      const chunkId = audioBuffer.slice(offset, offset + 4).toString('ascii')
-      const chunkSize = audioBuffer.readUInt32LE(offset + 4)
-      if (chunkId === 'data') {
-        audioBuffer = audioBuffer.slice(offset + 8, offset + 8 + chunkSize)
-        console.log(`[ElevenLabs] Stripped WAV header, raw audio: ${audioBuffer.length} bytes`)
-        break
-      }
-      offset += 8 + chunkSize
-    }
-  }
+  // downsample 16kHz → 8kHz → encode μ-law
+  const pcm8k = downsample16to8(pcm16k)
+  const mulaw = pcm16BufferToMulaw(pcm8k)
+  console.log(`[ElevenLabs] Converted: ${pcm16k.length}B@16k → ${pcm8k.length}B@8k → ${mulaw.length}B μ-law`)
 
-  // 160 bytes = 20ms @ 8kHz μ-law (1 byte/sample)
-  const chunkSize = 160
+  // 160 bytes = 20ms @ 8kHz μ-law
   const chunks = []
-  for (let i = 0; i < audioBuffer.length; i += chunkSize) {
-    chunks.push(audioBuffer.slice(i, i + chunkSize))
+  for (let i = 0; i < mulaw.length; i += 160) {
+    chunks.push(mulaw.slice(i, i + 160))
   }
 
-  console.log(`[ElevenLabs] ${chunks.length} chunks (${chunkSize}B each) ready`)
+  console.log(`[ElevenLabs] ${chunks.length} chunks ready`)
   return chunks
 }
 
