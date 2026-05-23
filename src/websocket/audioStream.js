@@ -6,7 +6,9 @@ const { synthesizeSpeech } = require('../services/elevenlabs')
 
 function registerWebSocket(fastify) {
   fastify.get('/stream', { websocket: true }, (socket, req) => {
-    const callSid = req.query.callSid
+    const rawUrl = req.url || ''
+    const qs = rawUrl.includes('?') ? rawUrl.split('?')[1] : ''
+    let callSid = new URLSearchParams(qs).get('callSid')
     let streamSid = null
     let sttStream = null
     let isSpeaking = false
@@ -19,6 +21,7 @@ function registerWebSocket(fastify) {
 
       if (msg.event === 'start') {
         streamSid = msg.start.streamSid
+        if (!callSid) callSid = msg.start.callSid
         const session = callSessions.get(callSid)
         if (!session) return
 
