@@ -6,11 +6,6 @@ const { synthesizeSpeech } = require('../services/elevenlabs')
 
 function registerWebSocket(fastify) {
   fastify.get('/stream', { websocket: true }, (connection, req) => {
-    // Diagnose both params to find the actual WebSocket
-    console.log(`[WS] param1 type=${connection?.constructor?.name} hasSend=${typeof connection?.send} hasOn=${typeof connection?.on}`)
-    console.log(`[WS] param2 type=${req?.constructor?.name} hasSend=${typeof req?.send} hasOn=${typeof req?.on}`)
-
-    // WebSocket has .send() — find it in either param
     const socket = (typeof connection.send === 'function') ? connection
       : (typeof req?.send === 'function') ? req
       : (connection.socket || connection)
@@ -22,7 +17,7 @@ function registerWebSocket(fastify) {
     let sttStream = null
     let isSpeaking = false
 
-    console.log(`[WS] socket resolved: type=${socket?.constructor?.name} callSid=${callSid}`)
+    console.log(`[WS] Connected callSid=${callSid}`)
 
     socket.on('message', async (rawMsg) => {
       let msg
@@ -120,24 +115,27 @@ function registerWebSocket(fastify) {
       }
 
       if (msg.event === 'media' && sttStream) {
-        const audioData = Buffer.from(msg.media.payload, 'base64')
-        sttStream.write(audioData)
+        try {
+          const audioData = Buffer.from(msg.media.payload, 'base64')
+          sttStream.write(audioData)
+        } catch (e) {
+          sttStream = null
+        }
       }
 
       if (msg.event === 'mark') {
-        // ลูกค้าได้ยิน AI พูดจบแล้ว
         isSpeaking = false
       }
 
       if (msg.event === 'stop') {
         console.log(`[WS] Stream stopped: ${callSid}`)
-        if (sttStream) sttStream.end()
+        if (sttStream) { sttStream.end(); sttStream = null }
       }
     })
 
     socket.on('close', () => {
       console.log(`[WS] Disconnected: ${callSid}`)
-      if (sttStream) sttStream.end()
+      if (sttStream) { sttStream.end(); sttStream = null }
     })
 
     socket.on('error', (err) => {
