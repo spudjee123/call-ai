@@ -16,7 +16,6 @@ async function synthesizeSpeech(text, voiceId) {
     {
       text,
       model_id: 'eleven_multilingual_v2',
-      language_code: 'th',
       voice_settings: {
         stability: 0.75,
         similarity_boost: 0.85,
