@@ -14,10 +14,11 @@ let sheets = null
 
 async function getClient() {
   if (sheets) return sheets
-  const auth = new google.auth.GoogleAuth({
-    keyFile: process.env.GOOGLE_APPLICATION_CREDENTIALS,
-    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-  })
+  const authOptions = { scopes: ['https://www.googleapis.com/auth/spreadsheets'] }
+  if (process.env.GOOGLE_CREDENTIALS_JSON) {
+    authOptions.credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON)
+  }
+  const auth = new google.auth.GoogleAuth(authOptions)
   sheets = google.sheets({ version: 'v4', auth })
   return sheets
 }

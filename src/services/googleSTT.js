@@ -1,7 +1,11 @@
 const speech = require('@google-cloud/speech')
 const { mulawBufferToPcm16 } = require('../utils/audioConverter')
 
-const client = new speech.SpeechClient()
+const clientOptions = {}
+if (process.env.GOOGLE_CREDENTIALS_JSON) {
+  clientOptions.credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON)
+}
+const client = new speech.SpeechClient(clientOptions)
 
 function transcribeStream(onTranscript) {
   const request = {
