@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>AI Call Dashboard</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: sans-serif; background: #f5f5f5; color: #333; }
+    .header { background: #1a1a2e; color: white; padding: 16px 24px; display: flex; align-items: center; gap: 12px; }
+    .header h1 { font-size: 20px; }
+    .badge { background: #e94560; color: white; padding: 2px 8px; border-radius: 12px; font-size: 12px; }
+    .container { padding: 20px; max-width: 1200px; margin: 0 auto; }
+    .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 24px; }
+    .stat-card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+    .stat-card .label { font-size: 13px; color: #666; margin-bottom: 8px; }
+    .stat-card .value { font-size: 32px; font-weight: bold; }
+    .card { background: white; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); margin-bottom: 20px; }
+    .card-header { padding: 16px 20px; border-bottom: 1px solid #eee; display: flex; justify-content: space-between; align-items: center; }
+    .card-header h2 { font-size: 16px; }
+    .card-body { padding: 20px; }
+    select, button { padding: 8px 16px; border-radius: 6px; border: 1px solid #ddd; font-size: 14px; cursor: pointer; }
+    .btn-start { background: #27ae60; color: white; border: none; }
+    .btn-stop { background: #e74c3c; color: white; border: none; }
+    .btn-refresh { background: #3498db; color: white; border: none; }
+    button:hover { opacity: 0.85; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid #eee; font-size: 13px; }
+    th { background: #f8f8f8; font-weight: 600; color: #555; }
+    .badge-outcome { padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+    .interested { background: #d5f5e3; color: #1e8449; }
+    .not_interested { background: #fadbd8; color: #922b21; }
+    .callback { background: #fdebd0; color: #784212; }
+    .no_answer { background: #eaecee; color: #566573; }
+    .active-dot { display: inline-block; width: 8px; height: 8px; background: #27ae60; border-radius: 50%; animation: pulse 1s infinite; margin-right: 6px; }
+    @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+    .empty { text-align: center; color: #aaa; padding: 40px; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>AI Call Dashboard</h1>
+    <span class="badge" id="activeBadge">0 Active</span>
+  </div>
+
+  <div class="container">
+    <div class="stats">
+      <div class="stat-card">
+        <div class="label">โทรทั้งหมด</div>
+        <div class="value" id="statTotal">-</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">สนใจ</div>
+        <div class="value" style="color:#27ae60" id="statInterested">-</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">นัด Callback</div>
+        <div class="value" style="color:#e67e22" id="statCallback">-</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">ไม่รับสาย</div>
+        <div class="value" style="color:#95a5a6" id="statNoAnswer">-</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <h2>จัดการ Campaign</h2>
+      </div>
+      <div class="card-body" style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+        <select id="campaignSelect"><option value="">-- เลือก Campaign --</option></select>
+        <button class="btn-start" onclick="startCampaign()">▶ เริ่มโทร</button>
+        <button class="btn-stop" onclick="stopCampaign()">■ หยุด</button>
+        <span id="campaignMsg" style="color:#666;font-size:13px"></span>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <h2><span class="active-dot"></span>Active Calls</h2>
+        <button class="btn-refresh" onclick="loadActive()">รีเฟรช</button>
+      </div>
+      <div class="card-body">
+        <table>
+          <thead><tr><th>เบอร์</th><th>ชื่อ</th><th>เวลา (วิ)</th><th>ข้อความ</th></tr></thead>
+          <tbody id="activeTable"><tr><td colspan="4" class="empty">ไม่มีสายที่กำลังโทร</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <h2>Call History</h2>
+        <button class="btn-refresh" onclick="loadLogs()">รีเฟรช</button>
+      </div>
+      <div class="card-body">
+        <table>
+          <thead><tr><th>เบอร์</th><th>ชื่อ</th><th>ผล</th><th>สรุป</th><th>เวลา</th></tr></thead>
+          <tbody id="logTable"><tr><td colspan="5" class="empty">ยังไม่มีข้อมูล</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    window.onload = () => { loadCampaigns(); loadStats(); loadActive(); loadLogs(); }
+
+    function loadCampaigns() {
+      google.script.run.withSuccessHandler(campaigns => {
+        const sel = document.getElementById('campaignSelect')
+        campaigns.forEach(c => {
+          const opt = document.createElement('option')
+          opt.value = c.id || c.ID
+          opt.text = c.name || c.Name || c.id
+          sel.appendChild(opt)
+        })
+      }).getCampaigns()
+    }
+
+    function loadStats() {
+      google.script.run.withSuccessHandler(stats => {
+        document.getElementById('statTotal').textContent = stats.total || 0
+        document.getElementById('statInterested').textContent = (stats.outcomes && stats.outcomes.interested) || 0
+        document.getElementById('statCallback').textContent = (stats.outcomes && stats.outcomes.callback) || 0
+        document.getElementById('statNoAnswer').textContent = (stats.outcomes && stats.outcomes.no_answer) || 0
+      }).getStats()
+    }
+
+    function loadActive() {
+      google.script.run.withSuccessHandler(calls => {
+        const badge = document.getElementById('activeBadge')
+        badge.textContent = `${calls.length} Active`
+        const tbody = document.getElementById('activeTable')
+        if (!calls.length) { tbody.innerHTML = '<tr><td colspan="4" class="empty">ไม่มีสายที่กำลังโทร</td></tr>'; return }
+        tbody.innerHTML = calls.map(c => `
+          <tr>
+            <td>${c.phone}</td>
+            <td>${c.name}</td>
+            <td>${c.duration}</td>
+            <td>${c.messageCount} ข้อความ</td>
+          </tr>`).join('')
+      }).getActiveCalls()
+    }
+
+    function loadLogs() {
+      const campaignId = document.getElementById('campaignSelect').value || null
+      google.script.run.withSuccessHandler(logs => {
+        const tbody = document.getElementById('logTable')
+        if (!logs.length) { tbody.innerHTML = '<tr><td colspan="5" class="empty">ยังไม่มีข้อมูล</td></tr>'; return }
+        tbody.innerHTML = logs.map(l => `
+          <tr>
+            <td>${l.phone || ''}</td>
+            <td>${l.name || ''}</td>
+            <td><span class="badge-outcome ${l.outcome || ''}">${l.outcome || ''}</span></td>
+            <td>${l.summary || ''}</td>
+            <td>${(l.timestamp || '').substring(0, 16)}</td>
+          </tr>`).join('')
+      }).getCallLogs(campaignId)
+    }
+
+    function startCampaign() {
+      const id = document.getElementById('campaignSelect').value
+      if (!id) { document.getElementById('campaignMsg').textContent = 'กรุณาเลือก campaign'; return }
+      document.getElementById('campaignMsg').textContent = 'กำลังเริ่ม...'
+      google.script.run.withSuccessHandler(res => {
+        document.getElementById('campaignMsg').textContent = `✓ ${res.message} (${res.count} contacts)`
+        setTimeout(loadStats, 2000)
+      }).startCampaign(id)
+    }
+
+    function stopCampaign() {
+      const id = document.getElementById('campaignSelect').value
+      if (!id) { document.getElementById('campaignMsg').textContent = 'กรุณาเลือก campaign'; return }
+      google.script.run.withSuccessHandler(res => {
+        document.getElementById('campaignMsg').textContent = `■ หยุดแล้ว`
+      }).stopCampaign(id)
+    }
+
+    setInterval(() => { loadActive(); loadStats(); }, 10000)
+  </script>
+</body>
+</html>

@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm *)",
+      "Bash(node *)",
+      "Bash(npx *)",
+      "PowerShell(npm *)",
+      "PowerShell(node *)",
+      "PowerShell(npx *)",
+      "PowerShell(New-Item *)",
+      "PowerShell(mkdir *)",
+      "PowerShell(ls *)",
+      "PowerShell(Get-ChildItem *)",
+      "PowerShell(cd *)",
+      "PowerShell(Set-Location *)",
+      "Write",
+      "Edit",
+      "Read"
+    ]
+  }
+}
