@@ -10,8 +10,9 @@ async function synthesizeSpeech(text, voiceId) {
   voiceId = voiceId || process.env.ELEVENLABS_VOICE_ID
   console.log(`[ElevenLabs] Requesting voiceId=${voiceId} format=${OUTPUT_FORMAT} text="${text.substring(0, 60)}"`)
 
+  // output_format MUST be a query parameter — ElevenLabs ignores it in the body
   const response = await axios.post(
-    `${BASE_URL}/text-to-speech/${voiceId}`,
+    `${BASE_URL}/text-to-speech/${voiceId}?output_format=${OUTPUT_FORMAT}`,
     {
       text,
       model_id: 'eleven_flash_v2_5',
@@ -21,13 +22,11 @@ async function synthesizeSpeech(text, voiceId) {
         style: 0.0,
         use_speaker_boost: true
       },
-      output_format: OUTPUT_FORMAT,
     },
     {
       headers: {
         'xi-api-key': API_KEY,
         'Content-Type': 'application/json',
-        'Accept': 'audio/basic',
       },
       responseType: 'arraybuffer',
     }

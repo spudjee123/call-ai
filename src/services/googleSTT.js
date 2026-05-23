@@ -8,6 +8,8 @@ if (process.env.GOOGLE_CREDENTIALS_JSON) {
 const client = new speech.SpeechClient(clientOptions)
 
 function transcribeStream(onTranscript) {
+  let destroyed = false
+
   const request = {
     config: {
       encoding: 'LINEAR16',
@@ -27,7 +29,7 @@ function transcribeStream(onTranscript) {
   const recognizeStream = client
     .streamingRecognize(request)
     .on('error', (err) => {
-      // stream หมดอายุหลัง 5 นาที เป็นเรื่องปกติ
+      destroyed = true
       if (err.code !== 11) console.error('[STT error]', err.message)
     })
     .on('data', (data) => {
@@ -38,14 +40,16 @@ function transcribeStream(onTranscript) {
       }
     })
 
-  // wrapper ที่รับ mulaw buffer จาก Twilio แล้วแปลงก่อนส่ง STT
   return {
     write(mulawBuffer) {
+      if (destroyed) return
       const pcm = mulawBufferToPcm16(mulawBuffer)
       recognizeStream.write(pcm)
     },
     end() {
-      recognizeStream.end()
+      if (destroyed) return
+      destroyed = true
+      try { recognizeStream.end() } catch (e) {}
     }
   }
 }
