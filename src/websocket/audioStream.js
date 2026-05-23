@@ -6,17 +6,23 @@ const { synthesizeSpeech } = require('../services/elevenlabs')
 
 function registerWebSocket(fastify) {
   fastify.get('/stream', { websocket: true }, (connection, req) => {
-    // @fastify/websocket v11: connection IS the ws.WebSocket directly (has .send)
-    // connection.socket = underlying net.Socket — do NOT use that
-    const socket = (typeof connection.send === 'function') ? connection : (connection.socket || connection)
-    const rawUrl = (req && req.url) || ''
+    // Diagnose both params to find the actual WebSocket
+    console.log(`[WS] param1 type=${connection?.constructor?.name} hasSend=${typeof connection?.send} hasOn=${typeof connection?.on}`)
+    console.log(`[WS] param2 type=${req?.constructor?.name} hasSend=${typeof req?.send} hasOn=${typeof req?.on}`)
+
+    // WebSocket has .send() — find it in either param
+    const socket = (typeof connection.send === 'function') ? connection
+      : (typeof req?.send === 'function') ? req
+      : (connection.socket || connection)
+
+    const rawUrl = (connection?.url || req?.url || '')
     const qs = rawUrl.includes('?') ? rawUrl.split('?')[1] : ''
     let callSid = new URLSearchParams(qs).get('callSid')
     let streamSid = null
     let sttStream = null
     let isSpeaking = false
 
-    console.log(`[WS] Connected callSid=${callSid}, socket type=${socket?.constructor?.name}, hasOn=${typeof socket?.on}`)
+    console.log(`[WS] socket resolved: type=${socket?.constructor?.name} callSid=${callSid}`)
 
     socket.on('message', async (rawMsg) => {
       let msg
