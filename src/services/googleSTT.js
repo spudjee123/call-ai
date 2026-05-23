@@ -27,7 +27,8 @@ function transcribeStream(onTranscript) {
   let errorRetryCount = 0
 
   function createStream() {
-    if (destroyed) return
+    if (destroyed || currentStream) return  // ป้องกัน double-creation
+    console.log('[STT] Creating new stream')
 
     const stream = client.streamingRecognize({
       config: STT_CONFIG,
@@ -56,8 +57,8 @@ function transcribeStream(onTranscript) {
       }
     })
     .on('end', () => {
-      // stream จบ (เช่น Google หมดเวลา) → recreate
       if (!destroyed) {
+        console.log('[STT] Stream ended, recreating...')
         currentStream = null
         setTimeout(createStream, 100)
       }
@@ -75,7 +76,9 @@ function transcribeStream(onTranscript) {
         const pcm = mulawBufferToPcm16(mulawBuffer)
         currentStream.write(pcm)
       } catch (e) {
+        console.error('[STT] write error, recreating stream:', e.message)
         currentStream = null
+        setTimeout(createStream, 100)  // recreate ทันที ไม่รอ zombie stream
       }
     },
     end() {

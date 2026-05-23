@@ -15,14 +15,14 @@ async function askClaude(session, isGreeting = false) {
 
   // ถ้าเป็นการทักทายครั้งแรก ไม่ต้องรอ user พูดก่อน
   const msgs = isGreeting
-    ? [{ role: 'user', content: 'เริ่มต้นการสนทนา' }]
+    ? [{ role: 'user', content: 'ทักทายและแนะนำตัวสั้นๆ 1 ประโยค ยังไม่ต้องพูดรายละเอียดโปรโมชั่น' }]
     : history
 
   if (!msgs.length) return 'สวัสดีครับ'
 
   const response = await client.messages.create({
     model: 'claude-haiku-4-5-20251001',
-    max_tokens: 80,
+    max_tokens: isGreeting ? 40 : 80,
     system: systemPrompt,
     messages: msgs,
   })
