@@ -16,7 +16,9 @@ function registerWebSocket(fastify) {
     let sttStream = null
     let isSpeaking = false
     let callActive = true
-    let abortController = null  // barge-in: cancel ongoing TTS stream
+    let abortController = null    // barge-in: cancel ongoing TTS stream
+    let sttProcessing = false     // mutex: ป้องกัน concurrent Claude calls
+    let bargeInCooldown = false   // cooldown หลัง barge-in ป้องกัน echo false-trigger
 
     console.log(`[WS] Connected callSid=${callSid}`)
 
@@ -95,17 +97,29 @@ function registerWebSocket(fastify) {
         sttStream = transcribeStream(async (transcript) => {
           if (!transcript || !callActive) return
           if (socket.readyState !== socket.OPEN) return
+          if (bargeInCooldown || sttProcessing) return  // skip ถ้ายังอยู่ใน cooldown หรือ busy
+
           const currentSession = callSessions.get(callSid)
           if (!currentSession) return
 
           console.log(`[STT] "${transcript}"`)
 
-          // Barge-in: ลูกค้าพูดแทรงขณะ AI กำลังพูดอยู่
+          // Barge-in: ตรวจสอบว่าเป็นเสียงจริง ไม่ใช่ echo ของ AI
           if (isSpeaking) {
+            const wordCount = transcript.trim().split(/\s+/).length
+            if (wordCount < 2 && transcript.length < 8) {
+              // Fragment สั้น = echo หรือ noise → ไม่ barge-in
+              console.log(`[STT] Short fragment during AI speech — ignoring echo: "${transcript}"`)
+              return
+            }
             bargeIn()
-            await new Promise(r => setTimeout(r, 150))  // รอ clear event ส่งก่อน
+            bargeInCooldown = true
+            setTimeout(() => { bargeInCooldown = false }, 800)
+            await new Promise(r => setTimeout(r, 200))
           }
 
+          if (sttProcessing) return  // double-check หลัง await
+          sttProcessing = true
           currentSession.messages.push({ role: 'user', content: transcript })
           isSpeaking = true
           try {
@@ -121,8 +135,9 @@ function registerWebSocket(fastify) {
           } catch (err) {
             console.error('[AI/TTS error]', err.message)
             isSpeaking = false
+          } finally {
+            sttProcessing = false
           }
-          // ไม่ใส่ finally { isSpeaking = false } — รอ mark event จาก Twilio แทน
         })
 
         // AI ทักทายก่อนเลย — ใช้ pre-generated audio ถ้ามี (ลด latency)
