@@ -1,5 +1,4 @@
 const callSessions = require('../utils/callSessions')
-const { mulawBufferToPcm16, pcm16BufferToMulaw } = require('../utils/audioConverter')
 const { transcribeStream } = require('../services/googleSTT')
 const { askClaude } = require('../services/claude')
 const { synthesizeSpeech } = require('../services/elevenlabs')
@@ -16,15 +15,38 @@ function registerWebSocket(fastify) {
     let streamSid = null
     let sttStream = null
     let isSpeaking = false
+    let callActive = true
 
     console.log(`[WS] Connected callSid=${callSid}`)
+
+    // ส่งเสียง AI กลับ Twilio แล้วรอ mark กลับมาก่อนจึง unlock isSpeaking
+    async function speakAndWait(text, session, markName) {
+      if (!callActive || socket.readyState !== socket.OPEN) return
+
+      const audioChunks = await synthesizeSpeech(text, session.campaign.voice_id)
+      console.log(`[Audio] Sending ${audioChunks.length} chunks for mark=${markName}`)
+
+      let sent = 0
+      for (const chunk of audioChunks) {
+        if (socket.readyState === socket.OPEN) {
+          socket.send(JSON.stringify({ event: 'media', streamSid, media: { payload: chunk.toString('base64') } }))
+          sent++
+        }
+      }
+      console.log(`[Audio] Sent ${sent}/${audioChunks.length} chunks`)
+
+      // ส่ง mark — isSpeaking จะถูก unlock เมื่อ Twilio ส่ง mark กลับมา
+      if (socket.readyState === socket.OPEN) {
+        socket.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: markName } }))
+      }
+    }
 
     socket.on('message', async (rawMsg) => {
       let msg
       try {
         msg = JSON.parse(rawMsg)
       } catch (e) {
-        console.error('[WS] Parse error:', e.message, 'type:', typeof rawMsg, 'isBuffer:', Buffer.isBuffer(rawMsg))
+        console.error('[WS] Parse error:', e.message)
         return
       }
       console.log(`[WS] Event received: ${msg.event}`)
@@ -40,57 +62,37 @@ function registerWebSocket(fastify) {
 
         // เริ่ม STT stream
         sttStream = transcribeStream(async (transcript) => {
-          if (!transcript || isSpeaking) return
+          // Block ถ้า: กำลังพูดอยู่, สายตัดแล้ว, socket ปิดแล้ว
+          if (!transcript || isSpeaking || !callActive) return
+          if (socket.readyState !== socket.OPEN) return
+          const currentSession = callSessions.get(callSid)
+          if (!currentSession) return
+
           console.log(`[STT] "${transcript}"`)
+          currentSession.messages.push({ role: 'user', content: transcript })
 
-          session.messages.push({ role: 'user', content: transcript })
-
-          // ส่งให้ Claude
           isSpeaking = true
           try {
-            const aiText = await askClaude(session)
+            const aiText = await askClaude(currentSession)
             console.log(`[AI] "${aiText}"`)
+            currentSession.messages.push({ role: 'assistant', content: aiText })
 
-            session.messages.push({ role: 'assistant', content: aiText })
+            await speakAndWait(aiText, currentSession, 'ai_done')
 
-            // ส่งให้ ElevenLabs แปลงเป็นเสียง
-            const audioChunks = await synthesizeSpeech(aiText, session.campaign.voice_id)
-
-            // ส่งเสียงกลับ Twilio (ElevenLabs ส่ง ulaw_8000 มาตรงๆ ไม่ต้องแปลง)
-            for (const chunk of audioChunks) {
-              const payload = {
-                event: 'media',
-                streamSid,
-                media: { payload: chunk.toString('base64') }
-              }
-              if (socket.readyState === socket.OPEN) {
-                socket.send(JSON.stringify(payload))
-              }
-            }
-
-            // ส่ง mark เมื่อพูดจบ
-            if (socket.readyState === socket.OPEN) {
-              socket.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'ai_done' } }))
-            }
-
-            // เช็คว่า AI ต้องการจบสาย
             if (aiText.includes('[END_CALL]')) {
-              setTimeout(() => {
-                if (socket.readyState === socket.OPEN) socket.close()
-              }, 3000)
+              setTimeout(() => { if (socket.readyState === socket.OPEN) socket.close() }, 3000)
             }
-
           } catch (err) {
             console.error('[AI/TTS error]', err.message)
-          } finally {
             isSpeaking = false
           }
+          // ไม่ใส่ finally { isSpeaking = false } — รอ mark event จาก Twilio แทน
         })
 
         // AI ทักทายก่อนเลย
         setTimeout(async () => {
           const session = callSessions.get(callSid)
-          if (!session) { console.log('[Greeting] No session found'); return }
+          if (!session || !callActive) return
           isSpeaking = true
           try {
             console.log(`[Greeting] Calling Claude...`)
@@ -98,52 +100,43 @@ function registerWebSocket(fastify) {
             console.log(`[Greeting] "${greeting.substring(0, 100)}"`)
             session.messages.push({ role: 'assistant', content: greeting })
 
-            const audioChunks = await synthesizeSpeech(greeting, session.campaign.voice_id)
-            console.log(`[Greeting] Sending ${audioChunks.length} chunks, readyState=${socket.readyState}`)
-            let sent = 0
-            for (const chunk of audioChunks) {
-              if (socket.readyState === socket.OPEN) {
-                socket.send(JSON.stringify({
-                  event: 'media',
-                  streamSid,
-                  media: { payload: chunk.toString('base64') }
-                }))
-                sent++
-              }
-            }
-            console.log(`[Greeting] Sent ${sent}/${audioChunks.length} chunks`)
-            if (socket.readyState === socket.OPEN) {
-              socket.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'greeting_done' } }))
-            }
+            await speakAndWait(greeting, session, 'greeting_done')
           } catch (err) {
-            console.error('[Greeting error]', err.message, err.stack)
-          } finally {
+            console.error('[Greeting error]', err.message)
             isSpeaking = false
           }
+          // ไม่ใส่ finally — รอ mark event จาก Twilio แทน
         }, 1000)
       }
 
       if (msg.event === 'media' && sttStream) {
-        try {
-          const audioData = Buffer.from(msg.media.payload, 'base64')
-          sttStream.write(audioData)
-        } catch (e) {
-          sttStream = null
+        // ไม่ส่งเสียงให้ STT ขณะ AI กำลังพูดอยู่ (ป้องกัน AI ได้ยินตัวเอง)
+        if (!isSpeaking) {
+          try {
+            const audioData = Buffer.from(msg.media.payload, 'base64')
+            sttStream.write(audioData)
+          } catch (e) {
+            sttStream = null
+          }
         }
       }
 
       if (msg.event === 'mark') {
+        console.log(`[WS] Mark received: ${msg.mark?.name}`)
+        // Twilio ยืนยันว่าเล่นเสียง AI จบแล้ว → unlock รับคำพูดลูกค้าได้
         isSpeaking = false
       }
 
       if (msg.event === 'stop') {
         console.log(`[WS] Stream stopped: ${callSid}`)
+        callActive = false
         if (sttStream) { sttStream.end(); sttStream = null }
       }
     })
 
     socket.on('close', () => {
       console.log(`[WS] Disconnected: ${callSid}`)
+      callActive = false
       if (sttStream) { sttStream.end(); sttStream = null }
     })
 

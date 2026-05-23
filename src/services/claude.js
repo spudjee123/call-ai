@@ -81,7 +81,7 @@ function buildSystemPrompt(campaignPrompt, customerName, offTopicCount) {
   return `${campaignPrompt}
 
 ชื่อลูกค้า: ${customerName}
-คำตอบต้องสั้น กระชับ ภาษาไทย ไม่เกิน 2-3 ประโยค เหมาะกับการพูด ไม่ใช้ bullet points หรือ markdown
+คำตอบต้องสั้น กระชับ ภาษาไทย ไม่เกิน 2-3 ประโยค เหมาะกับการพูด ไม่ใช้ bullet points, markdown, emoji หรือสัญลักษณ์พิเศษใดๆ ทั้งสิ้น ตอบเป็นประโยคธรรมดาเท่านั้น
 
 ${offTopicInstruction}
 
