@@ -99,24 +99,46 @@ function registerWebSocket(fastify) {
           // ไม่ใส่ finally { isSpeaking = false } — รอ mark event จาก Twilio แทน
         })
 
-        // AI ทักทายก่อนเลย
-        setTimeout(async () => {
+        // AI ทักทายก่อนเลย — ใช้ pre-generated audio ถ้ามี (ลด latency)
+        const playGreeting = async () => {
           const session = callSessions.get(callSid)
           if (!session || !callActive) return
           isSpeaking = true
           try {
-            console.log(`[Greeting] Calling Claude...`)
-            const greeting = await askClaude(session, true)
-            console.log(`[Greeting] "${greeting.substring(0, 100)}"`)
-            session.messages.push({ role: 'assistant', content: greeting })
-
-            await speakAndWait(greeting, session, 'greeting_done')
+            if (session.greetingChunks) {
+              // ใช้ audio ที่ pre-generate ไว้แล้ว — ส่งได้ทันที
+              console.log(`[Greeting] Using pre-generated audio (${session.greetingChunks.length} chunks)`)
+              const chunks = session.greetingChunks
+              session.greetingChunks = null  // ใช้แล้วล้างทิ้ง
+              let sent = 0
+              for (const chunk of chunks) {
+                if (socket.readyState === socket.OPEN) {
+                  socket.send(JSON.stringify({ event: 'media', streamSid, media: { payload: chunk.toString('base64') } }))
+                  sent++
+                }
+              }
+              if (socket.readyState === socket.OPEN) {
+                socket.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'greeting_done' } }))
+              }
+              const playbackMs = sent * 20 + 1500
+              setTimeout(() => { if (isSpeaking) { console.log('[Audio] Fallback unlock (greeting)'); isSpeaking = false } }, playbackMs)
+              console.log(`[Greeting] Sent ${sent} pre-generated chunks`)
+            } else {
+              // Fallback: generate ใหม่ถ้า pre-gen ไม่สำเร็จ
+              console.log(`[Greeting] Pre-gen not ready, generating now...`)
+              const greeting = await askClaude(session, true)
+              console.log(`[Greeting] "${greeting.substring(0, 100)}"`)
+              session.messages.push({ role: 'assistant', content: greeting })
+              await speakAndWait(greeting, session, 'greeting_done')
+            }
           } catch (err) {
             console.error('[Greeting error]', err.message)
             isSpeaking = false
           }
-          // ไม่ใส่ finally — รอ mark event จาก Twilio แทน
-        }, 1000)
+        }
+
+        // รอ 300ms แทน 1000ms — แค่ให้ stream stable
+        setTimeout(playGreeting, 300)
       }
 
       if (msg.event === 'media' && sttStream) {
