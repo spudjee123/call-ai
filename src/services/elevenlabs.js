@@ -24,7 +24,7 @@ function downsample16to8(pcm16k) {
 }
 
 async function synthesizeSpeech(text, voiceId) {
-  voiceId = voiceId || process.env.ELEVENLABS_VOICE_ID || '23ZccZ3acdfGBxlMxOPL'
+  voiceId = voiceId || process.env.ELEVENLABS_VOICE_ID || 'QKGPdwptrRjcqWxch80J'
   console.log(`[ElevenLabs] Requesting voiceId=${voiceId} text="${text.substring(0, 60)}"`)
 
   const response = await axios.post(
@@ -69,7 +69,7 @@ async function synthesizeSpeech(text, voiceId) {
 // Streaming version — yields 160-byte μ-law chunks as ElevenLabs generates them
 // ลด latency: Twilio เล่นเสียงได้ทันทีโดยไม่ต้องรอ TTS เสร็จทั้งหมด
 async function* synthesizeSpeechStream(text, voiceId, signal) {
-  voiceId = voiceId || process.env.ELEVENLABS_VOICE_ID || '23ZccZ3acdfGBxlMxOPL'
+  voiceId = voiceId || process.env.ELEVENLABS_VOICE_ID || 'QKGPdwptrRjcqWxch80J'
   console.log(`[ElevenLabs Stream] voiceId=${voiceId} text="${text.substring(0, 60)}"`)
 
   const response = await axios.post(
