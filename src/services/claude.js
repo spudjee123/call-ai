@@ -27,14 +27,7 @@ async function askClaude(session, isGreeting = false) {
     messages: msgs,
   })
 
-  let text = response.content[0].text.trim()
-
-  // เช็ค off-topic และนับ
-  if (isOffTopic(text)) {
-    session.offTopicCount = (session.offTopicCount || 0) + 1
-  }
-
-  return text
+  return response.content[0].text.trim()
 }
 
 async function summarizeCall(session) {
@@ -72,9 +65,9 @@ function buildSystemPrompt(campaignPrompt, customerName, offTopicCount) {
 
   if (offTopicCount === 0) {
     offTopicInstruction = `ถ้าลูกค้าคุยนอกเรื่อง ให้รับฟัง 1 ประโยคแล้วดึงกลับมาที่จุดประสงค์`
-  } else if (offTopicCount === 1) {
-    offTopicInstruction = `ลูกค้านอกเรื่องไปแล้ว 1 ครั้ง ให้ดึงกลับชัดขึ้น`
-  } else if (offTopicCount >= 2) {
+  } else if (offTopicCount < MAX_OFFTOPIC) {
+    offTopicInstruction = `ลูกค้านอกเรื่องไปแล้ว ${offTopicCount} ครั้ง ให้ดึงกลับชัดขึ้น`
+  } else {
     offTopicInstruction = `ลูกค้านอกเรื่องซ้ำ ให้ขอโทษและสรุปจบสาย พูดว่า [END_CALL] เมื่อต้องการวางสาย`
   }
 
@@ -113,7 +106,7 @@ function extractSentences(buffer) {
 
 // Streaming version — yields ประโยคทีละประโยคทันทีที่ Claude generate
 // ElevenLabs เริ่มแปลงเสียงได้โดยไม่ต้องรอ Claude เสร็จทั้งหมด
-async function* askClaudeStream(session, isGreeting = false) {
+async function* askClaudeStream(session, isGreeting = false, signal = null) {
   const { name, campaign, messages, offTopicCount } = session
   const systemPrompt = buildSystemPrompt(campaign.script || campaign.system_prompt, name, offTopicCount)
   const history = messages.slice(-MAX_HISTORY)
@@ -127,24 +120,29 @@ async function* askClaudeStream(session, isGreeting = false) {
     session.offTopicCount = (session.offTopicCount || 0) + 1
   }
 
-  const stream = client.messages.stream({
+  // ใช้ create({ stream: true }) แทน .stream() เพื่อ compatibility ทุก SDK version
+  const stream = await client.messages.create({
     model: 'claude-haiku-4-5-20251001',
     max_tokens: 80,
     system: systemPrompt,
     messages: msgs,
+    stream: true,
   })
 
   let buffer = ''
-  for await (const text of stream.textStream) {
-    buffer += text
-    const { sentences, remaining } = extractSentences(buffer)
-    buffer = remaining
-    for (const s of sentences) {
-      if (s) yield s
+  for await (const event of stream) {
+    if (signal?.aborted) return
+    if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
+      buffer += event.delta.text
+      const { sentences, remaining } = extractSentences(buffer)
+      buffer = remaining
+      for (const s of sentences) {
+        if (s) yield s
+      }
     }
   }
 
-  // flush ส่วนที่เหลือ (ประโยคไม่มี punctuation ท้าย)
+  // flush ส่วนที่เหลือ (ประโยคสุดท้ายไม่มี punctuation)
   if (buffer.trim()) yield buffer.trim()
 }
 

@@ -16,7 +16,8 @@ function registerWebSocket(fastify) {
     let sttStream = null
     let isSpeaking = false
     let callActive = true
-    let abortController = null    // barge-in: cancel ongoing TTS stream
+    let greetingAbortController = null  // barge-in: cancel greeting audio
+    let ttsAbortController = null       // barge-in: cancel STT→TTS pipeline
     let sttProcessing = false     // mutex: ป้องกัน concurrent Claude calls
     let bargeInCooldown = false   // cooldown หลัง barge-in ป้องกัน echo false-trigger
 
@@ -26,7 +27,8 @@ function registerWebSocket(fastify) {
     function bargeIn() {
       if (!isSpeaking) return
       console.log('[Barge-in] Customer interrupted — stopping AI audio')
-      if (abortController) { abortController.abort(); abortController = null }
+      if (greetingAbortController) { greetingAbortController.abort(); greetingAbortController = null }
+      if (ttsAbortController) { ttsAbortController.abort(); ttsAbortController = null }
       if (socket.readyState === socket.OPEN) {
         socket.send(JSON.stringify({ event: 'clear', streamSid }))
       }
@@ -39,8 +41,8 @@ function registerWebSocket(fastify) {
     async function speakAndWait(text, session, markName) {
       if (!callActive || socket.readyState !== socket.OPEN) return
 
-      abortController = new AbortController()
-      const signal = abortController.signal
+      greetingAbortController = new AbortController()
+      const signal = greetingAbortController.signal
       let sent = 0
 
       try {
@@ -54,13 +56,14 @@ function registerWebSocket(fastify) {
           console.error('[Audio Stream error]', err.message)
         }
       } finally {
-        abortController = null
+        greetingAbortController = null
       }
 
       console.log(`[Audio] Streamed ${sent} chunks for mark=${markName}`)
 
       // ถ้า barge-in เกิดขึ้นระหว่างส่ง → ไม่ส่ง mark (isSpeaking=false แล้ว)
       if (!isSpeaking) return
+      if (sent === 0) { isSpeaking = false; return }
 
       if (socket.readyState === socket.OPEN) {
         socket.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: markName } }))
@@ -124,15 +127,15 @@ function registerWebSocket(fastify) {
           currentSession.messages.push({ role: 'user', content: transcript })
           isSpeaking = true
 
-          abortController = new AbortController()
-          const signal = abortController.signal
+          ttsAbortController = new AbortController()
+          const signal = ttsAbortController.signal
           let fullText = ''
           let totalSent = 0
 
           try {
             // LLM Streaming → TTS Pipeline
             // Claude yield ประโยค → ElevenLabs เริ่มทันที → ไม่ต้องรอ Claude เสร็จ
-            for await (const sentence of askClaudeStream(currentSession)) {
+            for await (const sentence of askClaudeStream(currentSession, false, signal)) {
               if (signal.aborted || !callActive || !isSpeaking) break
 
               console.log(`[AI] "${sentence}"`)
@@ -157,7 +160,7 @@ function registerWebSocket(fastify) {
           } catch (err) {
             console.error('[AI/TTS error]', err.message)
           } finally {
-            abortController = null
+            ttsAbortController = null
             sttProcessing = false
           }
 
@@ -166,8 +169,10 @@ function registerWebSocket(fastify) {
             console.log(`[AI full] "${fullText}"`)
           }
 
-          if (!signal?.aborted && isSpeaking && socket.readyState === socket.OPEN) {
+          if (!signal?.aborted && isSpeaking && socket.readyState === socket.OPEN && totalSent > 0) {
             socket.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'ai_done' } }))
+          } else if (totalSent === 0) {
+            isSpeaking = false
           }
 
           const playbackMs = totalSent * 20 + 1500
@@ -191,14 +196,14 @@ function registerWebSocket(fastify) {
               console.log(`[Greeting] Using pre-generated audio (${session.greetingChunks.length} chunks)`)
               const chunks = session.greetingChunks
               session.greetingChunks = null  // ใช้แล้วล้างทิ้ง
-              abortController = new AbortController()
+              greetingAbortController = new AbortController()
               let sent = 0
               for (const chunk of chunks) {
-                if (socket.readyState !== socket.OPEN || abortController?.signal.aborted) break
+                if (socket.readyState !== socket.OPEN || greetingAbortController?.signal.aborted) break
                 socket.send(JSON.stringify({ event: 'media', streamSid, media: { payload: chunk.toString('base64') } }))
                 sent++
               }
-              abortController = null
+              greetingAbortController = null
               if (!isSpeaking) return  // barge-in happened during greeting
               if (socket.readyState === socket.OPEN) {
                 socket.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'greeting_done' } }))
@@ -231,6 +236,7 @@ function registerWebSocket(fastify) {
           const audioData = Buffer.from(msg.media.payload, 'base64')
           sttStream.write(audioData)
         } catch (e) {
+          try { sttStream.end() } catch (_) {}
           sttStream = null
         }
       }

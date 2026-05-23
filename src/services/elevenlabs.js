@@ -3,6 +3,7 @@ const { pcm16BufferToMulaw } = require('../utils/audioConverter')
 
 const API_KEY = process.env.ELEVENLABS_API_KEY
 const BASE_URL = 'https://api.elevenlabs.io/v1'
+const DEFAULT_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || 'GolXPCpsnS5QBmdAYjj4'
 
 // ขอ 16kHz PCM จาก ElevenLabs แทน ulaw_8000 โดยตรง
 // เพราะ ElevenLabs model สร้างเสียงคุณภาพสูงกว่าที่ 16kHz
@@ -24,7 +25,7 @@ function downsample16to8(pcm16k) {
 }
 
 async function synthesizeSpeech(text, voiceId) {
-  voiceId = voiceId || process.env.ELEVENLABS_VOICE_ID || 'GolXPCpsnS5QBmdAYjj4'
+  voiceId = voiceId || DEFAULT_VOICE_ID
   console.log(`[ElevenLabs] Requesting voiceId=${voiceId} text="${text.substring(0, 60)}"`)
 
   const response = await axios.post(
@@ -69,7 +70,7 @@ async function synthesizeSpeech(text, voiceId) {
 // Streaming version — yields 160-byte μ-law chunks as ElevenLabs generates them
 // ลด latency: Twilio เล่นเสียงได้ทันทีโดยไม่ต้องรอ TTS เสร็จทั้งหมด
 async function* synthesizeSpeechStream(text, voiceId, signal) {
-  voiceId = voiceId || process.env.ELEVENLABS_VOICE_ID || 'GolXPCpsnS5QBmdAYjj4'
+  voiceId = voiceId || DEFAULT_VOICE_ID
   console.log(`[ElevenLabs Stream] voiceId=${voiceId} text="${text.substring(0, 60)}"`)
 
   const response = await axios.post(

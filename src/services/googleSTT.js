@@ -24,6 +24,7 @@ const STT_CONFIG = {
 function transcribeStream(onTranscript) {
   let destroyed = false
   let currentStream = null
+  let errorRetryCount = 0
 
   function createStream() {
     if (destroyed) return
@@ -38,11 +39,16 @@ function transcribeStream(onTranscript) {
     .on('error', (err) => {
       if (destroyed) return
       if (err.code !== 11) console.error('[STT error]', err.message)
-      // Recreate stream หลัง error (รวม code 11 = deadline exceeded)
       currentStream = null
+      errorRetryCount++
+      if (errorRetryCount >= 10) {
+        console.error('[STT] Too many consecutive errors, stopping recreation')
+        return
+      }
       setTimeout(createStream, 100)
     })
     .on('data', (data) => {
+      errorRetryCount = 0
       const result = data.results[0]
       if (result?.isFinal) {
         const transcript = result.alternatives[0].transcript.trim()
