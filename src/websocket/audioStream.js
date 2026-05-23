@@ -16,26 +16,48 @@ function registerWebSocket(fastify) {
     let sttStream = null
     let isSpeaking = false
     let callActive = true
+    let abortController = null  // barge-in: cancel ongoing TTS stream
 
     console.log(`[WS] Connected callSid=${callSid}`)
+
+    // หยุด AI พูดทันที เมื่อลูกค้าพูดแทรก
+    function bargeIn() {
+      if (!isSpeaking) return
+      console.log('[Barge-in] Customer interrupted — stopping AI audio')
+      if (abortController) { abortController.abort(); abortController = null }
+      if (socket.readyState === socket.OPEN) {
+        socket.send(JSON.stringify({ event: 'clear', streamSid }))
+      }
+      isSpeaking = false
+    }
 
     // Streaming TTS — ส่ง chunk ไป Twilio ทันทีที่ ElevenLabs generate
     // ไม่ต้องรอ audio ทั้งหมดก่อน → ลด latency 2-3 วินาที
     async function speakAndWait(text, session, markName) {
       if (!callActive || socket.readyState !== socket.OPEN) return
 
+      abortController = new AbortController()
+      const signal = abortController.signal
       let sent = 0
+
       try {
-        for await (const chunk of synthesizeSpeechStream(text, session.campaign.voice_id)) {
-          if (socket.readyState !== socket.OPEN) break
+        for await (const chunk of synthesizeSpeechStream(text, session.campaign.voice_id, signal)) {
+          if (socket.readyState !== socket.OPEN || signal.aborted) break
           socket.send(JSON.stringify({ event: 'media', streamSid, media: { payload: chunk.toString('base64') } }))
           sent++
         }
       } catch (err) {
-        console.error('[Audio Stream error]', err.message)
+        if (err.code !== 'ERR_CANCELED' && err.name !== 'CanceledError') {
+          console.error('[Audio Stream error]', err.message)
+        }
+      } finally {
+        abortController = null
       }
 
       console.log(`[Audio] Streamed ${sent} chunks for mark=${markName}`)
+
+      // ถ้า barge-in เกิดขึ้นระหว่างส่ง → ไม่ส่ง mark (isSpeaking=false แล้ว)
+      if (!isSpeaking) return
 
       if (socket.readyState === socket.OPEN) {
         socket.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: markName } }))
@@ -71,15 +93,20 @@ function registerWebSocket(fastify) {
 
         // เริ่ม STT stream
         sttStream = transcribeStream(async (transcript) => {
-          // Block ถ้า: กำลังพูดอยู่, สายตัดแล้ว, socket ปิดแล้ว
-          if (!transcript || isSpeaking || !callActive) return
+          if (!transcript || !callActive) return
           if (socket.readyState !== socket.OPEN) return
           const currentSession = callSessions.get(callSid)
           if (!currentSession) return
 
           console.log(`[STT] "${transcript}"`)
-          currentSession.messages.push({ role: 'user', content: transcript })
 
+          // Barge-in: ลูกค้าพูดแทรงขณะ AI กำลังพูดอยู่
+          if (isSpeaking) {
+            bargeIn()
+            await new Promise(r => setTimeout(r, 150))  // รอ clear event ส่งก่อน
+          }
+
+          currentSession.messages.push({ role: 'user', content: transcript })
           isSpeaking = true
           try {
             const aiText = await askClaude(currentSession)
@@ -109,13 +136,15 @@ function registerWebSocket(fastify) {
               console.log(`[Greeting] Using pre-generated audio (${session.greetingChunks.length} chunks)`)
               const chunks = session.greetingChunks
               session.greetingChunks = null  // ใช้แล้วล้างทิ้ง
+              abortController = new AbortController()
               let sent = 0
               for (const chunk of chunks) {
-                if (socket.readyState === socket.OPEN) {
-                  socket.send(JSON.stringify({ event: 'media', streamSid, media: { payload: chunk.toString('base64') } }))
-                  sent++
-                }
+                if (socket.readyState !== socket.OPEN || abortController?.signal.aborted) break
+                socket.send(JSON.stringify({ event: 'media', streamSid, media: { payload: chunk.toString('base64') } }))
+                sent++
               }
+              abortController = null
+              if (!isSpeaking) return  // barge-in happened during greeting
               if (socket.readyState === socket.OPEN) {
                 socket.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'greeting_done' } }))
               }
@@ -141,14 +170,13 @@ function registerWebSocket(fastify) {
       }
 
       if (msg.event === 'media' && sttStream) {
-        // ไม่ส่งเสียงให้ STT ขณะ AI กำลังพูดอยู่ (ป้องกัน AI ได้ยินตัวเอง)
-        if (!isSpeaking) {
-          try {
-            const audioData = Buffer.from(msg.media.payload, 'base64')
-            sttStream.write(audioData)
-          } catch (e) {
-            sttStream = null
-          }
+        // ส่งเสียงลูกค้าให้ STT เสมอ (รวมถึงตอน AI พูด เพื่อ barge-in detection)
+        // Twilio PSTN handles echo cancellation — ไม่ต้องกังวลเสียง AI ย้อนกลับ
+        try {
+          const audioData = Buffer.from(msg.media.payload, 'base64')
+          sttStream.write(audioData)
+        } catch (e) {
+          sttStream = null
         }
       }
 

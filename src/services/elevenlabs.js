@@ -68,7 +68,7 @@ async function synthesizeSpeech(text, voiceId) {
 
 // Streaming version — yields 160-byte μ-law chunks as ElevenLabs generates them
 // ลด latency: Twilio เล่นเสียงได้ทันทีโดยไม่ต้องรอ TTS เสร็จทั้งหมด
-async function* synthesizeSpeechStream(text, voiceId) {
+async function* synthesizeSpeechStream(text, voiceId, signal) {
   voiceId = voiceId || process.env.ELEVENLABS_VOICE_ID || '23ZccZ3acdfGBxlMxOPL'
   console.log(`[ElevenLabs Stream] voiceId=${voiceId} text="${text.substring(0, 60)}"`)
 
@@ -90,6 +90,7 @@ async function* synthesizeSpeechStream(text, voiceId) {
         'Content-Type': 'application/json',
       },
       responseType: 'stream',
+      signal,  // AbortController signal สำหรับ barge-in
     }
   )
 
@@ -97,6 +98,7 @@ async function* synthesizeSpeechStream(text, voiceId) {
   let mulawBuffer = Buffer.alloc(0) // incomplete 160-byte μ-law chunks
 
   for await (const rawChunk of response.data) {
+    if (signal?.aborted) return
     pcmBuffer = Buffer.concat([pcmBuffer, Buffer.from(rawChunk)])
 
     // ประมวลผลเฉพาะ complete 4-byte frames (2 samples × 2 bytes each)
