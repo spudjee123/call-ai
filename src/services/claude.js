@@ -95,4 +95,57 @@ function isOffTopic(text) {
   return !salesKeywords.some(k => text.includes(k))
 }
 
-module.exports = { askClaude, summarizeCall }
+// ตรวจหาจุดสิ้นสุดประโยคสำหรับภาษาไทย
+// แยกที่: . ! ? หรือ คำลงท้ายสุภาพ ตามด้วย space หรือ end
+function extractSentences(buffer) {
+  const re = /(.*?(?:[.!?]|ค่ะ|ครับ|นะคะ|นะครับ|เลยค่ะ|เลยครับ|ด้วยค่ะ|ด้วยครับ))(?=\s|$)/g
+  const sentences = []
+  let lastIndex = 0
+  let match
+  re.lastIndex = 0
+  while ((match = re.exec(buffer)) !== null) {
+    const s = match[1].trim()
+    if (s) sentences.push(s)
+    lastIndex = re.lastIndex
+  }
+  return { sentences, remaining: buffer.slice(lastIndex) }
+}
+
+// Streaming version — yields ประโยคทีละประโยคทันทีที่ Claude generate
+// ElevenLabs เริ่มแปลงเสียงได้โดยไม่ต้องรอ Claude เสร็จทั้งหมด
+async function* askClaudeStream(session, isGreeting = false) {
+  const { name, campaign, messages, offTopicCount } = session
+  const systemPrompt = buildSystemPrompt(campaign.script || campaign.system_prompt, name, offTopicCount)
+  const history = messages.slice(-MAX_HISTORY)
+  const msgs = isGreeting
+    ? [{ role: 'user', content: 'เริ่มต้นการสนทนา' }]
+    : history
+
+  if (!msgs.length) { yield 'สวัสดีค่ะ'; return }
+
+  if (isOffTopic(msgs[msgs.length - 1]?.content || '')) {
+    session.offTopicCount = (session.offTopicCount || 0) + 1
+  }
+
+  const stream = client.messages.stream({
+    model: 'claude-haiku-4-5-20251001',
+    max_tokens: 80,
+    system: systemPrompt,
+    messages: msgs,
+  })
+
+  let buffer = ''
+  for await (const text of stream.textStream) {
+    buffer += text
+    const { sentences, remaining } = extractSentences(buffer)
+    buffer = remaining
+    for (const s of sentences) {
+      if (s) yield s
+    }
+  }
+
+  // flush ส่วนที่เหลือ (ประโยคไม่มี punctuation ท้าย)
+  if (buffer.trim()) yield buffer.trim()
+}
+
+module.exports = { askClaude, askClaudeStream, summarizeCall }

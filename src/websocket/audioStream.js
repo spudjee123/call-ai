@@ -1,6 +1,6 @@
 const callSessions = require('../utils/callSessions')
 const { transcribeStream } = require('../services/googleSTT')
-const { askClaude } = require('../services/claude')
+const { askClaude, askClaudeStream } = require('../services/claude')
 const { synthesizeSpeechStream } = require('../services/tts')
 
 function registerWebSocket(fastify) {
@@ -31,6 +31,7 @@ function registerWebSocket(fastify) {
         socket.send(JSON.stringify({ event: 'clear', streamSid }))
       }
       isSpeaking = false
+      sttProcessing = false  // unlock ให้รับ utterance ใหม่ได้ทันที
     }
 
     // Streaming TTS — ส่ง chunk ไป Twilio ทันทีที่ ElevenLabs generate
@@ -119,25 +120,63 @@ function registerWebSocket(fastify) {
           }
 
           if (sttProcessing) return  // double-check หลัง await
-          sttProcessing = true       // lock แค่ช่วง Claude — ป้องกัน duplicate request
+          sttProcessing = true
           currentSession.messages.push({ role: 'user', content: transcript })
           isSpeaking = true
+
+          abortController = new AbortController()
+          const signal = abortController.signal
+          let fullText = ''
+          let totalSent = 0
+
           try {
-            const aiText = await askClaude(currentSession)
-            console.log(`[AI] "${aiText}"`)
-            currentSession.messages.push({ role: 'assistant', content: aiText })
-            sttProcessing = false    // unlock หลัง Claude ตอบ — barge-in ทำงานได้ระหว่าง AI พูด
+            // LLM Streaming → TTS Pipeline
+            // Claude yield ประโยค → ElevenLabs เริ่มทันที → ไม่ต้องรอ Claude เสร็จ
+            for await (const sentence of askClaudeStream(currentSession)) {
+              if (signal.aborted || !callActive || !isSpeaking) break
 
-            await speakAndWait(aiText, currentSession, 'ai_done')
+              console.log(`[AI] "${sentence}"`)
+              fullText += (fullText ? ' ' : '') + sentence
 
-            if (aiText.includes('[END_CALL]')) {
-              setTimeout(() => { if (socket.readyState === socket.OPEN) socket.close() }, 3000)
+              // Stream ประโยคนี้ไป TTS และส่ง Twilio ทันที
+              try {
+                for await (const chunk of synthesizeSpeechStream(sentence, currentSession.campaign.voice_id, signal)) {
+                  if (socket.readyState !== socket.OPEN || signal.aborted) break
+                  socket.send(JSON.stringify({ event: 'media', streamSid, media: { payload: chunk.toString('base64') } }))
+                  totalSent++
+                }
+              } catch (err) {
+                if (err.code !== 'ERR_CANCELED' && err.name !== 'CanceledError') {
+                  console.error('[TTS error]', err.message)
+                }
+                break
+              }
+
+              if (sentence.includes('[END_CALL]')) break
             }
           } catch (err) {
             console.error('[AI/TTS error]', err.message)
-            isSpeaking = false
           } finally {
-            sttProcessing = false    // ensure cleanup
+            abortController = null
+            sttProcessing = false
+          }
+
+          if (fullText) {
+            currentSession.messages.push({ role: 'assistant', content: fullText })
+            console.log(`[AI full] "${fullText}"`)
+          }
+
+          if (!signal?.aborted && isSpeaking && socket.readyState === socket.OPEN) {
+            socket.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'ai_done' } }))
+          }
+
+          const playbackMs = totalSent * 20 + 1500
+          setTimeout(() => {
+            if (isSpeaking) { console.log('[Audio] Fallback unlock'); isSpeaking = false }
+          }, playbackMs)
+
+          if (fullText.includes('[END_CALL]')) {
+            setTimeout(() => { if (socket.readyState === socket.OPEN) socket.close() }, 3000)
           }
         })
 
