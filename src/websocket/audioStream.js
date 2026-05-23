@@ -15,11 +15,17 @@ function registerWebSocket(fastify) {
     let sttStream = null
     let isSpeaking = false
 
-    console.log(`[WS] Connected callSid=${callSid}`)
+    console.log(`[WS] Connected callSid=${callSid}, socket type=${socket?.constructor?.name}, hasOn=${typeof socket?.on}`)
 
     socket.on('message', async (rawMsg) => {
       let msg
-      try { msg = JSON.parse(rawMsg) } catch { return }
+      try {
+        msg = JSON.parse(rawMsg)
+      } catch (e) {
+        console.error('[WS] Parse error:', e.message, 'type:', typeof rawMsg, 'isBuffer:', Buffer.isBuffer(rawMsg))
+        return
+      }
+      console.log(`[WS] Event received: ${msg.event}`)
 
       if (msg.event === 'start') {
         streamSid = msg.start.streamSid
