@@ -20,13 +20,71 @@ function registerWebSocket(fastify) {
     let ttsAbortController = null       // barge-in: cancel STT→TTS pipeline
     let sttProcessing = false     // mutex: ป้องกัน concurrent Claude calls
     let bargeInCooldown = false   // cooldown หลัง barge-in ป้องกัน echo false-trigger
+    let silenceTimer = null
+    let silencePromptCount = 0
 
     console.log(`[WS] Connected callSid=${callSid}`)
+
+    function clearSilenceTimer() {
+      if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null }
+    }
+
+    function startSilenceTimer() {
+      clearSilenceTimer()
+      if (!callActive || isSpeaking) return
+      silenceTimer = setTimeout(handleSilence, 8000)
+    }
+
+    async function handleSilence() {
+      silenceTimer = null
+      if (!callActive || isSpeaking || sttProcessing) return
+      const currentSession = callSessions.get(callSid)
+      if (!currentSession) return
+
+      silencePromptCount++
+      console.log(`[Silence] Timeout #${silencePromptCount}`)
+      isSpeaking = true
+      sttProcessing = true
+      ttsAbortController = new AbortController()
+      const signal = ttsAbortController.signal
+      let totalSent = 0
+
+      const promptText = silencePromptCount >= 2
+        ? 'ไม่ได้ยินเสียงครับ ขอบคุณที่รับสายนะครับ'
+        : 'ได้ยินอยู่ไหมครับ'
+
+      try {
+        for await (const chunk of synthesizeSpeechStream(promptText, currentSession.campaign.voice_id, signal)) {
+          if (socket.readyState !== socket.OPEN || signal.aborted) break
+          socket.send(JSON.stringify({ event: 'media', streamSid, media: { payload: chunk.toString('base64') } }))
+          totalSent++
+        }
+      } catch (err) {
+        if (err.code !== 'ERR_CANCELED' && err.name !== 'CanceledError') {
+          console.error('[Silence TTS error]', err.message)
+        }
+      } finally {
+        ttsAbortController = null
+        sttProcessing = false
+      }
+
+      if (totalSent > 0 && isSpeaking && socket.readyState === socket.OPEN) {
+        socket.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'silence_done' } }))
+      } else {
+        isSpeaking = false
+        if (silencePromptCount < 2) startSilenceTimer()
+      }
+
+      if (silencePromptCount >= 2) {
+        setTimeout(() => { if (socket.readyState === socket.OPEN) socket.close() }, 3000)
+      }
+    }
 
     // หยุด AI พูดทันที เมื่อลูกค้าพูดแทรก
     function bargeIn() {
       if (!isSpeaking) return
       console.log('[Barge-in] Customer interrupted — stopping AI audio')
+      clearSilenceTimer()
       if (greetingAbortController) { greetingAbortController.abort(); greetingAbortController = null }
       if (ttsAbortController) { ttsAbortController.abort(); ttsAbortController = null }
       if (socket.readyState === socket.OPEN) {
@@ -107,6 +165,8 @@ function registerWebSocket(fastify) {
           if (!currentSession) return
 
           console.log(`[STT] "${transcript}"`)
+          clearSilenceTimer()
+          silencePromptCount = 0
 
           // Barge-in: ตรวจสอบว่าเป็นเสียงจริง ไม่ใช่ echo ของ AI
           if (isSpeaking) {
@@ -243,13 +303,14 @@ function registerWebSocket(fastify) {
 
       if (msg.event === 'mark') {
         console.log(`[WS] Mark received: ${msg.mark?.name}`)
-        // Twilio ยืนยันว่าเล่นเสียง AI จบแล้ว → unlock รับคำพูดลูกค้าได้
         isSpeaking = false
+        startSilenceTimer()
       }
 
       if (msg.event === 'stop') {
         console.log(`[WS] Stream stopped: ${callSid}`)
         callActive = false
+        clearSilenceTimer()
         if (sttStream) { sttStream.end(); sttStream = null }
       }
     })
@@ -257,6 +318,7 @@ function registerWebSocket(fastify) {
     socket.on('close', () => {
       console.log(`[WS] Disconnected: ${callSid}`)
       callActive = false
+      clearSilenceTimer()
       if (sttStream) { sttStream.end(); sttStream = null }
     })
 

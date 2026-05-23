@@ -22,7 +22,7 @@ async function askClaude(session, isGreeting = false) {
 
   const response = await client.messages.create({
     model: 'claude-haiku-4-5-20251001',
-    max_tokens: isGreeting ? 40 : 80,
+    max_tokens: isGreeting ? 60 : 80,
     system: systemPrompt,
     messages: msgs,
   })

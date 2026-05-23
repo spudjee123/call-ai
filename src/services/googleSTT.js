@@ -32,9 +32,7 @@ function transcribeStream(onTranscript) {
 
     const stream = client.streamingRecognize({
       config: STT_CONFIG,
-      interimResults: false,
-      // singleUtterance: false → stream เปิดค้างตลอดสาย ไม่มี recreation gap
-      // ป้องกันเสียงหายช่วง recreate ที่ทำให้ STT ได้ยินแค่ครึ่งประโยค
+      interimResults: true,   // diagnostic: ดูว่า Google ส่งอะไรกลับมาบ้าง
       singleUtterance: false,
     })
     .on('error', (err) => {
@@ -51,9 +49,16 @@ function transcribeStream(onTranscript) {
     .on('data', (data) => {
       errorRetryCount = 0
       const result = data.results[0]
-      if (result?.isFinal) {
-        const transcript = result.alternatives[0].transcript.trim()
-        if (transcript) onTranscript(transcript)
+      if (!result) return
+      const text = result.alternatives?.[0]?.transcript || ''
+      if (!result.isFinal) {
+        if (text) console.log(`[STT interim] "${text}"`)
+        return
+      }
+      if (text.trim()) {
+        onTranscript(text.trim())
+      } else {
+        console.log('[STT] Final result but empty transcript')
       }
     })
     .on('end', () => {
