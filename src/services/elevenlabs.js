@@ -3,8 +3,8 @@ const axios = require('axios')
 const API_KEY = process.env.ELEVENLABS_API_KEY
 const BASE_URL = 'https://api.elevenlabs.io/v1'
 
-// PCM 16-bit 8kHz (ตรงกับ Twilio)
-const OUTPUT_FORMAT = 'pcm_8000'
+// ulaw 8kHz — ตรงกับ Twilio Media Streams โดยไม่ต้องแปลง
+const OUTPUT_FORMAT = 'ulaw_8000'
 
 async function synthesizeSpeech(text, voiceId) {
   voiceId = voiceId || process.env.ELEVENLABS_VOICE_ID

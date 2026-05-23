@@ -61,13 +61,12 @@ function registerWebSocket(fastify) {
             // ส่งให้ ElevenLabs แปลงเป็นเสียง
             const audioChunks = await synthesizeSpeech(aiText, session.campaign.voice_id)
 
-            // ส่งเสียงกลับ Twilio
+            // ส่งเสียงกลับ Twilio (ElevenLabs ส่ง ulaw_8000 มาตรงๆ ไม่ต้องแปลง)
             for (const chunk of audioChunks) {
-              const mulawChunk = pcm16BufferToMulaw(chunk)
               const payload = {
                 event: 'media',
                 streamSid,
-                media: { payload: mulawChunk.toString('base64') }
+                media: { payload: chunk.toString('base64') }
               }
               if (socket.readyState === socket.OPEN) {
                 socket.send(JSON.stringify(payload))
@@ -104,12 +103,11 @@ function registerWebSocket(fastify) {
 
             const audioChunks = await synthesizeSpeech(greeting, session.campaign.voice_id)
             for (const chunk of audioChunks) {
-              const mulawChunk = pcm16BufferToMulaw(chunk)
               if (socket.readyState === socket.OPEN) {
                 socket.send(JSON.stringify({
                   event: 'media',
                   streamSid,
-                  media: { payload: mulawChunk.toString('base64') }
+                  media: { payload: chunk.toString('base64') }
                 }))
               }
             }
