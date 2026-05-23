@@ -6,8 +6,9 @@ const { synthesizeSpeech } = require('../services/elevenlabs')
 
 function registerWebSocket(fastify) {
   fastify.get('/stream', { websocket: true }, (connection, req) => {
-    // @fastify/websocket v11: first param may be SocketStream (connection.socket) or WebSocket directly
-    const socket = (connection && typeof connection.socket !== 'undefined') ? connection.socket : connection
+    // @fastify/websocket v11: connection IS the ws.WebSocket directly (has .send)
+    // connection.socket = underlying net.Socket — do NOT use that
+    const socket = (typeof connection.send === 'function') ? connection : (connection.socket || connection)
     const rawUrl = (req && req.url) || ''
     const qs = rawUrl.includes('?') ? rawUrl.split('?')[1] : ''
     let callSid = new URLSearchParams(qs).get('callSid')
