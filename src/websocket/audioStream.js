@@ -114,18 +114,19 @@ function registerWebSocket(fastify) {
             }
             bargeIn()
             bargeInCooldown = true
-            setTimeout(() => { bargeInCooldown = false }, 800)
+            setTimeout(() => { bargeInCooldown = false }, 400)
             await new Promise(r => setTimeout(r, 200))
           }
 
           if (sttProcessing) return  // double-check หลัง await
-          sttProcessing = true
+          sttProcessing = true       // lock แค่ช่วง Claude — ป้องกัน duplicate request
           currentSession.messages.push({ role: 'user', content: transcript })
           isSpeaking = true
           try {
             const aiText = await askClaude(currentSession)
             console.log(`[AI] "${aiText}"`)
             currentSession.messages.push({ role: 'assistant', content: aiText })
+            sttProcessing = false    // unlock หลัง Claude ตอบ — barge-in ทำงานได้ระหว่าง AI พูด
 
             await speakAndWait(aiText, currentSession, 'ai_done')
 
@@ -136,7 +137,7 @@ function registerWebSocket(fastify) {
             console.error('[AI/TTS error]', err.message)
             isSpeaking = false
           } finally {
-            sttProcessing = false
+            sttProcessing = false    // ensure cleanup
           }
         })
 

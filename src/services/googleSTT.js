@@ -31,9 +31,9 @@ function transcribeStream(onTranscript) {
     const stream = client.streamingRecognize({
       config: STT_CONFIG,
       interimResults: false,
-      // singleUtterance: true → Google fires result เร็วกว่า หลังหยุดพูด
-      // แล้ว stream จบ (end event) → recreate ทันทีเพื่อรับ utterance ถัดไป
-      singleUtterance: true,
+      // singleUtterance: false → stream เปิดค้างตลอดสาย ไม่มี recreation gap
+      // ป้องกันเสียงหายช่วง recreate ที่ทำให้ STT ได้ยินแค่ครึ่งประโยค
+      singleUtterance: false,
     })
     .on('error', (err) => {
       if (destroyed) return
@@ -50,10 +50,10 @@ function transcribeStream(onTranscript) {
       }
     })
     .on('end', () => {
-      // singleUtterance fired → stream จบ → recreate สำหรับ utterance ถัดไป
+      // stream จบ (เช่น Google หมดเวลา) → recreate
       if (!destroyed) {
         currentStream = null
-        setTimeout(createStream, 50)
+        setTimeout(createStream, 100)
       }
     })
 
