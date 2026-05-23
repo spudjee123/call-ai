@@ -18,7 +18,9 @@ function transcribeStream(onTranscript) {
       model: 'latest_short',
       useEnhanced: true,
       speechContexts: [{
-        phrases: ['สวัสดี', 'ครับ', 'ค่ะ', 'สนใจ', 'ราคา', 'โปรโมชั่น', 'ไม่สนใจ', 'ขอบคุณ']
+        phrases: ['สวัสดี', 'ครับ', 'ค่ะ', 'สนใจ', 'ราคา', 'โปรโมชั่น', 'ไม่สนใจ', 'ขอบคุณ',
+                  'PGDOG', 'พีจีด็อก', 'แอดไลน์', 'พอยต์', 'ฝาก', 'สมัคร', 'โบนัส'],
+        boost: 15
       }],
       enableAutomaticPunctuation: true,
     },

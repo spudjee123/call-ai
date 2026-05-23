@@ -22,7 +22,7 @@ async function askClaude(session, isGreeting = false) {
 
   const response = await client.messages.create({
     model: 'claude-haiku-4-5-20251001',
-    max_tokens: 300,
+    max_tokens: 80,
     system: systemPrompt,
     messages: msgs,
   })
@@ -81,7 +81,7 @@ function buildSystemPrompt(campaignPrompt, customerName, offTopicCount) {
   return `${campaignPrompt}
 
 ชื่อลูกค้า: ${customerName}
-คำตอบต้องสั้น กระชับ ภาษาไทย ไม่เกิน 2-3 ประโยค เหมาะกับการพูด ไม่ใช้ bullet points, markdown, emoji หรือสัญลักษณ์พิเศษใดๆ ทั้งสิ้น ตอบเป็นประโยคธรรมดาเท่านั้น
+คำตอบต้องสั้นมาก ไม่เกิน 1-2 ประโยคเท่านั้น ภาษาไทย เหมาะกับการพูดทางโทรศัพท์ ห้ามใช้ bullet points, markdown, emoji หรือสัญลักษณ์พิเศษ ตอบกระชับที่สุด
 
 ${offTopicInstruction}
 
