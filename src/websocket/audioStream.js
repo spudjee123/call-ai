@@ -1,7 +1,7 @@
 const callSessions = require('../utils/callSessions')
 const { transcribeStream } = require('../services/googleSTT')
 const { askClaude } = require('../services/claude')
-const { synthesizeSpeech } = require('../services/tts')
+const { synthesizeSpeechStream } = require('../services/tts')
 
 function registerWebSocket(fastify) {
   fastify.get('/stream', { websocket: true }, (connection, req) => {
@@ -19,33 +19,32 @@ function registerWebSocket(fastify) {
 
     console.log(`[WS] Connected callSid=${callSid}`)
 
-    // ส่งเสียง AI กลับ Twilio แล้ว unlock isSpeaking หลัง playback จบ
+    // Streaming TTS — ส่ง chunk ไป Twilio ทันทีที่ ElevenLabs generate
+    // ไม่ต้องรอ audio ทั้งหมดก่อน → ลด latency 2-3 วินาที
     async function speakAndWait(text, session, markName) {
       if (!callActive || socket.readyState !== socket.OPEN) return
 
-      const audioChunks = await synthesizeSpeech(text, session.campaign.voice_id)
-      console.log(`[Audio] Sending ${audioChunks.length} chunks for mark=${markName}`)
-
       let sent = 0
-      for (const chunk of audioChunks) {
-        if (socket.readyState === socket.OPEN) {
+      try {
+        for await (const chunk of synthesizeSpeechStream(text, session.campaign.voice_id)) {
+          if (socket.readyState !== socket.OPEN) break
           socket.send(JSON.stringify({ event: 'media', streamSid, media: { payload: chunk.toString('base64') } }))
           sent++
         }
+      } catch (err) {
+        console.error('[Audio Stream error]', err.message)
       }
-      console.log(`[Audio] Sent ${sent}/${audioChunks.length} chunks`)
+
+      console.log(`[Audio] Streamed ${sent} chunks for mark=${markName}`)
 
       if (socket.readyState === socket.OPEN) {
         socket.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: markName } }))
       }
 
-      // Fallback: unlock isSpeaking หลัง expected playback duration
-      // Twilio ไม่ส่ง mark กลับมาเสมอ → ใช้ timer เป็น safety net
-      // 160 bytes/chunk × 8000 bytes/sec = 20ms/chunk
-      const playbackMs = sent * 20 + 1500  // actual duration + 1.5s buffer
+      const playbackMs = sent * 20 + 1500
       setTimeout(() => {
         if (isSpeaking) {
-          console.log(`[Audio] Fallback unlock after ${playbackMs}ms (mark not received)`)
+          console.log(`[Audio] Fallback unlock after ${playbackMs}ms`)
           isSpeaking = false
         }
       }, playbackMs)
