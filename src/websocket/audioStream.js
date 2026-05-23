@@ -22,6 +22,7 @@ function registerWebSocket(fastify) {
     let bargeInCooldown = false   // cooldown หลัง barge-in ป้องกัน echo false-trigger
     let silenceTimer = null
     let silencePromptCount = 0
+    let lastMarkTime = 0
 
     console.log(`[WS] Connected callSid=${callSid}`)
 
@@ -159,7 +160,23 @@ function registerWebSocket(fastify) {
         sttStream = transcribeStream(async (transcript) => {
           if (!transcript || !callActive) return
           if (socket.readyState !== socket.OPEN) return
-          if (bargeInCooldown || sttProcessing) return  // skip ถ้ายังอยู่ใน cooldown หรือ busy
+          if (sttProcessing) {
+            console.log(`[STT] Transcript dropped (busy): "${transcript.substring(0, 40)}"`)
+            return
+          }
+          if (bargeInCooldown) {
+            console.log(`[STT] Transcript dropped (barge-in cooldown): "${transcript.substring(0, 40)}"`)
+            return
+          }
+          // Post-mark echo filter: short fragment ภายใน 500ms ของ mark = delayed PSTN echo
+          const msSinceMark = Date.now() - lastMarkTime
+          if (msSinceMark < 500) {
+            const wc = transcript.trim().split(/\s+/).length
+            if (wc < 3 && transcript.length < 10) {
+              console.log(`[STT] Echo suppressed (${msSinceMark}ms after mark): "${transcript}"`)
+              return
+            }
+          }
 
           const currentSession = callSessions.get(callSid)
           if (!currentSession) return
@@ -192,6 +209,15 @@ function registerWebSocket(fastify) {
           let fullText = ''
           let totalSent = 0
 
+          // Safety: ถ้า Claude/TTS ค้างนานผิดปกติ ให้ unlock อัตโนมัติ
+          const processingGuard = setTimeout(() => {
+            if (sttProcessing) {
+              console.error('[AI] sttProcessing stuck >30s — force reset')
+              sttProcessing = false
+              isSpeaking = false
+            }
+          }, 30000)
+
           try {
             // LLM Streaming → TTS Pipeline
             // Claude yield ประโยค → ElevenLabs เริ่มทันที → ไม่ต้องรอ Claude เสร็จ
@@ -220,6 +246,7 @@ function registerWebSocket(fastify) {
           } catch (err) {
             console.error('[AI/TTS error]', err.message)
           } finally {
+            clearTimeout(processingGuard)
             ttsAbortController = null
             sttProcessing = false
           }
@@ -304,8 +331,7 @@ function registerWebSocket(fastify) {
       if (msg.event === 'mark') {
         console.log(`[WS] Mark received: ${msg.mark?.name}`)
         isSpeaking = false
-        bargeInCooldown = true
-        setTimeout(() => { bargeInCooldown = false }, 500)
+        lastMarkTime = Date.now()
         startSilenceTimer()
       }
 

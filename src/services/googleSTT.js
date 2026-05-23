@@ -26,6 +26,9 @@ function transcribeStream(onTranscript) {
   let currentStream = null
   let errorRetryCount = 0
 
+  let writeCount = 0
+  let code11Count = 0
+
   function createStream() {
     if (destroyed || currentStream) return  // ป้องกัน double-creation
     console.log('[STT] Creating new stream')
@@ -37,7 +40,12 @@ function transcribeStream(onTranscript) {
     })
     .on('error', (err) => {
       if (destroyed) return
-      if (err.code !== 11) console.error('[STT error]', err.message)
+      if (err.code === 11) {
+        code11Count++
+        if (code11Count % 5 === 0) console.log(`[STT] Stream reset (code 11) ×${code11Count}`)
+      } else {
+        console.error('[STT error]', err.message)
+      }
       currentStream = null
       errorRetryCount++
       if (errorRetryCount >= 10) {
@@ -76,14 +84,18 @@ function transcribeStream(onTranscript) {
 
   return {
     write(mulawBuffer) {
-      if (destroyed || !currentStream) return
+      if (destroyed || !currentStream) {
+        if (!destroyed) console.log('[STT] write skipped — no stream')
+        return
+      }
       try {
         const pcm = mulawBufferToPcm16(mulawBuffer)
         currentStream.write(pcm)
+        if (++writeCount % 100 === 0) console.log(`[STT] Audio flowing: ${writeCount} packets sent`)
       } catch (e) {
         console.error('[STT] write error, recreating stream:', e.message)
         currentStream = null
-        setTimeout(createStream, 100)  // recreate ทันที ไม่รอ zombie stream
+        setTimeout(createStream, 100)
       }
     },
     end() {
