@@ -50,8 +50,8 @@ function registerWebSocket(fastify) {
       let totalSent = 0
 
       const promptText = silencePromptCount >= 2
-        ? 'ไม่ได้ยินเสียงครับ ขอบคุณที่รับสายนะครับ'
-        : 'ได้ยินอยู่ไหมครับ'
+        ? 'ไม่ได้ยินเสียงค่ะ ขอบคุณที่รับสายนะคะ'
+        : 'ได้ยินอยู่ไหมคะ'
 
       try {
         for await (const chunk of synthesizeSpeechStream(promptText, currentSession.campaign.voice_id, signal)) {
@@ -304,6 +304,8 @@ function registerWebSocket(fastify) {
       if (msg.event === 'mark') {
         console.log(`[WS] Mark received: ${msg.mark?.name}`)
         isSpeaking = false
+        bargeInCooldown = true
+        setTimeout(() => { bargeInCooldown = false }, 500)
         startSilenceTimer()
       }
 
