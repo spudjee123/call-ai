@@ -8,7 +8,7 @@ const MAX_HISTORY = 20
 async function askClaude(session, isGreeting = false) {
   const { name, campaign, messages, offTopicCount } = session
 
-  const systemPrompt = buildSystemPrompt(campaign.system_prompt, name, offTopicCount)
+  const systemPrompt = buildSystemPrompt(campaign.script || campaign.system_prompt, name, offTopicCount)
 
   // ตัด history ให้ไม่ยาวเกิน
   const history = messages.slice(-MAX_HISTORY)
