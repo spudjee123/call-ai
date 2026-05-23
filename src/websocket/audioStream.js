@@ -90,13 +90,17 @@ function registerWebSocket(fastify) {
         // AI ทักทายก่อนเลย
         setTimeout(async () => {
           const session = callSessions.get(callSid)
-          if (!session) return
+          if (!session) { console.log('[Greeting] No session found'); return }
           isSpeaking = true
           try {
+            console.log(`[Greeting] Calling Claude...`)
             const greeting = await askClaude(session, true)
+            console.log(`[Greeting] "${greeting.substring(0, 100)}"`)
             session.messages.push({ role: 'assistant', content: greeting })
 
             const audioChunks = await synthesizeSpeech(greeting, session.campaign.voice_id)
+            console.log(`[Greeting] Sending ${audioChunks.length} chunks, readyState=${socket.readyState}`)
+            let sent = 0
             for (const chunk of audioChunks) {
               if (socket.readyState === socket.OPEN) {
                 socket.send(JSON.stringify({
@@ -104,10 +108,15 @@ function registerWebSocket(fastify) {
                   streamSid,
                   media: { payload: chunk.toString('base64') }
                 }))
+                sent++
               }
             }
+            console.log(`[Greeting] Sent ${sent}/${audioChunks.length} chunks`)
+            if (socket.readyState === socket.OPEN) {
+              socket.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'greeting_done' } }))
+            }
           } catch (err) {
-            console.error('[Greeting error]', err.message)
+            console.error('[Greeting error]', err.message, err.stack)
           } finally {
             isSpeaking = false
           }
