@@ -13,7 +13,6 @@ async function makeOutboundCall(contact, campaign) {
     statusCallback: `${process.env.BASE_URL}/webhook/status`,
     statusCallbackMethod: 'POST',
     statusCallbackEvent: ['completed', 'busy', 'no-answer', 'failed'],
-    machineDetection: 'DetectMessageEnd',
     timeout: 30,
   })
 
