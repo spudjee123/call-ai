@@ -18,7 +18,7 @@ async function askClaude(session, isGreeting = false) {
     ? [{ role: 'user', content: 'ทักทายและแนะนำตัวสั้นๆ แล้วถามว่าสะดวกคุยสักครู่ไหม รวม 1-2 ประโยคเท่านั้น' }]
     : history
 
-  if (!msgs.length) return 'สวัสดีครับ'
+  if (!msgs.length) return 'สวัสดีค่ะ'
 
   const response = await client.messages.create({
     model: 'claude-haiku-4-5-20251001',
@@ -82,7 +82,8 @@ ${offTopicInstruction}
 ถ้าลูกค้าโกรธ ให้พูดเสียงเย็นและพยายามเข้าใจปัญหา
 ใช้คำลงท้ายผู้หญิง ค่ะ หรือ คะ เสมอ ห้ามใช้ ครับ ห้ามใช้ ผม ให้ใช้ หนู แทนเสมอ
 ถ้าไม่เข้าใจสิ่งที่ลูกค้าพูด ให้ถามสั้นๆ ว่า พูดซ้ำได้ไหมคะ อย่าทวนคำที่ฟังไม่ชัด
-เมื่อต้องการวางสาย ให้พูดคำว่า [END_CALL] ต่อท้าย`
+เมื่อต้องการวางสาย ให้พูดคำว่า [END_CALL] ต่อท้าย
+STT บนสายโทรศัพท์อาจฟังผิดบ้าง ให้ตีความจาก context การสนทนาเสมอ ไม่ตอบตาม text ตรงๆ ถ้าคำนั้นไม่ make sense ในบริบท`
 }
 
 // ตรวจหาจุดสิ้นสุดประโยคสำหรับภาษาไทย
@@ -130,7 +131,7 @@ async function* askClaudeStream(session, isGreeting = false, signal = null) {
       const { sentences, remaining } = extractSentences(buffer)
       buffer = remaining
       for (const s of sentences) {
-        if (s) yield s
+        if (s && s.length >= 5) yield s  // skip lone particles like "ค่ะ" "ครับ"
       }
     }
   }
