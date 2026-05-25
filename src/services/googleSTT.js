@@ -11,7 +11,7 @@ const STT_CONFIG = {
   encoding: 'LINEAR16',
   sampleRateHertz: 8000,
   languageCode: 'th-TH',
-  model: 'latest_short',
+  model: 'phone_call',
   useEnhanced: true,
   speechContexts: [{
     phrases: ['สวัสดี', 'ครับ', 'ค่ะ', 'สนใจ', 'ราคา', 'โปรโมชั่น', 'ไม่สนใจ', 'ขอบคุณ',
@@ -21,8 +21,6 @@ const STT_CONFIG = {
   enableAutomaticPunctuation: true,
 }
 
-// 300ms of PCM silence (8000 Hz × 0.3s × 2 bytes) — kicks off gRPC connection for prewarm
-const PCM_SILENCE_300MS = Buffer.alloc(4800, 0)
 
 function transcribeStream(onTranscript, onInterim) {
   let destroyed = false
@@ -85,7 +83,10 @@ function transcribeStream(onTranscript, onInterim) {
       if (stream !== currentStream) return  // ignore prewarm stream data
       errorRetryCount = 0
       const result = data.results[0]
-      if (!result) return
+      if (!result) {
+        if (data.speechEventType) console.log(`[STT] Event: ${data.speechEventType}`)
+        return
+      }
       const text = result.alternatives?.[0]?.transcript || ''
 
       if (!result.isFinal) {
@@ -139,15 +140,19 @@ function transcribeStream(onTranscript, onInterim) {
           setTimeout(() => createStream(false), 50)
         }
       } else if (stream === nextStream) {
-        // prewarm stream ended early (e.g. silence timeout)
-        console.log('[STT] Pre-warm stream ended early — will recreate on demand')
         nextStream = null
+        // Recreate prewarm if current stream is still active
+        if (!destroyed && currentStream) {
+          console.log('[STT] Pre-warm ended early — recreating')
+          setTimeout(() => { if (!nextStream && !destroyed && currentStream) createStream(true) }, 300)
+        }
       }
     })
 
     if (isPrewarm) {
       nextStream = stream
-      try { stream.write(PCM_SILENCE_300MS) } catch (_) {}
+      // gRPC channel established on createStream() — no audio write needed
+      // Writing silence triggers Google VAD → singleUtterance ends prewarm early
     } else {
       currentStream = stream
     }
