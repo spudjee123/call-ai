@@ -11,7 +11,7 @@ const STT_CONFIG = {
   encoding: 'LINEAR16',
   sampleRateHertz: 8000,
   languageCode: 'th-TH',
-  model: 'latest_short',
+  model: 'latest_long',
   useEnhanced: true,
   speechContexts: [{
     phrases: ['สวัสดี', 'ครับ', 'ค่ะ', 'สนใจ', 'ราคา', 'โปรโมชั่น', 'ไม่สนใจ', 'ขอบคุณ',
@@ -28,6 +28,9 @@ function transcribeStream(onTranscript, onInterim) {
 
   let writeCount = 0
   let code11Count = 0
+  let interimText = ''
+  let interimTimer = null
+  const INTERIM_FINALIZE_MS = 1500  // หยุดพูด 1.5s = treat interim เป็น final
 
   function createStream() {
     if (destroyed || currentStream) return  // ป้องกัน double-creation
@@ -35,8 +38,8 @@ function transcribeStream(onTranscript, onInterim) {
 
     const stream = client.streamingRecognize({
       config: STT_CONFIG,
-      interimResults: true,   // diagnostic: ดูว่า Google ส่งอะไรกลับมาบ้าง
-      singleUtterance: false,
+      interimResults: true,
+      singleUtterance: true,  // finalize เร็วขึ้นเมื่อ Google detect end-of-speech
     })
     .on('error', (err) => {
       if (destroyed) return
@@ -62,10 +65,24 @@ function transcribeStream(onTranscript, onInterim) {
       if (!result.isFinal) {
         if (text) {
           console.log(`[STT interim] "${text}"`)
+          interimText = text
           onInterim?.()
+          // reset timer: ถ้าหยุดพูด 1.5s แล้วยังไม่มี final → treat interim เป็น final
+          clearTimeout(interimTimer)
+          interimTimer = setTimeout(() => {
+            if (interimText && !destroyed) {
+              console.log(`[STT] Interim→Final (1.5s silence): "${interimText}"`)
+              onTranscript(interimText)
+              interimText = ''
+            }
+          }, INTERIM_FINALIZE_MS)
         }
         return
       }
+      // Google finalize มาก่อน timer → cancel timer แล้วใช้ final แทน
+      clearTimeout(interimTimer)
+      interimTimer = null
+      interimText = ''
       if (text.trim()) {
         onTranscript(text.trim())
       } else {
@@ -74,9 +91,11 @@ function transcribeStream(onTranscript, onInterim) {
     })
     .on('end', () => {
       if (!destroyed) {
-        console.log('[STT] Stream ended, recreating...')
+        console.log('[STT] Stream ended (singleUtterance) — recreating for next utterance')
         currentStream = null
-        setTimeout(createStream, 100)
+        interimText = ''
+        clearTimeout(interimTimer)
+        setTimeout(createStream, 50)
       }
     })
 
@@ -104,6 +123,8 @@ function transcribeStream(onTranscript, onInterim) {
     end() {
       if (destroyed) return
       destroyed = true
+      clearTimeout(interimTimer)
+      interimTimer = null
       try { currentStream?.end() } catch (e) {}
       currentStream = null
     }
