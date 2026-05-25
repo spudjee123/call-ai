@@ -32,7 +32,7 @@ function registerWebSocket(fastify) {
 
     function startSilenceTimer() {
       clearSilenceTimer()
-      if (!callActive || isSpeaking) return
+      if (!callActive || isSpeaking || sttProcessing) return
       silenceTimer = setTimeout(handleSilence, 8000)
     }
 
@@ -86,6 +86,7 @@ function registerWebSocket(fastify) {
       if (!isSpeaking) return
       console.log('[Barge-in] Customer interrupted — stopping AI audio')
       clearSilenceTimer()
+      silencePromptCount = 0
       if (greetingAbortController) { greetingAbortController.abort(); greetingAbortController = null }
       if (ttsAbortController) { ttsAbortController.abort(); ttsAbortController = null }
       if (socket.readyState === socket.OPEN) {
@@ -227,9 +228,13 @@ function registerWebSocket(fastify) {
               console.log(`[AI] "${sentence}"`)
               fullText += (fullText ? ' ' : '') + sentence
 
+              // Strip [END_CALL] ก่อนส่ง TTS ป้องกันพูดออกเสียงตัว marker
+              const cleanSentence = sentence.replace(/\[END_CALL\]/g, '').trim()
+
               // Stream ประโยคนี้ไป TTS และส่ง Twilio ทันที
               try {
-                for await (const chunk of synthesizeSpeechStream(sentence, currentSession.campaign.voice_id, signal)) {
+                if (!cleanSentence) { if (sentence.includes('[END_CALL]')) break; continue }
+                for await (const chunk of synthesizeSpeechStream(cleanSentence, currentSession.campaign.voice_id, signal)) {
                   if (socket.readyState !== socket.OPEN || signal.aborted) break
                   socket.send(JSON.stringify({ event: 'media', streamSid, media: { payload: chunk.toString('base64') } }))
                   totalSent++

@@ -39,10 +39,10 @@ function transcribeStream(onTranscript, onInterim) {
     const stream = client.streamingRecognize({
       config: STT_CONFIG,
       interimResults: true,
-      singleUtterance: true,  // finalize เร็วขึ้นเมื่อ Google detect end-of-speech
     })
     .on('error', (err) => {
       if (destroyed) return
+      if (currentStream !== stream) return
       if (err.code === 11) {
         code11Count++
         if (code11Count % 5 === 0) console.log(`[STT] Stream reset (code 11) ×${code11Count}`)
@@ -58,6 +58,7 @@ function transcribeStream(onTranscript, onInterim) {
       setTimeout(createStream, 100)
     })
     .on('data', (data) => {
+      if (currentStream !== stream) return
       errorRetryCount = 0
       const result = data.results[0]
       if (!result) return
@@ -67,7 +68,6 @@ function transcribeStream(onTranscript, onInterim) {
           console.log(`[STT interim] "${text}"`)
           interimText = text
           onInterim?.()
-          // reset timer: ถ้าหยุดพูด 1.5s แล้วยังไม่มี final → treat interim เป็น final
           clearTimeout(interimTimer)
           interimTimer = setTimeout(() => {
             if (interimText && !destroyed) {
@@ -79,7 +79,6 @@ function transcribeStream(onTranscript, onInterim) {
         }
         return
       }
-      // Google finalize มาก่อน timer → cancel timer แล้วใช้ final แทน
       clearTimeout(interimTimer)
       interimTimer = null
       interimText = ''
@@ -90,8 +89,8 @@ function transcribeStream(onTranscript, onInterim) {
       }
     })
     .on('end', () => {
-      if (!destroyed) {
-        console.log('[STT] Stream ended (singleUtterance) — recreating for next utterance')
+      if (!destroyed && currentStream === stream) {
+        console.log('[STT] Stream ended — recreating')
         currentStream = null
         interimText = ''
         clearTimeout(interimTimer)

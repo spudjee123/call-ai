@@ -85,11 +85,6 @@ ${offTopicInstruction}
 เมื่อต้องการวางสาย ให้พูดคำว่า [END_CALL] ต่อท้าย`
 }
 
-function isOffTopic(text) {
-  const salesKeywords = ['สินค้า', 'โปรโมชั่น', 'ราคา', 'สนใจ', 'ซื้อ', 'บริการ', 'ติดต่อ', 'นัดหมาย']
-  return !salesKeywords.some(k => text.includes(k))
-}
-
 // ตรวจหาจุดสิ้นสุดประโยคสำหรับภาษาไทย
 // แยกที่: . ! ? หรือ คำลงท้ายสุภาพ ตามด้วย space หรือ end
 function extractSentences(buffer) {
@@ -118,14 +113,10 @@ async function* askClaudeStream(session, isGreeting = false, signal = null) {
 
   if (!msgs.length) { yield 'สวัสดีค่ะ'; return }
 
-  if (isOffTopic(msgs[msgs.length - 1]?.content || '')) {
-    session.offTopicCount = (session.offTopicCount || 0) + 1
-  }
-
   // ใช้ create({ stream: true }) แทน .stream() เพื่อ compatibility ทุก SDK version
   const stream = await client.messages.create({
     model: 'claude-haiku-4-5-20251001',
-    max_tokens: 80,
+    max_tokens: 150,
     system: systemPrompt,
     messages: msgs,
     stream: true,
