@@ -11,7 +11,7 @@ const STT_CONFIG = {
   encoding: 'LINEAR16',
   sampleRateHertz: 8000,
   languageCode: 'th-TH',
-  model: 'phone_call',
+  model: 'default',
   useEnhanced: true,
   speechContexts: [{
     phrases: ['สวัสดี', 'ครับ', 'ค่ะ', 'สนใจ', 'ราคา', 'โปรโมชั่น', 'ไม่สนใจ', 'ขอบคุณ',
