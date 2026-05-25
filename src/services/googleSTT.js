@@ -21,87 +21,139 @@ const STT_CONFIG = {
   enableAutomaticPunctuation: true,
 }
 
+// 300ms of PCM silence (8000 Hz × 0.3s × 2 bytes) — kicks off gRPC connection for prewarm
+const PCM_SILENCE_300MS = Buffer.alloc(4800, 0)
+
 function transcribeStream(onTranscript, onInterim) {
   let destroyed = false
   let currentStream = null
+  let nextStream = null    // pre-warmed stream ready for next utterance
   let errorRetryCount = 0
 
   let writeCount = 0
   let code11Count = 0
   let interimText = ''
   let interimTimer = null
-  const INTERIM_FINALIZE_MS = 1500  // หยุดพูด 1.5s = treat interim เป็น final
+  let interimPromoted = false  // true only when interimTimer already called onTranscript
+  const INTERIM_FINALIZE_MS = 1500
 
-  function createStream() {
-    if (destroyed || currentStream) return  // ป้องกัน double-creation
-    console.log('[STT] Creating new stream')
+  function createStream(isPrewarm = false) {
+    if (destroyed) return
+    if (!isPrewarm && currentStream) return
+
+    console.log(isPrewarm ? '[STT] Pre-warming next stream' : '[STT] Creating new stream')
 
     const stream = client.streamingRecognize({
       config: STT_CONFIG,
       interimResults: true,
+      singleUtterance: true,
     })
     .on('error', (err) => {
       if (destroyed) return
-      if (currentStream !== stream) return
+      if (stream !== currentStream && stream !== nextStream) return
+
       if (err.code === 11) {
         code11Count++
         if (code11Count % 5 === 0) console.log(`[STT] Stream reset (code 11) ×${code11Count}`)
       } else {
         console.error('[STT error]', err.message)
       }
-      currentStream = null
-      errorRetryCount++
-      if (errorRetryCount >= 10) {
-        console.error('[STT] Too many consecutive errors, stopping recreation')
-        return
+
+      if (stream === currentStream) {
+        currentStream = null
+        errorRetryCount++
+        if (errorRetryCount >= 10) {
+          console.error('[STT] Too many consecutive errors, stopping recreation')
+          return
+        }
+        if (nextStream) {
+          clearTimeout(interimTimer)
+          interimTimer = null
+          interimText = ''
+          interimPromoted = false
+          currentStream = nextStream
+          nextStream = null
+          console.log('[STT] Error recovery: switched to pre-warmed stream')
+        } else {
+          setTimeout(() => createStream(false), 100)
+        }
+      } else {
+        nextStream = null
       }
-      setTimeout(createStream, 100)
     })
     .on('data', (data) => {
-      if (currentStream !== stream) return
+      if (stream !== currentStream) return  // ignore prewarm stream data
       errorRetryCount = 0
       const result = data.results[0]
       if (!result) return
       const text = result.alternatives?.[0]?.transcript || ''
+
       if (!result.isFinal) {
         if (text) {
           console.log(`[STT interim] "${text}"`)
           interimText = text
           onInterim?.()
+
+          // trigger prewarm on first interim — stream B warms while customer is still speaking
+          if (!nextStream && !destroyed) createStream(true)
+
           clearTimeout(interimTimer)
           interimTimer = setTimeout(() => {
             if (interimText && !destroyed) {
               console.log(`[STT] Interim→Final (1.5s silence): "${interimText}"`)
               onTranscript(interimText)
               interimText = ''
+              interimPromoted = true
             }
           }, INTERIM_FINALIZE_MS)
         }
         return
       }
+
+      // Final result — guard against duplicate if interimTimer already promoted it
       clearTimeout(interimTimer)
       interimTimer = null
       interimText = ''
-      if (text.trim()) {
+      if (!interimPromoted && text.trim()) {
         onTranscript(text.trim())
-      } else {
+      } else if (!interimPromoted && !text.trim()) {
         console.log('[STT] Final result but empty transcript')
       }
+      interimPromoted = false
     })
     .on('end', () => {
-      if (!destroyed && currentStream === stream) {
-        console.log('[STT] Stream ended — recreating')
+      if (destroyed) return
+      if (stream === currentStream) {
         currentStream = null
-        interimText = ''
+        // clear timer so it doesn't fire against the new stream's interimText
         clearTimeout(interimTimer)
-        setTimeout(createStream, 50)
+        interimTimer = null
+        interimText = ''
+        interimPromoted = false
+        if (nextStream) {
+          console.log('[STT] Switched to pre-warmed stream ✓')
+          currentStream = nextStream
+          nextStream = null
+        } else {
+          console.log('[STT] No pre-warm ready — cold start fallback')
+          setTimeout(() => createStream(false), 50)
+        }
+      } else if (stream === nextStream) {
+        // prewarm stream ended early (e.g. silence timeout)
+        console.log('[STT] Pre-warm stream ended early — will recreate on demand')
+        nextStream = null
       }
     })
 
-    currentStream = stream
+    if (isPrewarm) {
+      nextStream = stream
+      try { stream.write(PCM_SILENCE_300MS) } catch (_) {}
+    } else {
+      currentStream = stream
+    }
   }
 
-  createStream()
+  createStream(false)
 
   return {
     write(mulawBuffer) {
@@ -116,7 +168,17 @@ function transcribeStream(onTranscript, onInterim) {
       } catch (e) {
         console.error('[STT] write error, recreating stream:', e.message)
         currentStream = null
-        setTimeout(createStream, 100)
+        if (nextStream) {
+          clearTimeout(interimTimer)
+          interimTimer = null
+          interimText = ''
+          interimPromoted = false
+          currentStream = nextStream
+          nextStream = null
+          console.log('[STT] Write error recovery: switched to pre-warmed stream')
+        } else {
+          setTimeout(() => createStream(false), 100)
+        }
       }
     },
     end() {
@@ -124,8 +186,10 @@ function transcribeStream(onTranscript, onInterim) {
       destroyed = true
       clearTimeout(interimTimer)
       interimTimer = null
-      try { currentStream?.end() } catch (e) {}
+      try { currentStream?.end() } catch (_) {}
+      try { nextStream?.end() } catch (_) {}
       currentStream = null
+      nextStream = null
     }
   }
 }
