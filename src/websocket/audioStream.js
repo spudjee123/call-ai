@@ -23,6 +23,7 @@ function registerWebSocket(fastify) {
     let silenceTimer = null
     let silencePromptCount = 0
     let lastMarkTime = 0
+    let pendingEndCall = false
 
     console.log(`[WS] Connected callSid=${callSid}`)
 
@@ -77,7 +78,8 @@ function registerWebSocket(fastify) {
       }
 
       if (silencePromptCount >= 2) {
-        setTimeout(() => { if (socket.readyState === socket.OPEN) socket.close() }, 3000)
+        const closeDelay = totalSent * 20 + 4000
+        setTimeout(() => { if (socket.readyState === socket.OPEN) socket.close() }, closeDelay)
       }
     }
 
@@ -273,7 +275,10 @@ function registerWebSocket(fastify) {
           }, playbackMs)
 
           if (fullText.includes('[END_CALL]')) {
-            setTimeout(() => { if (socket.readyState === socket.OPEN) socket.close() }, 3000)
+            pendingEndCall = true
+            // Fallback: ปิดสายถ้า mark ไม่มาภายในเวลาที่คาดไว้
+            const fallbackDelay = totalSent * 20 + 5000
+            setTimeout(() => { if (socket.readyState === socket.OPEN) socket.close() }, fallbackDelay)
           }
         }, () => {
           // Interim result = ลูกค้ากำลังพูดอยู่ → reset silence timer ทันที
@@ -344,6 +349,10 @@ function registerWebSocket(fastify) {
         console.log(`[WS] Mark received: ${msg.mark?.name}`)
         isSpeaking = false
         lastMarkTime = Date.now()
+        if (pendingEndCall) {
+          setTimeout(() => { if (socket.readyState === socket.OPEN) socket.close() }, 1000)
+          return
+        }
         startSilenceTimer()
       }
 
