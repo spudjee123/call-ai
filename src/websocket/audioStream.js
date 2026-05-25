@@ -270,6 +270,13 @@ function registerWebSocket(fastify) {
           if (fullText.includes('[END_CALL]')) {
             setTimeout(() => { if (socket.readyState === socket.OPEN) socket.close() }, 3000)
           }
+        }, () => {
+          // Interim result = ลูกค้ากำลังพูดอยู่ → reset silence timer ทันที
+          // ป้องกัน "ได้ยินอยู่ไหมคะ" ไฟร์ระหว่างที่ลูกค้าพูด
+          if (callActive && !isSpeaking && !sttProcessing) {
+            clearSilenceTimer()
+            silencePromptCount = 0
+          }
         })
 
         // AI ทักทายก่อนเลย — ใช้ pre-generated audio ถ้ามี (ลด latency)

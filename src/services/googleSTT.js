@@ -21,7 +21,7 @@ const STT_CONFIG = {
   enableAutomaticPunctuation: true,
 }
 
-function transcribeStream(onTranscript) {
+function transcribeStream(onTranscript, onInterim) {
   let destroyed = false
   let currentStream = null
   let errorRetryCount = 0
@@ -60,7 +60,10 @@ function transcribeStream(onTranscript) {
       if (!result) return
       const text = result.alternatives?.[0]?.transcript || ''
       if (!result.isFinal) {
-        if (text) console.log(`[STT interim] "${text}"`)
+        if (text) {
+          console.log(`[STT interim] "${text}"`)
+          onInterim?.()
+        }
         return
       }
       if (text.trim()) {

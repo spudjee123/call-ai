@@ -15,7 +15,7 @@ async function askClaude(session, isGreeting = false) {
 
   // ถ้าเป็นการทักทายครั้งแรก ไม่ต้องรอ user พูดก่อน
   const msgs = isGreeting
-    ? [{ role: 'user', content: 'ทักทายและแนะนำตัวสั้นๆ 1 ประโยค ยังไม่ต้องพูดรายละเอียดโปรโมชั่น' }]
+    ? [{ role: 'user', content: 'ทักทายและแนะนำตัวสั้นๆ แล้วถามว่าสะดวกคุยสักครู่ไหม รวม 1-2 ประโยคเท่านั้น' }]
     : history
 
   if (!msgs.length) return 'สวัสดีครับ'
@@ -80,7 +80,7 @@ ${offTopicInstruction}
 
 ถ้าถูกถามว่าเป็น AI ให้ตอบตรงๆ ว่าใช่
 ถ้าลูกค้าโกรธ ให้พูดเสียงเย็นและพยายามเข้าใจปัญหา
-ใช้คำลงท้ายผู้หญิง ค่ะ หรือ คะ เสมอ ห้ามใช้ ครับ
+ใช้คำลงท้ายผู้หญิง ค่ะ หรือ คะ เสมอ ห้ามใช้ ครับ ห้ามใช้ ผม ให้ใช้ หนู แทนเสมอ
 ถ้าไม่เข้าใจสิ่งที่ลูกค้าพูด ให้ถามสั้นๆ ว่า พูดซ้ำได้ไหมคะ อย่าทวนคำที่ฟังไม่ชัด
 เมื่อต้องการวางสาย ให้พูดคำว่า [END_CALL] ต่อท้าย`
 }
@@ -113,7 +113,7 @@ async function* askClaudeStream(session, isGreeting = false, signal = null) {
   const systemPrompt = buildSystemPrompt(campaign.script || campaign.system_prompt, name, offTopicCount)
   const history = messages.slice(-MAX_HISTORY)
   const msgs = isGreeting
-    ? [{ role: 'user', content: 'เริ่มต้นการสนทนา' }]
+    ? [{ role: 'user', content: 'ทักทายและแนะนำตัวสั้นๆ แล้วถามว่าสะดวกคุยสักครู่ไหม รวม 1-2 ประโยคเท่านั้น' }]
     : history
 
   if (!msgs.length) { yield 'สวัสดีค่ะ'; return }
