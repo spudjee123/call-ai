@@ -78,6 +78,7 @@ function registerWebSocket(fastify) {
       }
 
       if (silencePromptCount >= 2) {
+        pendingEndCall = true
         const closeDelay = totalSent * 20 + 4000
         setTimeout(() => { if (socket.readyState === socket.OPEN) socket.close() }, closeDelay)
       }
@@ -162,6 +163,7 @@ function registerWebSocket(fastify) {
         // เริ่ม STT stream
         sttStream = transcribeStream(async (transcript) => {
           if (!transcript || !callActive) return
+          if (pendingEndCall) return
           if (socket.readyState !== socket.OPEN) return
           if (sttProcessing) {
             console.log(`[STT] Transcript dropped (busy): "${transcript.substring(0, 40)}"`)
