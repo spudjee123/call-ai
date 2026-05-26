@@ -64,7 +64,7 @@ function buildSystemPrompt(campaignPrompt, customerName, offTopicCount) {
   let offTopicInstruction = ''
 
   if (offTopicCount === 0) {
-    offTopicInstruction = `ถ้าลูกค้าคุยนอกเรื่อง ให้รับฟัง 1 ประโยคแล้วดึงกลับมาที่โปรโมชั่น พร้อมชักชวนให้ลูกค้าสนใจรับโปรให้ได้`
+    offTopicInstruction = `ถ้าลูกค้าคุยนอกเรื่อง ให้ตอบรับสั้นๆ 1 คำ แล้วดึงกลับมาที่โปรโมชั่นทันที ห้ามให้คำแนะนำหรือพูดเรื่องอื่นที่ไม่เกี่ยวกับโปรโมชั่นเด็ดขาด`
   } else if (offTopicCount < MAX_OFFTOPIC) {
     offTopicInstruction = `ลูกค้านอกเรื่องไปแล้ว ${offTopicCount} ครั้ง ให้ดึงกลับมาที่โปรโมชั่นและพยายามปิดการขายให้ได้`
   } else {
@@ -93,24 +93,6 @@ ${offTopicInstruction}
 STT บนสายโทรศัพท์อาจฟังผิดบ้าง ให้ตีความจาก context การสนทนาเสมอ ไม่ตอบตาม text ตรงๆ ถ้าคำนั้นไม่ make sense ในบริบท`
 }
 
-// ตรวจหาจุดสิ้นสุดประโยคสำหรับภาษาไทย
-// แยกที่: . ! ? หรือ คำลงท้ายสุภาพ ตามด้วย space หรือ end
-function extractSentences(buffer) {
-  const re = /(.*?(?:[.!?]|ค่ะ|ครับ|นะคะ|นะครับ|เลยค่ะ|เลยครับ|ด้วยค่ะ|ด้วยครับ))(?=\s|$)/g
-  const sentences = []
-  let lastIndex = 0
-  let match
-  re.lastIndex = 0
-  while ((match = re.exec(buffer)) !== null) {
-    const s = match[1].trim()
-    if (s) sentences.push(s)
-    lastIndex = re.lastIndex
-  }
-  return { sentences, remaining: buffer.slice(lastIndex) }
-}
-
-// Streaming version — yields ประโยคทีละประโยคทันทีที่ Claude generate
-// ElevenLabs เริ่มแปลงเสียงได้โดยไม่ต้องรอ Claude เสร็จทั้งหมด
 async function* askClaudeStream(session, isGreeting = false, signal = null) {
   const { name, campaign, messages, offTopicCount } = session
   const systemPrompt = buildSystemPrompt(campaign.script || campaign.system_prompt, name, offTopicCount)
@@ -121,38 +103,17 @@ async function* askClaudeStream(session, isGreeting = false, signal = null) {
 
   if (!msgs.length) { yield 'สวัสดีค่ะ'; return }
 
-  // ใช้ create({ stream: true }) แทน .stream() เพื่อ compatibility ทุก SDK version
-  const stream = await client.messages.create({
-    model: 'claude-haiku-4-5-20251001',
-    max_tokens: 150,
+  const response = await client.messages.create({
+    model: 'claude-sonnet-4-6',
+    max_tokens: 200,
     system: systemPrompt,
     messages: msgs,
-    stream: true,
   })
 
-  let buffer = ''
-  let shortBuffer = ''  // holds short sentences (<8 chars) to merge with next long one
-  for await (const event of stream) {
-    if (signal?.aborted) return
-    if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
-      buffer += event.delta.text
-      const { sentences, remaining } = extractSentences(buffer)
-      buffer = remaining
-      for (const s of sentences) {
-        if (!s || s.length < 3) continue
-        if (s.length < 8) {
-          shortBuffer = shortBuffer ? shortBuffer + ' ' + s : s
-        } else {
-          yield shortBuffer ? shortBuffer + ' ' + s : s
-          shortBuffer = ''
-        }
-      }
-    }
-  }
+  if (signal?.aborted) return
 
-  // flush — combine any pending short buffer + unparsed tail
-  const pending = [shortBuffer, buffer.trim()].filter(Boolean).join(' ').trim()
-  if (pending.length >= 3) yield pending
+  const text = response.content[0].text.trim()
+  if (text.length >= 3) yield text
 }
 
 module.exports = { askClaude, askClaudeStream, summarizeCall }

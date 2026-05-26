@@ -8,9 +8,9 @@ const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TO
 // Generate ประโยคยาวเพื่อให้ ElevenLabs สร้างเสียงด้วย continuation intonation
 // แล้ว slice เอาเฉพาะส่วนแรก (filler portion) — ทำให้ tone กลมกลืนกับ response หลัก
 const FILLERS = [
-  { text: 'ค่ะ หนูจะตอบให้นะคะ',     keep: 10 },  // ~200ms = "ค่ะ"
-  { text: 'อ่า ค่ะ หนูกำลังดูนะคะ',   keep: 15 },  // ~300ms = "อ่า ค่ะ"
-  { text: 'เดี๋ยวนะคะ หนูตอบให้ค่ะ',  keep: 20 },  // ~400ms = "เดี๋ยวนะคะ"
+  { text: 'ค่ะ หนูจะตอบให้นะคะ',     keep: 20 },  // ~400ms
+  { text: 'อ่า ค่ะ หนูกำลังดูนะคะ',   keep: 30 },  // ~600ms
+  { text: 'เดี๋ยวนะคะ หนูตอบให้ค่ะ',  keep: 35 },  // ~700ms
 ]
 
 async function makeOutboundCall(contact, campaign) {
