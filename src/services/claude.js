@@ -129,6 +129,7 @@ async function* askClaudeStream(session, isGreeting = false, signal = null) {
   })
 
   let buffer = ''
+  let prependKha = !isGreeting  // true until first sentence yielded — adds "ค่ะ " acknowledgment
   for await (const event of stream) {
     if (signal?.aborted) return
     if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
@@ -136,13 +137,27 @@ async function* askClaudeStream(session, isGreeting = false, signal = null) {
       const { sentences, remaining } = extractSentences(buffer)
       buffer = remaining
       for (const s of sentences) {
-        if (s && s.length >= 5) yield s  // skip lone particles like "ค่ะ" "ครับ"
+        if (s && s.length >= 5) {
+          if (prependKha) {
+            prependKha = false
+            yield (s.startsWith('ค่ะ ') || s === 'ค่ะ') ? s : 'ค่ะ ' + s
+          } else {
+            yield s
+          }
+        }
       }
     }
   }
 
   // flush ส่วนที่เหลือ (ประโยคสุดท้ายไม่มี punctuation)
-  if (buffer.trim()) yield buffer.trim()
+  if (buffer.trim().length >= 3) {
+    const flushed = buffer.trim()
+    if (prependKha) {
+      yield (flushed.startsWith('ค่ะ ') || flushed === 'ค่ะ') ? flushed : 'ค่ะ ' + flushed
+    } else {
+      yield flushed
+    }
+  }
 }
 
 module.exports = { askClaude, askClaudeStream, summarizeCall }

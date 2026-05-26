@@ -5,14 +5,6 @@ const { synthesizeSpeech } = require('./tts')
 
 const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
 
-// Generate ประโยคยาวเพื่อให้ ElevenLabs สร้างเสียงด้วย continuation intonation
-// แล้ว slice เอาเฉพาะส่วนแรก (filler portion) — ทำให้ tone กลมกลืนกับ response หลัก
-const FILLERS = [
-  { text: 'ค่ะ หนูจะตอบให้นะคะ',     keep: 10 },  // ~200ms = "ค่ะ"
-  { text: 'อ่า ค่ะ หนูกำลังดูนะคะ',   keep: 15 },  // ~300ms = "อ่า ค่ะ"
-  { text: 'เดี๋ยวนะคะ หนูตอบให้ค่ะ',  keep: 20 },  // ~400ms = "เดี๋ยวนะคะ"
-]
-
 async function makeOutboundCall(contact, campaign) {
   const session = {
     callSid: null,
@@ -24,10 +16,9 @@ async function makeOutboundCall(contact, campaign) {
     direction: 'outbound',
     startTime: Date.now(),
     greetingChunks: null,
-    fillerChunks: null,   // pre-generated filler sounds
   }
 
-  // Pre-generate greeting + fillers ขณะรอสายต่อ (~3-4s) เพื่อลด silence
+  // Pre-generate greeting ขณะรอสายต่อ (~3-4s) เพื่อลด silence
   const greetingPromise = (async () => {
     try {
       const text = await askClaude(session, true)
@@ -36,13 +27,6 @@ async function makeOutboundCall(contact, campaign) {
       session.greetingChunks = chunks
       session.greetingText = text
       console.log(`[PreGen] Greeting ready: "${text.substring(0, 60)}" (${chunks.length} chunks)`)
-      try {
-        const fillerRaw = await Promise.all(FILLERS.map(f => synthesizeSpeech(f.text, campaign.voice_id)))
-        session.fillerChunks = fillerRaw.map((raw, i) => raw.slice(0, FILLERS[i].keep))
-        console.log(`[PreGen] Fillers ready: ${session.fillerChunks.map(f => f.length).join(', ')} chunks`)
-      } catch (err) {
-        console.error('[PreGen] Fillers failed (non-critical):', err.message)
-      }
     } catch (err) {
       console.error('[PreGen] Failed:', err.message)
     }
