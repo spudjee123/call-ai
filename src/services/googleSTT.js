@@ -14,26 +14,42 @@ const STT_CONFIG = {
   model: 'latest_short',
   useEnhanced: true,
   speechContexts: [{
-    phrases: ['สวัสดี', 'ครับ', 'ค่ะ', 'สนใจ', 'ราคา', 'โปรโมชั่น', 'ไม่สนใจ', 'ขอบคุณ',
-              'PGDOG', 'พีจีด็อก', 'แอดไลน์', 'พอยต์', 'ฝาก', 'สมัคร', 'โบนัส'],
+    phrases: [
+      'สวัสดี', 'ครับ', 'ค่ะ', 'สนใจ', 'ราคา', 'โปรโมชั่น', 'ไม่สนใจ', 'ขอบคุณ',
+      'PGDOG', 'พีจีด็อก', 'แอดไลน์', 'พอยต์', 'ฝาก', 'สมัคร', 'โบนัส',
+      'รับ', 'อยากรับ', 'สมัครรับ', 'ต้องทำยังไง',
+    ],
     boost: 15
   }],
   enableAutomaticPunctuation: true,
 }
 
-
 function transcribeStream(onTranscript, onInterim) {
   let destroyed = false
   let currentStream = null
-  let nextStream = null    // pre-warmed stream ready for next utterance
+  let nextStream = null
   let errorRetryCount = 0
 
   let writeCount = 0
   let code11Count = 0
+
   let interimText = ''
   let interimTimer = null
-  let interimPromoted = false  // true only when interimTimer already called onTranscript
+  let utteranceClosed = false  // true after timer delivers transcript — blocks trailing interims and isFinal duplicate
   const INTERIM_FINALIZE_MS = 1500
+
+  function resetUtteranceState() {
+    clearTimeout(interimTimer)
+    interimTimer = null
+    interimText = ''
+    utteranceClosed = false
+  }
+
+  function activatePrewarm() {
+    resetUtteranceState()
+    currentStream = nextStream
+    nextStream = null
+  }
 
   function createStream(isPrewarm = false) {
     if (destroyed) return
@@ -65,14 +81,10 @@ function transcribeStream(onTranscript, onInterim) {
           return
         }
         if (nextStream) {
-          clearTimeout(interimTimer)
-          interimTimer = null
-          interimText = ''
-          interimPromoted = false
-          currentStream = nextStream
-          nextStream = null
+          activatePrewarm()
           console.log('[STT] Error recovery: switched to pre-warmed stream')
         } else {
+          resetUtteranceState()
           setTimeout(() => createStream(false), 100)
         }
       } else {
@@ -80,8 +92,9 @@ function transcribeStream(onTranscript, onInterim) {
       }
     })
     .on('data', (data) => {
-      if (stream !== currentStream) return  // ignore prewarm stream data
+      if (stream !== currentStream) return
       errorRetryCount = 0
+
       const result = data.results[0]
       if (!result) {
         if (data.speechEventType) console.log(`[STT] Event: ${data.speechEventType}`)
@@ -90,58 +103,54 @@ function transcribeStream(onTranscript, onInterim) {
       const text = result.alternatives?.[0]?.transcript || ''
 
       if (!result.isFinal) {
-        if (text) {
-          console.log(`[STT interim] "${text}"`)
-          interimText = text
-          onInterim?.()
+        if (!text || utteranceClosed) return
 
-          // trigger prewarm on first interim — stream B warms while customer is still speaking
-          if (!nextStream && !destroyed) createStream(true)
+        console.log(`[STT interim] "${text}"`)
+        interimText = text
+        onInterim?.()
 
-          clearTimeout(interimTimer)
-          interimTimer = setTimeout(() => {
-            if (interimText && !destroyed) {
-              console.log(`[STT] Interim→Final (1.5s silence): "${interimText}"`)
-              onTranscript(interimText)
-              interimText = ''
-              interimPromoted = true
-            }
-          }, INTERIM_FINALIZE_MS)
-        }
+        if (!nextStream && !destroyed) createStream(true)
+
+        clearTimeout(interimTimer)
+        interimTimer = setTimeout(() => {
+          if (interimText && !destroyed) {
+            console.log(`[STT] Interim→Final (1.5s silence): "${interimText}"`)
+            onTranscript(interimText)
+            interimText = ''
+            utteranceClosed = true
+          }
+        }, INTERIM_FINALIZE_MS)
         return
       }
 
-      // Final result — guard against duplicate if interimTimer already promoted it
+      // isFinal
       clearTimeout(interimTimer)
       interimTimer = null
-      interimText = ''
-      if (!interimPromoted && text.trim()) {
-        onTranscript(text.trim())
-      } else if (!interimPromoted && !text.trim()) {
-        console.log('[STT] Final result but empty transcript')
+      const finalText = text.trim()
+      if (!utteranceClosed) {
+        if (finalText) {
+          onTranscript(finalText)
+        } else {
+          console.log('[STT] Final result but empty transcript')
+        }
       }
-      interimPromoted = false
+      interimText = ''
+      utteranceClosed = false
     })
     .on('end', () => {
       if (destroyed) return
       if (stream === currentStream) {
         currentStream = null
-        // clear timer so it doesn't fire against the new stream's interimText
-        clearTimeout(interimTimer)
-        interimTimer = null
-        interimText = ''
-        interimPromoted = false
         if (nextStream) {
           console.log('[STT] Switched to pre-warmed stream ✓')
-          currentStream = nextStream
-          nextStream = null
+          activatePrewarm()
         } else {
           console.log('[STT] No pre-warm ready — cold start fallback')
+          resetUtteranceState()
           setTimeout(() => createStream(false), 50)
         }
       } else if (stream === nextStream) {
         nextStream = null
-        // Recreate prewarm if current stream is still active
         if (!destroyed && currentStream) {
           console.log('[STT] Pre-warm ended early — recreating')
           setTimeout(() => { if (!nextStream && !destroyed && currentStream) createStream(true) }, 300)
@@ -151,8 +160,6 @@ function transcribeStream(onTranscript, onInterim) {
 
     if (isPrewarm) {
       nextStream = stream
-      // gRPC channel established on createStream() — no audio write needed
-      // Writing silence triggers Google VAD → singleUtterance ends prewarm early
     } else {
       currentStream = stream
     }
@@ -174,14 +181,10 @@ function transcribeStream(onTranscript, onInterim) {
         console.error('[STT] write error, recreating stream:', e.message)
         currentStream = null
         if (nextStream) {
-          clearTimeout(interimTimer)
-          interimTimer = null
-          interimText = ''
-          interimPromoted = false
-          currentStream = nextStream
-          nextStream = null
+          activatePrewarm()
           console.log('[STT] Write error recovery: switched to pre-warmed stream')
         } else {
+          resetUtteranceState()
           setTimeout(() => createStream(false), 100)
         }
       }
