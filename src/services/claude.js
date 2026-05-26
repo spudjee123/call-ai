@@ -81,11 +81,13 @@ ${offTopicInstruction}
 ถ้าถูกถามว่าเป็น AI ให้ตอบตรงๆ ว่าใช่
 ถ้าลูกค้าโกรธ ให้พูดเสียงเย็นและพยายามเข้าใจปัญหา
 ใช้คำลงท้ายผู้หญิง ค่ะ หรือ คะ เสมอ ห้ามใช้ ครับ ห้ามใช้ ผม ให้ใช้ หนู แทนเสมอ
+เมื่อต้องการตอบรับลูกค้า ตัวอย่างเช่น: ดีใจมากเลยค่ะ / ยินดีค่ะ / ขอบคุณค่ะ / เข้าใจแล้วค่ะ / ดีค่ะ ห้ามใช้คำที่ไม่มีในภาษาไทยปกติหรือคำซ้ำผิดปกติ
 ถ้าไม่เข้าใจสิ่งที่ลูกค้าพูด ให้ถามสั้นๆ ว่า พูดซ้ำได้ไหมคะ อย่าทวนคำที่ฟังไม่ชัด
 ใช้ [END_CALL] เฉพาะ 2 กรณีเท่านั้น:
 1. ลูกค้าขอจบสายเองชัดเจน เช่น วางสายได้เลย / ไม่สะดวกแล้ว / ขอบคุณไม่ต้องแล้ว
 2. ลูกค้าปฏิเสธซ้ำหลังจากที่ชักชวนเพิ่มเติมแล้ว — ครั้งแรกที่ปฏิเสธให้โน้มน้าวอีกครั้งก่อนเสมอ
-ถ้าลูกค้าบอกรับทราบ / โอเค / ได้ / เข้าใจ / จะลองทำ → ถามว่า มีอะไรให้ช่วยอีกไหมคะ ห้ามใช้ [END_CALL]
+ถ้าลูกค้าบอกรับทราบ / โอเค / ได้ / เข้าใจ / จะลองทำ / สนใจ / อยากลอง / ลองดู → ถามว่า มีอะไรสอบถามเพิ่มเติมไหมคะ ห้ามใช้ [END_CALL]
+ถ้าลูกค้าสนใจและต้องการสมัคร → แนะนำขั้นตอนสั้นๆ แล้วต้องถาม มีอะไรสอบถามเพิ่มเติมไหมคะ ก่อนเสมอ ถ้าลูกค้าตอบว่าไม่มีคำถามเพิ่มเติม ให้กล่าว ขอบคุณที่สนใจนะคะ [END_CALL]
 ห้ามใช้ [END_CALL] หลังพูดโปรโมชั่น ต้องรอฟังคำตอบก่อนเสมอ
 ห้ามพูดข้อมูลซ้ำที่พูดไปแล้วในสายนี้ ตอบต่อจาก context ล่าสุด ไม่ต้องสรุปซ้ำ
 STT บนสายโทรศัพท์อาจฟังผิดบ้าง ให้ตีความจาก context การสนทนาเสมอ ไม่ตอบตาม text ตรงๆ ถ้าคำนั้นไม่ make sense ในบริบท`
@@ -129,6 +131,7 @@ async function* askClaudeStream(session, isGreeting = false, signal = null) {
   })
 
   let buffer = ''
+  let shortBuffer = ''  // holds short sentences (<8 chars) to merge with next long one
   for await (const event of stream) {
     if (signal?.aborted) return
     if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
@@ -136,13 +139,20 @@ async function* askClaudeStream(session, isGreeting = false, signal = null) {
       const { sentences, remaining } = extractSentences(buffer)
       buffer = remaining
       for (const s of sentences) {
-        if (s && s.length >= 5) yield s  // skip lone particles like "ค่ะ" "ครับ"
+        if (!s || s.length < 3) continue
+        if (s.length < 8) {
+          shortBuffer = shortBuffer ? shortBuffer + ' ' + s : s
+        } else {
+          yield shortBuffer ? shortBuffer + ' ' + s : s
+          shortBuffer = ''
+        }
       }
     }
   }
 
-  // flush ส่วนที่เหลือ (ประโยคสุดท้ายไม่มี punctuation)
-  if (buffer.trim()) yield buffer.trim()
+  // flush — combine any pending short buffer + unparsed tail
+  const pending = [shortBuffer, buffer.trim()].filter(Boolean).join(' ').trim()
+  if (pending.length >= 3) yield pending
 }
 
 module.exports = { askClaude, askClaudeStream, summarizeCall }
