@@ -107,7 +107,7 @@ function transcribeStream(onTranscript, onInterim) {
 
         console.log(`[STT interim] "${text}"`)
         interimText = text
-        onInterim?.()
+        onInterim?.(text)
 
         if (!nextStream && !destroyed) createStream(true)
 

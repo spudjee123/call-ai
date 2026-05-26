@@ -34,6 +34,9 @@ function registerWebSocket(fastify) {
     let lastMarkTime = 0
     let pendingEndCall = false
     let activePipelineId = 0
+    let prewarmPromise = null    // pre-warmed Claude response Promise<string|null>
+    let prewarmStartText = null  // interim text that triggered prewarm
+    let prewarmAbort = null      // AbortController for prewarm call
 
     console.log(`[WS] Connected callSid=${callSid}`)
 
@@ -45,6 +48,43 @@ function registerWebSocket(fastify) {
       clearSilenceTimer()
       if (!callActive || isSpeaking || sttProcessing) return
       silenceTimer = setTimeout(handleSilence, 8000)
+    }
+
+    function isPrewarmUsable(interimText, finalText) {
+      if (!interimText || !finalText) return false
+      const a = interimText.trim(), b = finalText.trim()
+      if (a.length >= 2 && (b.includes(a) || a.includes(b))) return true
+      const n = Math.min(4, a.length, b.length)
+      return n >= 2 && a.substring(0, n) === b.substring(0, n)
+    }
+
+    function startPrewarm(session, interimText) {
+      if (prewarmPromise || isSpeaking || sttProcessing) return
+      prewarmStartText = interimText
+      prewarmAbort = new AbortController()
+      const signal = prewarmAbort.signal
+      const snap = { ...session, messages: [...session.messages, { role: 'user', content: interimText }] }
+      console.log(`[Prewarm] Starting for: "${interimText}"`)
+      prewarmPromise = (async () => {
+        try {
+          let text = ''
+          for await (const chunk of askClaudeStream(snap, false, signal)) {
+            if (signal.aborted) return null
+            text += (text ? ' ' : '') + chunk
+          }
+          if (text) console.log(`[Prewarm] Ready: "${text.substring(0, 60)}"`)
+          return text || null
+        } catch (err) {
+          if (err.name !== 'AbortError') console.error('[Prewarm] Error:', err.message)
+          return null
+        }
+      })()
+    }
+
+    function clearPrewarm() {
+      if (prewarmAbort) { prewarmAbort.abort(); prewarmAbort = null }
+      prewarmPromise = null
+      prewarmStartText = null
     }
 
     async function handleSilence() {
@@ -100,6 +140,7 @@ function registerWebSocket(fastify) {
       console.log('[Barge-in] Customer interrupted — stopping AI audio')
       clearSilenceTimer()
       silencePromptCount = 0
+      clearPrewarm()
       if (greetingAbortController) { greetingAbortController.abort(); greetingAbortController = null }
       if (ttsAbortController) { ttsAbortController.abort(); ttsAbortController = null }
       if (socket.readyState === socket.OPEN) {
@@ -226,18 +267,6 @@ function registerWebSocket(fastify) {
           let fullText = ''
           let totalSent = 0
 
-          // ส่ง filler sound ทันทีขณะ Claude กำลังประมวลผล — ลูกค้าได้ยินเสียงตอบสนองทันที
-          if (currentSession.fillerChunks?.length && socket.readyState === socket.OPEN) {
-            const fillerIdx = Math.floor(Math.random() * currentSession.fillerChunks.length)
-            const filler = currentSession.fillerChunks[fillerIdx]
-            console.log(`[Filler] Playing #${fillerIdx} (${filler.length} chunks)`)
-            for (const chunk of filler) {
-              if (socket.readyState !== socket.OPEN || signal.aborted) break
-              socket.send(JSON.stringify({ event: 'media', streamSid, media: { payload: chunk.toString('base64') } }))
-              totalSent++
-            }
-          }
-
           // Safety: ถ้า Claude/TTS ค้างนานผิดปกติ ให้ unlock อัตโนมัติ
           const processingGuard = setTimeout(() => {
             if (sttProcessing) {
@@ -247,30 +276,45 @@ function registerWebSocket(fastify) {
             }
           }, 30000)
 
+          // Capture prewarm reference — ป้องกัน pipeline เก่าล้าง prewarm ของ pipeline ใหม่
+          const myPrewarm = prewarmPromise
+          const myPrewarmText = prewarmStartText
+
           try {
-            for await (const sentence of askClaudeStream(currentSession, false, signal)) {
-              if (signal.aborted || !callActive || !isSpeaking) break
+            // Use pre-warmed Claude response if available and applicable
+            let aiText = null
+            if (myPrewarm && isPrewarmUsable(myPrewarmText, transcript)) {
+              console.log(`[Prewarm] Awaiting pre-warmed response for: "${transcript}"`)
+              aiText = await myPrewarm
+              if (aiText) console.log(`[Prewarm] Hit — skipping fresh Claude call`)
+              else console.log(`[Prewarm] Null result — falling back to fresh call`)
+            }
+            if (prewarmPromise === myPrewarm) clearPrewarm()
 
-              console.log(`[AI] "${sentence}"`)
-              fullText += (fullText ? ' ' : '') + sentence
-
-              const cleanSentence = sentence.replace(/\[END_CALL\]/g, '').trim()
-
-              try {
-                if (!cleanSentence) { if (sentence.includes('[END_CALL]')) break; continue }
-                for await (const chunk of synthesizeSpeechStream(cleanSentence, currentSession.campaign.voice_id, signal)) {
-                  if (socket.readyState !== socket.OPEN || signal.aborted) break
-                  socket.send(JSON.stringify({ event: 'media', streamSid, media: { payload: chunk.toString('base64') } }))
-                  totalSent++
-                }
-              } catch (err) {
-                if (err.code !== 'ERR_CANCELED' && err.name !== 'CanceledError') {
-                  console.error('[TTS error]', err.message)
-                }
-                break
+            if (!aiText && !signal.aborted && callActive && isSpeaking) {
+              for await (const chunk of askClaudeStream(currentSession, false, signal)) {
+                if (signal.aborted || !callActive || !isSpeaking) break
+                aiText = (aiText ? aiText + ' ' : '') + chunk
               }
+            }
 
-              if (sentence.includes('[END_CALL]')) break
+            if (aiText && !signal.aborted && callActive && isSpeaking) {
+              console.log(`[AI] "${aiText}"`)
+              fullText = aiText
+              const cleanText = aiText.replace(/\[END_CALL\]/g, '').trim()
+              if (cleanText) {
+                try {
+                  for await (const chunk of synthesizeSpeechStream(cleanText, currentSession.campaign.voice_id, signal)) {
+                    if (socket.readyState !== socket.OPEN || signal.aborted) break
+                    socket.send(JSON.stringify({ event: 'media', streamSid, media: { payload: chunk.toString('base64') } }))
+                    totalSent++
+                  }
+                } catch (err) {
+                  if (err.code !== 'ERR_CANCELED' && err.name !== 'CanceledError') {
+                    console.error('[TTS error]', err.message)
+                  }
+                }
+              }
             }
 
             if (fullText.includes('[END_CALL]') && shouldBlockEndCall(currentSession, fullText)) {
@@ -293,6 +337,7 @@ function registerWebSocket(fastify) {
             console.error('[AI/TTS error]', err.message)
           } finally {
             clearTimeout(processingGuard)
+            if (prewarmPromise === myPrewarm) clearPrewarm()
             ttsAbortController = null
             if (activePipelineId === pipelineId) sttProcessing = false
           }
@@ -323,13 +368,12 @@ function registerWebSocket(fastify) {
             const fallbackDelay = totalSent * 20 + 5000
             setTimeout(() => { if (socket.readyState === socket.OPEN) socket.close() }, fallbackDelay)
           }
-        }, () => {
-          // Interim result = ลูกค้ากำลังพูดอยู่ → reset silence timer ทันที
-          // ป้องกัน "ได้ยินอยู่ไหมคะ" ไฟร์ระหว่างที่ลูกค้าพูด
-          if (callActive && !isSpeaking && !sttProcessing) {
-            clearSilenceTimer()
-            silencePromptCount = 0
-          }
+        }, (interimText) => {
+          if (!callActive || isSpeaking || sttProcessing || bargeInCooldown) return
+          clearSilenceTimer()
+          silencePromptCount = 0
+          const session = callSessions.get(callSid)
+          if (session) startPrewarm(session, interimText)
         })
 
         // AI ทักทายก่อนเลย — ใช้ pre-generated audio ถ้ามี (ลด latency)
