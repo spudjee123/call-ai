@@ -189,6 +189,17 @@ function transcribeStream(onTranscript, onInterim) {
         }
       }
     },
+    reset() {
+      if (destroyed) return
+      errorRetryCount = 0
+      console.log('[STT] Resetting stream (AI done)')
+      try { currentStream?.end() } catch (_) {}
+      try { nextStream?.end() } catch (_) {}
+      currentStream = null
+      nextStream = null
+      resetUtteranceState()
+      createStream(false)
+    },
     end() {
       if (destroyed) return
       destroyed = true

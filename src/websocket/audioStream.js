@@ -363,6 +363,7 @@ function registerWebSocket(fastify) {
           setTimeout(() => { if (socket.readyState === socket.OPEN) socket.close() }, 1000)
           return
         }
+        if (!bargeInCooldown && !sttProcessing) sttStream?.reset()
         startSilenceTimer()
       }
 
