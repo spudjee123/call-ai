@@ -36,7 +36,7 @@ function transcribeStream(onTranscript, onInterim) {
   let interimText = ''
   let interimTimer = null
   let utteranceClosed = false  // true after timer delivers transcript — blocks trailing interims and isFinal duplicate
-  const INTERIM_FINALIZE_MS = 800
+  const INTERIM_FINALIZE_MS = 1500
 
   function resetUtteranceState() {
     clearTimeout(interimTimer)
