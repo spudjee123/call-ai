@@ -24,6 +24,7 @@ function registerWebSocket(fastify) {
     let silencePromptCount = 0
     let lastMarkTime = 0
     let pendingEndCall = false
+    let activePipelineId = 0
 
     console.log(`[WS] Connected callSid=${callSid}`)
 
@@ -101,7 +102,7 @@ function registerWebSocket(fastify) {
 
     // Streaming TTS — ส่ง chunk ไป Twilio ทันทีที่ ElevenLabs generate
     // ไม่ต้องรอ audio ทั้งหมดก่อน → ลด latency 2-3 วินาที
-    async function speakAndWait(text, session, markName) {
+    async function speakAndWait(text, session, markName, pipelineId = -1) {
       if (!callActive || socket.readyState !== socket.OPEN) return
 
       greetingAbortController = new AbortController()
@@ -134,9 +135,10 @@ function registerWebSocket(fastify) {
 
       const playbackMs = sent * 20 + 1500
       setTimeout(() => {
-        if (isSpeaking) {
+        if (activePipelineId === pipelineId && isSpeaking) {
           console.log(`[Audio] Fallback unlock after ${playbackMs}ms`)
           isSpeaking = false
+          startSilenceTimer()
         }
       }, playbackMs)
     }
@@ -207,6 +209,7 @@ function registerWebSocket(fastify) {
           if (sttProcessing) return  // double-check หลัง await
           sttProcessing = true
           currentSession.messages.push({ role: 'user', content: transcript })
+          const pipelineId = ++activePipelineId
           isSpeaking = true
 
           ttsAbortController = new AbortController()
@@ -273,7 +276,11 @@ function registerWebSocket(fastify) {
 
           const playbackMs = totalSent * 20 + 1500
           setTimeout(() => {
-            if (isSpeaking) { console.log('[Audio] Fallback unlock'); isSpeaking = false }
+            if (activePipelineId === pipelineId && isSpeaking) {
+              console.log('[Audio] Fallback unlock')
+              isSpeaking = false
+              startSilenceTimer()
+            }
           }, playbackMs)
 
           if (fullText.includes('[END_CALL]')) {
@@ -296,6 +303,7 @@ function registerWebSocket(fastify) {
           const session = callSessions.get(callSid)
           if (!session || !callActive) return
           isSpeaking = true
+          const pipelineId = ++activePipelineId
           try {
             if (session.greetingChunks) {
               // ใช้ audio ที่ pre-generate ไว้แล้ว — ส่งได้ทันที
@@ -315,7 +323,7 @@ function registerWebSocket(fastify) {
                 socket.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'greeting_done' } }))
               }
               const playbackMs = sent * 20 + 1500
-              setTimeout(() => { if (isSpeaking) { console.log('[Audio] Fallback unlock (greeting)'); isSpeaking = false } }, playbackMs)
+              setTimeout(() => { if (activePipelineId === pipelineId && isSpeaking) { console.log('[Audio] Fallback unlock (greeting)'); isSpeaking = false; startSilenceTimer() } }, playbackMs)
               console.log(`[Greeting] Sent ${sent} pre-generated chunks`)
             } else {
               // Fallback: generate ใหม่ถ้า pre-gen ไม่สำเร็จ
@@ -323,7 +331,7 @@ function registerWebSocket(fastify) {
               const greeting = await askClaude(session, true)
               console.log(`[Greeting] "${greeting.substring(0, 100)}"`)
               session.messages.push({ role: 'assistant', content: greeting })
-              await speakAndWait(greeting, session, 'greeting_done')
+              await speakAndWait(greeting, session, 'greeting_done', pipelineId)
             }
           } catch (err) {
             console.error('[Greeting error]', err.message)
