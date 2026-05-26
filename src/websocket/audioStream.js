@@ -217,6 +217,16 @@ function registerWebSocket(fastify) {
           let fullText = ''
           let totalSent = 0
 
+          // ส่ง filler sound ทันทีขณะ Claude กำลังประมวลผล — ลูกค้าได้ยินเสียงตอบสนองทันที
+          if (currentSession.fillerChunks?.length && socket.readyState === socket.OPEN) {
+            const filler = currentSession.fillerChunks[Math.floor(Math.random() * currentSession.fillerChunks.length)]
+            for (const chunk of filler) {
+              if (socket.readyState !== socket.OPEN || signal.aborted) break
+              socket.send(JSON.stringify({ event: 'media', streamSid, media: { payload: chunk.toString('base64') } }))
+              totalSent++
+            }
+          }
+
           // Safety: ถ้า Claude/TTS ค้างนานผิดปกติ ให้ unlock อัตโนมัติ
           const processingGuard = setTimeout(() => {
             if (sttProcessing) {
