@@ -68,7 +68,7 @@ function buildSystemPrompt(campaignPrompt, customerName, offTopicCount) {
   } else if (offTopicCount < MAX_OFFTOPIC) {
     offTopicInstruction = `ลูกค้านอกเรื่องไปแล้ว ${offTopicCount} ครั้ง ให้ดึงกลับมาที่โปรโมชั่นและพยายามปิดการขายให้ได้`
   } else {
-    offTopicInstruction = `ลูกค้านอกเรื่องซ้ำ ให้พยายามดึงกลับมาปิดการขายอีกครั้ง ถ้าลูกค้าปฏิเสธชัดเจนจึงจบสาย พูดว่า [END_CALL] เมื่อต้องการวางสาย`
+    offTopicInstruction = `ลูกค้านอกเรื่องซ้ำ ให้โน้มน้าวกลับมาที่โปรโมชั่นอีกครั้ง ถ้าปฏิเสธซ้ำอีกจึงจบสาย [END_CALL]`
   }
 
   return `${campaignPrompt}

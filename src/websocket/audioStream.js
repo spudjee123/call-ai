@@ -219,7 +219,9 @@ function registerWebSocket(fastify) {
 
           // ส่ง filler sound ทันทีขณะ Claude กำลังประมวลผล — ลูกค้าได้ยินเสียงตอบสนองทันที
           if (currentSession.fillerChunks?.length && socket.readyState === socket.OPEN) {
-            const filler = currentSession.fillerChunks[Math.floor(Math.random() * currentSession.fillerChunks.length)]
+            const fillerIdx = Math.floor(Math.random() * currentSession.fillerChunks.length)
+            const filler = currentSession.fillerChunks[fillerIdx]
+            console.log(`[Filler] Playing #${fillerIdx} (${filler.length} chunks)`)
             for (const chunk of filler) {
               if (socket.readyState !== socket.OPEN || signal.aborted) break
               socket.send(JSON.stringify({ event: 'media', streamSid, media: { payload: chunk.toString('base64') } }))
