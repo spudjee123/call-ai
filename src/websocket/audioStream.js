@@ -3,6 +3,17 @@ const { transcribeStream } = require('../services/googleSTT')
 const { askClaude, askClaudeStream } = require('../services/claude')
 const { synthesizeSpeechStream } = require('../services/tts')
 
+// Guard: ป้องกัน END_CALL ก่อนที่จะถาม follow-up เมื่อลูกค้าบอกสนใจ
+// Sonnet ควรจัดการได้เอง แต่ guard นี้เป็น safety net ชั้นที่ 2
+function shouldBlockEndCall(session, aiResponse) {
+  const userMessages = session.messages.filter(m => m.role === 'user')
+  const lastUserMsg = userMessages.at(-1)?.content ?? ''
+  const hasNegation = lastUserMsg.includes('ไม่') || lastUserMsg.includes('ยังไม่')
+  const hasInterest = ['สนใจ', 'อยากลอง', 'อยากสมัคร', 'สมัครเลย'].some(k => lastUserMsg.includes(k))
+  if (!hasInterest || hasNegation) return false
+  return !aiResponse.includes('เพิ่มเติม')
+}
+
 function registerWebSocket(fastify) {
   fastify.get('/stream', { websocket: true }, (connection, req) => {
     const socket = (typeof connection.send === 'function') ? connection
@@ -239,18 +250,14 @@ function registerWebSocket(fastify) {
           }, 30000)
 
           try {
-            // LLM Streaming → TTS Pipeline
-            // Claude yield ประโยค → ElevenLabs เริ่มทันที → ไม่ต้องรอ Claude เสร็จ
             for await (const sentence of askClaudeStream(currentSession, false, signal)) {
               if (signal.aborted || !callActive || !isSpeaking) break
 
               console.log(`[AI] "${sentence}"`)
               fullText += (fullText ? ' ' : '') + sentence
 
-              // Strip [END_CALL] ก่อนส่ง TTS ป้องกันพูดออกเสียงตัว marker
               const cleanSentence = sentence.replace(/\[END_CALL\]/g, '').trim()
 
-              // Stream ประโยคนี้ไป TTS และส่ง Twilio ทันที
               try {
                 if (!cleanSentence) { if (sentence.includes('[END_CALL]')) break; continue }
                 for await (const chunk of synthesizeSpeechStream(cleanSentence, currentSession.campaign.voice_id, signal)) {
@@ -266,6 +273,23 @@ function registerWebSocket(fastify) {
               }
 
               if (sentence.includes('[END_CALL]')) break
+            }
+
+            if (fullText.includes('[END_CALL]') && shouldBlockEndCall(currentSession, fullText)) {
+              console.log('[Guard] Premature END_CALL blocked — injecting follow-up question')
+              const followUp = 'มีอะไรสอบถามเพิ่มเติมไหมคะ'
+              fullText = fullText.replace(/\[END_CALL\]/g, '').trim() + ' ' + followUp
+              try {
+                for await (const chunk of synthesizeSpeechStream(followUp, currentSession.campaign.voice_id, signal)) {
+                  if (socket.readyState !== socket.OPEN || signal.aborted) break
+                  socket.send(JSON.stringify({ event: 'media', streamSid, media: { payload: chunk.toString('base64') } }))
+                  totalSent++
+                }
+              } catch (err) {
+                if (err.code !== 'ERR_CANCELED' && err.name !== 'CanceledError') {
+                  console.error('[Guard TTS error]', err.message)
+                }
+              }
             }
           } catch (err) {
             console.error('[AI/TTS error]', err.message)
