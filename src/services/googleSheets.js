@@ -17,6 +17,8 @@ async function getClient() {
   const authOptions = { scopes: ['https://www.googleapis.com/auth/spreadsheets'] }
   if (process.env.GOOGLE_CREDENTIALS_JSON) {
     authOptions.credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON)
+  } else {
+    authOptions.keyFile = '/etc/secrets/google-credentials.json'
   }
   const auth = new google.auth.GoogleAuth(authOptions)
   sheets = google.sheets({ version: 'v4', auth })
