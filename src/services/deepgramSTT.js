@@ -36,16 +36,24 @@ function transcribeStream(onTranscript, onInterim) {
       const conn = await client.listen.v1.connect(STT_CONFIG)
       if (destroyed) { try { conn.finish() } catch (_) {}; return }
 
-      conn.on('open', () => {
+      // ป้องกัน race condition: open event อาจยิงก่อน conn.on('open') ลงทะเบียน
+      let readyFired = false
+      function onReady() {
+        if (readyFired) return
+        readyFired = true
         console.log('[STT] Deepgram connected ✓')
         errorCount = 0
         connection = conn
-        // flush audio ที่ค้างไว้
         for (const buf of audioBuffer) {
           try { conn.sendMedia(buf) } catch (_) {}
         }
         audioBuffer = []
-      })
+      }
+
+      conn.on('open', onReady)
+
+      // ถ้า WebSocket เปิดแล้วก่อนที่ on('open') จะลงทะเบียน
+      if (conn.readyState === 1) onReady()
 
       conn.on('message', (data) => {
         if (destroyed) return
