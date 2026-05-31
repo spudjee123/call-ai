@@ -1,5 +1,5 @@
 const callSessions = require('../utils/callSessions')
-const { transcribeStream } = require('../services/googleSTT')
+const { transcribeStream } = require('../services/deepgramSTT')
 const { askClaude, askClaudeStream } = require('../services/claude')
 const { synthesizeSpeechStream } = require('../services/tts')
 
