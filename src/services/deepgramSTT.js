@@ -1,23 +1,21 @@
-const { DeepgramClient } = require('@deepgram/sdk')
+const WebSocket = require('ws')
 
-const client = new DeepgramClient({ apiKey: process.env.DEEPGRAM_API_KEY })
-
-const STT_CONFIG = {
+const DG_URL = 'wss://api.deepgram.com/v1/listen?' + new URLSearchParams({
   model: 'nova-3',
   language: 'th',
   encoding: 'mulaw',
-  sample_rate: 8000,
-  channels: 1,
-  interim_results: true,
-  endpointing: 400,       // ms silence → fires speech_final (แทน timer 1500ms)
-  utterance_end_ms: 1000, // fallback ถ้า endpointing ไม่ยิง
-  smart_format: false,
-}
+  sample_rate: '8000',
+  channels: '1',
+  interim_results: 'true',
+  endpointing: '400',
+  utterance_end_ms: '1000',
+  smart_format: 'false',
+}).toString()
 
 function transcribeStream(onTranscript, onInterim) {
   let destroyed = false
-  let connection = null
-  let audioBuffer = []   // buffer audio ที่มาก่อน connection ready
+  let ws = null
+  let audioBuffer = []
   let errorCount = 0
   let reconnectTimer = null
   let interimText = ''
@@ -28,100 +26,82 @@ function transcribeStream(onTranscript, onInterim) {
     utteranceClosed = false
   }
 
-  async function connect() {
+  function connect() {
     if (destroyed) return
     console.log('[STT] Connecting to Deepgram...')
 
-    try {
-      const conn = await client.listen.v1.connect(STT_CONFIG)
-      if (destroyed) { try { conn.finish() } catch (_) {}; return }
+    ws = new WebSocket(DG_URL, {
+      headers: { Authorization: `Token ${process.env.DEEPGRAM_API_KEY}` }
+    })
 
-      // ป้องกัน race condition: open event อาจยิงก่อน conn.on('open') ลงทะเบียน
-      let readyFired = false
-      function onReady() {
-        if (readyFired) return
-        readyFired = true
-        console.log('[STT] Deepgram connected ✓')
-        errorCount = 0
-        connection = conn
-        for (const buf of audioBuffer) {
-          try { conn.sendMedia(buf) } catch (_) {}
-        }
-        audioBuffer = []
+    ws.on('open', () => {
+      console.log('[STT] Deepgram connected ✓')
+      errorCount = 0
+      for (const buf of audioBuffer) {
+        try { ws.send(buf) } catch (_) {}
       }
+      audioBuffer = []
+    })
 
-      conn.on('open', onReady)
+    ws.on('message', (raw) => {
+      if (destroyed) return
+      let data
+      try { data = JSON.parse(raw) } catch { return }
 
-      // ถ้า WebSocket เปิดแล้วก่อนที่ on('open') จะลงทะเบียน
-      if (conn.readyState === 1) onReady()
-
-      conn.on('message', (data) => {
-        if (destroyed) return
-
-        // UtteranceEnd fallback
-        if (data?.type === 'UtteranceEnd') {
-          if (!utteranceClosed && interimText) {
-            console.log(`[STT] UtteranceEnd fallback: "${interimText}"`)
-            onTranscript(interimText)
-            interimText = ''
-            utteranceClosed = true
-          }
-          return
-        }
-
-        const result = data?.channel?.alternatives?.[0]
-        if (!result) return
-        const text = result.transcript?.trim()
-        if (!text) return
-
-        const isFinal = data.is_final
-        const speechFinal = data.speech_final
-
-        if (!isFinal) {
-          if (utteranceClosed) return
-          console.log(`[STT interim] "${text}"`)
-          interimText = text
-          onInterim?.(text)
-          return
-        }
-
-        if (utteranceClosed) return
-
-        if (speechFinal) {
-          // endpointing ตรวจว่าพูดจบ → ยิง transcript ทันที
-          console.log(`[STT] speech_final: "${text}"`)
-          onTranscript(text)
+      // UtteranceEnd fallback
+      if (data.type === 'UtteranceEnd') {
+        if (!utteranceClosed && interimText) {
+          console.log(`[STT] UtteranceEnd fallback: "${interimText}"`)
+          onTranscript(interimText)
           interimText = ''
           utteranceClosed = true
-        } else {
-          interimText = text
-          onInterim?.(text)
         }
-      })
+        return
+      }
 
-      conn.on('error', (err) => {
-        if (destroyed) return
-        console.error('[STT error]', err?.message || err)
-        errorCount++
-        connection = null
-        if (errorCount >= 10) { console.error('[STT] Too many errors, stopping'); return }
-        scheduleReconnect(500)
-      })
+      const text = data?.channel?.alternatives?.[0]?.transcript?.trim()
+      if (!text) return
 
-      conn.on('close', () => {
-        if (destroyed) return
-        console.log('[STT] Deepgram disconnected — reconnecting...')
-        connection = null
-        resetUtteranceState()
-        scheduleReconnect(100)
-      })
+      const isFinal = data.is_final
+      const speechFinal = data.speech_final
 
-    } catch (err) {
+      if (!isFinal) {
+        if (utteranceClosed) return
+        console.log(`[STT interim] "${text}"`)
+        interimText = text
+        onInterim?.(text)
+        return
+      }
+
+      if (utteranceClosed) return
+
+      if (speechFinal) {
+        console.log(`[STT] speech_final: "${text}"`)
+        onTranscript(text)
+        interimText = ''
+        utteranceClosed = true
+      } else {
+        interimText = text
+        onInterim?.(text)
+      }
+    })
+
+    ws.on('error', (err) => {
       if (destroyed) return
-      console.error('[STT] Connect failed:', err.message)
+      console.error('[STT error]', err.message)
       errorCount++
+      ws = null
+      if (errorCount >= 10) { console.error('[STT] Too many errors, stopping'); return }
       scheduleReconnect(500)
-    }
+    })
+
+    ws.on('close', (code) => {
+      if (destroyed) return
+      console.log(`[STT] Deepgram closed (${code}) — reconnecting...`)
+      ws = null
+      resetUtteranceState()
+      scheduleReconnect(100)
+    })
   }
 
   function scheduleReconnect(ms) {
@@ -134,13 +114,11 @@ function transcribeStream(onTranscript, onInterim) {
   return {
     write(mulawBuffer) {
       if (destroyed) return
-      if (!connection) {
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
         audioBuffer.push(mulawBuffer)
         return
       }
-      try {
-        connection.sendMedia(mulawBuffer)
-      } catch (e) {
+      try { ws.send(mulawBuffer) } catch (e) {
         console.error('[STT] write error:', e.message)
       }
     },
@@ -155,8 +133,8 @@ function transcribeStream(onTranscript, onInterim) {
       clearTimeout(reconnectTimer)
       reconnectTimer = null
       audioBuffer = []
-      try { connection?.finish() } catch (_) {}
-      connection = null
+      try { ws?.close() } catch (_) {}
+      ws = null
     }
   }
 }
