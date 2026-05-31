@@ -1,6 +1,6 @@
 const WebSocket = require('ws')
 
-const DG_URL = 'wss://api.deepgram.com/v1/listen?' + new URLSearchParams({
+const _params = new URLSearchParams({
   model: 'nova-3',
   language: 'th',
   encoding: 'mulaw',
@@ -10,7 +10,9 @@ const DG_URL = 'wss://api.deepgram.com/v1/listen?' + new URLSearchParams({
   endpointing: '400',
   utterance_end_ms: '1000',
   smart_format: 'false',
-}).toString()
+})
+;['PGDOG', 'แอดไลน์', 'พีจีด็อก', 'พอยต์', 'โบนัส', 'สมัคร', 'ฝาก'].forEach(k => _params.append('keyterm', k))
+const DG_URL = 'wss://api.deepgram.com/v1/listen?' + _params.toString()
 
 function transcribeStream(onTranscript, onInterim) {
   let destroyed = false
@@ -113,7 +115,7 @@ function transcribeStream(onTranscript, onInterim) {
 
   return {
     write(mulawBuffer) {
-      if (destroyed) return
+      if (destroyed || errorCount >= 10) return
       if (!ws || ws.readyState !== WebSocket.OPEN) {
         audioBuffer.push(mulawBuffer)
         return
