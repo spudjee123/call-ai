@@ -406,7 +406,7 @@ function registerWebSocket(fastify) {
             } else {
               // Fallback: generate ใหม่ถ้า pre-gen ไม่สำเร็จ
               console.log(`[Greeting] Pre-gen not ready, generating now...`)
-              const greeting = await askClaude(session, true)
+              const greeting = await askClaude(session)
               console.log(`[Greeting] "${greeting.substring(0, 100)}"`)
               session.messages.push({ role: 'assistant', content: greeting })
               await speakAndWait(greeting, session, 'greeting_done', pipelineId)

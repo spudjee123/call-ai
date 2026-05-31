@@ -13,7 +13,6 @@ async function makeOutboundCall(contact, campaign) {
     name: contact.name || 'คุณลูกค้า',
     campaign,
     messages: [],
-    offTopicCount: 0,
     direction: 'outbound',
     startTime: Date.now(),
     greetingChunks: null,
@@ -22,7 +21,7 @@ async function makeOutboundCall(contact, campaign) {
   // Pre-generate greeting ขณะรอสายต่อ (~3-4s) เพื่อลด silence
   const greetingPromise = (async () => {
     try {
-      const text = await askClaude(session, true)
+      const text = await askClaude(session)
       session.messages.push({ role: 'assistant', content: text })
       const chunks = await synthesizeSpeech(text, campaign.voice_id)
       session.greetingChunks = chunks
