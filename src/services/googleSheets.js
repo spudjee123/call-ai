@@ -25,31 +25,53 @@ async function getClient() {
   return sheets
 }
 
-async function getRows(sheetName) {
+// ดึงข้อมูลดิบ (headers ที่ normalize แล้ว + rows แบบ array) เก็บ row index ไว้ใช้ update ทีหลัง
+async function getSheetData(sheetName) {
   const client = await getClient()
   const res = await client.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
     range: sheetName,
   })
-  const rows = res.data.values || []
-  if (!rows.length) return []
-  const headers = rows[0].map(h => h.toLowerCase().trim().replace(/\s+/g, '_'))
-  return rows.slice(1).map(row => {
+  const values = res.data.values || []
+  if (!values.length) return { headers: [], rows: [] }
+  const headers = values[0].map(h => h.toLowerCase().trim().replace(/\s+/g, '_'))
+  return { headers, rows: values.slice(1) }
+}
+
+async function getRows(sheetName) {
+  const { headers, rows } = await getSheetData(sheetName)
+  return rows.map(row => {
     const obj = {}
     headers.forEach((h, i) => { obj[h] = row[i] || '' })
     return obj
   })
 }
 
-async function updateCell(sheetName, rowIndex, colIndex, value) {
+// หา row ด้วย key column แล้วอัปเดตหลาย field พร้อมกันในครั้งเดียว (เขียนทับทั้งแถว)
+async function updateRowByKey(sheetName, keyField, keyValue, updates) {
+  const { headers, rows } = await getSheetData(sheetName)
+  const keyIdx = headers.indexOf(keyField)
+  if (keyIdx === -1) throw new Error(`Column '${keyField}' not found in ${sheetName}`)
+
+  const rowIdx = rows.findIndex(r => r[keyIdx] === keyValue)
+  if (rowIdx === -1) return false
+
+  const row = [...rows[rowIdx]]
+  while (row.length < headers.length) row.push('')
+  Object.entries(updates).forEach(([field, value]) => {
+    const colIdx = headers.indexOf(field.toLowerCase().trim().replace(/\s+/g, '_'))
+    if (colIdx !== -1) row[colIdx] = value
+  })
+
   const client = await getClient()
-  const col = String.fromCharCode(65 + colIndex)
+  const lastCol = String.fromCharCode(65 + headers.length - 1)
   await client.spreadsheets.values.update({
     spreadsheetId: SPREADSHEET_ID,
-    range: `${sheetName}!${col}${rowIndex + 2}`,
+    range: `${sheetName}!A${rowIdx + 2}:${lastCol}${rowIdx + 2}`,
     valueInputOption: 'RAW',
-    requestBody: { values: [[value]] },
+    requestBody: { values: [row] },
   })
+  return true
 }
 
 async function appendRow(sheetName, values) {
@@ -60,6 +82,13 @@ async function appendRow(sheetName, values) {
     valueInputOption: 'RAW',
     requestBody: { values: [values] },
   })
+}
+
+// เติมค่าตามชื่อ column (ไม่สนลำดับ) แล้ว append — กันพังถ้า column ในชีตสลับตำแหน่ง
+async function appendRowByFields(sheetName, fields) {
+  const { headers } = await getSheetData(sheetName)
+  const row = headers.map(h => (fields[h] !== undefined ? fields[h] : ''))
+  await appendRow(sheetName, row)
 }
 
 const sheetsService = {
@@ -73,19 +102,37 @@ const sheetsService = {
     return rows.find(r => r.status === 'active' && r.type === 'inbound') || rows[0] || {}
   },
 
+  async getCampaigns() {
+    return getRows(SHEETS.CAMPAIGNS)
+  },
+
+  async updateCampaign(id, updates) {
+    return updateRowByKey(SHEETS.CAMPAIGNS, 'id', id, updates)
+  },
+
   async getPendingContacts(campaignId) {
     const rows = await getRows(SHEETS.CONTACTS)
     return rows.filter(r => r.campaign === campaignId && r.status === 'pending')
   },
 
-  async updateContactStatus(phone, status) {
+  async getContacts({ campaignId, status } = {}) {
     const rows = await getRows(SHEETS.CONTACTS)
-    const idx = rows.findIndex(r => r.phone === phone)
-    if (idx >= 0) {
-      const headers = Object.keys(rows[0])
-      const statusCol = headers.indexOf('status')
-      await updateCell(SHEETS.CONTACTS, idx, statusCol, status)
-    }
+    return rows.filter(r =>
+      (!campaignId || r.campaign === campaignId) &&
+      (!status || r.status === status)
+    )
+  },
+
+  async addContact(fields) {
+    await appendRowByFields(SHEETS.CONTACTS, { status: 'pending', ...fields })
+  },
+
+  async updateContact(phone, updates) {
+    return updateRowByKey(SHEETS.CONTACTS, 'phone', phone, updates)
+  },
+
+  async updateContactStatus(phone, status) {
+    return updateRowByKey(SHEETS.CONTACTS, 'phone', phone, { status })
   },
 
   async saveCallResult(result) {

@@ -1,8 +1,40 @@
 const { sheetsService } = require('../services/googleSheets')
 const { callQueue } = require('../utils/callQueue')
-const twilioService = require('../services/twilio')
 
 module.exports = async function campaignRoutes(fastify) {
+
+  // รายชื่อ campaign ทั้งหมด (สำหรับ dropdown + ตาราง)
+  fastify.get('/api/campaigns', async (req, reply) => {
+    const campaigns = await sheetsService.getCampaigns()
+    return reply.send(campaigns)
+  })
+
+  // ดู campaign เดียว (สำหรับเปิดแก้ prompt)
+  fastify.get('/api/campaigns/:id', async (req, reply) => {
+    const campaign = await sheetsService.getCampaign(req.params.id)
+    if (!campaign) return reply.code(404).send({ error: 'Campaign not found' })
+    return reply.send(campaign)
+  })
+
+  // แก้ไข campaign เช่น prompt, voice_id, sms flags
+  fastify.patch('/api/campaigns/:id', async (req, reply) => {
+    const updated = await sheetsService.updateCampaign(req.params.id, req.body || {})
+    if (!updated) return reply.code(404).send({ error: 'Campaign not found' })
+    return reply.send({ message: 'Campaign updated' })
+  })
+
+  // ยิงโทรทดสอบเบอร์เดียว — ใช้ pipeline เดียวกับ campaign จริง แต่ไม่แตะ Contacts sheet
+  fastify.post('/api/calls/test', async (req, reply) => {
+    const { phone, name, campaignId } = req.body || {}
+    if (!phone || !campaignId) {
+      return reply.code(400).send({ error: 'phone and campaignId required' })
+    }
+    const campaign = await sheetsService.getCampaign(campaignId)
+    if (!campaign) return reply.code(404).send({ error: 'Campaign not found' })
+
+    callQueue.add({ contact: { phone, name: name || 'ทดสอบ' }, campaign })
+    return reply.send({ message: 'Test call queued', phone })
+  })
 
   // เริ่ม campaign — Apps Script เรียก
   fastify.post('/api/campaign/start', async (req, reply) => {

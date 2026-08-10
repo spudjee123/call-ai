@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Call AI — Control Center</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, "Segoe UI", sans-serif; background: #f5f5f5; color: #333; }
+  .header { background: #1a1a2e; color: white; padding: 16px 24px; display: flex; align-items: center; gap: 12px; }
+  .header h1 { font-size: 20px; flex: 1; }
+  .badge { background: #e94560; color: white; padding: 2px 8px; border-radius: 12px; font-size: 12px; }
+  .container { padding: 20px; max-width: 1200px; margin: 0 auto; }
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 24px; }
+  .stat-card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+  .stat-card .label { font-size: 13px; color: #666; margin-bottom: 8px; }
+  .stat-card .value { font-size: 32px; font-weight: bold; }
+  .card { background: white; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); margin-bottom: 20px; }
+  .card-header { padding: 16px 20px; border-bottom: 1px solid #eee; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }
+  .card-header h2 { font-size: 16px; }
+  .card-body { padding: 20px; }
+  .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  input[type=text], input[type=password], input[type=tel], select, textarea {
+    padding: 8px 10px; border-radius: 6px; border: 1px solid #ddd; font-size: 14px; font-family: inherit;
+  }
+  textarea { width: 100%; min-height: 140px; resize: vertical; }
+  button { padding: 8px 16px; border-radius: 6px; border: 1px solid #ddd; font-size: 14px; cursor: pointer; background: white; }
+  .btn-primary { background: #3498db; color: white; border: none; }
+  .btn-start { background: #27ae60; color: white; border: none; }
+  .btn-stop { background: #e74c3c; color: white; border: none; }
+  .btn-danger { background: #e74c3c; color: white; border: none; }
+  .btn-refresh { background: #3498db; color: white; border: none; }
+  button:hover { opacity: 0.85; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid #eee; font-size: 13px; }
+  th { background: #f8f8f8; font-weight: 600; color: #555; }
+  .badge-outcome { padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+  .interested { background: #d5f5e3; color: #1e8449; }
+  .not_interested { background: #fadbd8; color: #922b21; }
+  .callback { background: #fdebd0; color: #784212; }
+  .no_answer { background: #eaecee; color: #566573; }
+  .angry { background: #fadbd8; color: #922b21; }
+  .active-dot { display: inline-block; width: 8px; height: 8px; background: #27ae60; border-radius: 50%; animation: pulse 1s infinite; margin-right: 6px; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+  .empty { text-align: center; color: #aaa; padding: 40px; }
+  .msg { font-size: 13px; color: #666; }
+  .msg.error { color: #e74c3c; }
+  .msg.ok { color: #27ae60; }
+  .action-link { color: #3498db; cursor: pointer; font-size: 13px; margin-right: 10px; background: none; border: none; padding: 0; }
+  .action-link.danger { color: #e74c3c; }
+  .checkbox-group { display: flex; gap: 14px; flex-wrap: wrap; font-size: 13px; margin: 10px 0; }
+  .checkbox-group label { display: flex; align-items: center; gap: 4px; }
+
+  #loginScreen { min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+  .login-box { background: white; padding: 32px; border-radius: 8px; box-shadow: 0 1px 8px rgba(0,0,0,0.15); width: 320px; text-align: center; }
+  .login-box h1 { font-size: 18px; margin-bottom: 20px; }
+  .login-box input { width: 100%; margin-bottom: 12px; }
+  .login-box button { width: 100%; }
+
+  #app { display: none; }
+</style>
+</head>
+<body>
+
+  <div id="loginScreen">
+    <div class="login-box">
+      <h1>Call AI — Control Center</h1>
+      <input type="password" id="loginPassword" placeholder="รหัสผ่าน">
+      <button class="btn-primary" onclick="login()">เข้าสู่ระบบ</button>
+      <div class="msg error" id="loginError"></div>
+    </div>
+  </div>
+
+  <div id="app">
+    <div class="header">
+      <h1>Call AI — Control Center</h1>
+      <span class="badge" id="activeBadge">0 Active</span>
+      <button onclick="logout()">ออกจากระบบ</button>
+    </div>
+
+    <div class="container">
+
+      <div class="stats">
+        <div class="stat-card"><div class="label">โทรทั้งหมด</div><div class="value" id="statTotal">-</div></div>
+        <div class="stat-card"><div class="label">สนใจ</div><div class="value" style="color:#27ae60" id="statInterested">-</div></div>
+        <div class="stat-card"><div class="label">นัด Callback</div><div class="value" style="color:#e67e22" id="statCallback">-</div></div>
+        <div class="stat-card"><div class="label">ไม่รับสาย</div><div class="value" style="color:#95a5a6" id="statNoAnswer">-</div></div>
+      </div>
+
+      <div class="card">
+        <div class="card-header"><h2>ทดสอบโทร</h2></div>
+        <div class="card-body">
+          <div class="row">
+            <input type="tel" id="testPhone" placeholder="เบอร์โทร เช่น +66812345678">
+            <input type="text" id="testName" placeholder="ชื่อ (ไม่บังคับ)">
+            <select id="testCampaign" class="campaign-select"><option value="">-- เลือก Campaign --</option></select>
+            <button class="btn-primary" onclick="testCall()">📞 โทรทดสอบ</button>
+          </div>
+          <div class="msg" id="testCallMsg"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <h2>จัดการ Campaign</h2>
+          <button class="btn-refresh" onclick="loadCampaigns()">รีเฟรช</button>
+        </div>
+        <div class="card-body">
+          <table>
+            <thead><tr><th>ID</th><th>ชื่อ</th><th>สถานะ</th><th>ประเภท</th><th>Voice</th><th>Actions</th></tr></thead>
+            <tbody id="campaignTable"><tr><td colspan="6" class="empty">กำลังโหลด...</td></tr></tbody>
+          </table>
+
+          <div id="campaignEditPanel" style="display:none; margin-top:20px; border-top:1px solid #eee; padding-top:16px;">
+            <h3 style="font-size:14px; margin-bottom:10px;">แก้ไข Campaign: <span id="editCampaignId"></span></h3>
+            <div class="row" style="margin-bottom:10px;">
+              <input type="text" id="editName" placeholder="ชื่อ campaign" style="flex:1">
+              <input type="text" id="editVoiceId" placeholder="Voice ID">
+              <select id="editStatus">
+                <option value="active">active</option>
+                <option value="paused">paused</option>
+              </select>
+            </div>
+            <label style="font-size:13px;color:#666">Prompt / Script</label>
+            <textarea id="editScript" placeholder="System prompt ที่ AI ใช้พูดกับลูกค้า"></textarea>
+            <label style="font-size:13px;color:#666">ส่ง SMS follow-up เมื่อผลเป็น:</label>
+            <div class="checkbox-group">
+              <label><input type="checkbox" id="smsInterested"> สนใจ</label>
+              <label><input type="checkbox" id="smsNotInterested"> ไม่สนใจ</label>
+              <label><input type="checkbox" id="smsCallback"> Callback</label>
+              <label><input type="checkbox" id="smsNoAnswer"> ไม่รับสาย</label>
+              <label><input type="checkbox" id="smsAngry"> โกรธ</label>
+            </div>
+            <div class="row">
+              <button class="btn-primary" onclick="saveCampaign()">บันทึก</button>
+              <button onclick="closeCampaignEdit()">ยกเลิก</button>
+              <span class="msg" id="campaignEditMsg"></span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header"><h2>ลงชื่อเบอร์ (Contacts)</h2></div>
+        <div class="card-body">
+          <div class="row" style="margin-bottom:16px;">
+            <input type="tel" id="contactPhone" placeholder="เบอร์โทร">
+            <input type="text" id="contactName" placeholder="ชื่อ">
+            <select id="contactCampaign" class="campaign-select"><option value="">-- เลือก Campaign --</option></select>
+            <button class="btn-primary" onclick="addContact()">+ เพิ่มเบอร์</button>
+            <span class="msg" id="addContactMsg"></span>
+          </div>
+
+          <div class="row" style="margin-bottom:12px;">
+            <select id="contactsFilterCampaign" class="campaign-select" onchange="loadContacts()"><option value="">ทุก Campaign</option></select>
+            <select id="contactsFilterStatus" onchange="loadContacts()">
+              <option value="">ทุกสถานะ</option>
+              <option value="pending">pending</option>
+              <option value="called">called</option>
+              <option value="deleted">deleted</option>
+            </select>
+            <button class="btn-refresh" onclick="loadContacts()">รีเฟรช</button>
+          </div>
+
+          <table>
+            <thead><tr><th>เบอร์</th><th>ชื่อ</th><th>Campaign</th><th>สถานะ</th><th>Actions</th></tr></thead>
+            <tbody id="contactsTable"><tr><td colspan="5" class="empty">ยังไม่มีข้อมูล</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <h2><span class="active-dot"></span>Active Calls</h2>
+          <button class="btn-refresh" onclick="loadActive()">รีเฟรช</button>
+        </div>
+        <div class="card-body">
+          <table>
+            <thead><tr><th>เบอร์</th><th>ชื่อ</th><th>เวลา (วิ)</th><th>ข้อความ</th></tr></thead>
+            <tbody id="activeTable"><tr><td colspan="4" class="empty">ไม่มีสายที่กำลังโทร</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <h2>Call History</h2>
+          <div class="row">
+            <select id="logCampaignFilter" class="campaign-select" onchange="loadLogs()"><option value="">ทุก Campaign</option></select>
+            <button class="btn-refresh" onclick="loadLogs()">รีเฟรช</button>
+          </div>
+        </div>
+        <div class="card-body">
+          <table>
+            <thead><tr><th>เบอร์</th><th>ชื่อ</th><th>ผล</th><th>สรุป</th><th>เวลา</th></tr></thead>
+            <tbody id="logTable"><tr><td colspan="5" class="empty">ยังไม่มีข้อมูล</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+<script>
+  let token = localStorage.getItem('callai_token') || null
+  let campaignsCache = []
+
+  async function apiFetch(url, options = {}) {
+    options.headers = Object.assign({}, options.headers, { 'Authorization': 'Bearer ' + token })
+    if (options.body && typeof options.body !== 'string') {
+      options.headers['Content-Type'] = 'application/json'
+      options.body = JSON.stringify(options.body)
+    }
+    const res = await fetch(url, options)
+    if (res.status === 401) {
+      token = null
+      localStorage.removeItem('callai_token')
+      showLogin()
+      throw new Error('Unauthorized')
+    }
+    return res
+  }
+
+  function showLogin() {
+    document.getElementById('loginScreen').style.display = 'flex'
+    document.getElementById('app').style.display = 'none'
+  }
+
+  function showApp() {
+    document.getElementById('loginScreen').style.display = 'none'
+    document.getElementById('app').style.display = 'block'
+    loadAll()
+  }
+
+  async function login() {
+    const password = document.getElementById('loginPassword').value
+    const errEl = document.getElementById('loginError')
+    errEl.textContent = ''
+    try {
+      const res = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password })
+      })
+      const data = await res.json()
+      if (!res.ok) { errEl.textContent = data.error || 'เข้าสู่ระบบไม่สำเร็จ'; return }
+      token = data.token
+      localStorage.setItem('callai_token', token)
+      showApp()
+    } catch (e) {
+      errEl.textContent = 'เชื่อมต่อไม่ได้'
+    }
+  }
+
+  async function logout() {
+    try { await apiFetch('/api/auth/logout', { method: 'POST' }) } catch (e) {}
+    token = null
+    localStorage.removeItem('callai_token')
+    showLogin()
+  }
+
+  function loadAll() {
+    loadCampaigns()
+    loadStats()
+    loadActive()
+    loadLogs()
+    loadContacts()
+  }
+
+  function populateCampaignSelects(campaigns) {
+    campaignsCache = campaigns
+    document.querySelectorAll('.campaign-select').forEach(sel => {
+      const current = sel.value
+      const keepFirst = sel.options[0]
+      sel.innerHTML = ''
+      sel.appendChild(keepFirst)
+      campaigns.forEach(c => {
+        const opt = document.createElement('option')
+        opt.value = c.id
+        opt.text = c.name || c.id
+        sel.appendChild(opt)
+      })
+      sel.value = current
+    })
+  }
+
+  async function loadStats() {
+    const res = await apiFetch('/api/stats')
+    const stats = await res.json()
+    document.getElementById('statTotal').textContent = stats.total || 0
+    document.getElementById('statInterested').textContent = (stats.outcomes && stats.outcomes.interested) || 0
+    document.getElementById('statCallback').textContent = (stats.outcomes && stats.outcomes.callback) || 0
+    document.getElementById('statNoAnswer').textContent = (stats.outcomes && stats.outcomes.no_answer) || 0
+  }
+
+  async function loadActive() {
+    const res = await apiFetch('/api/calls/active')
+    const calls = await res.json()
+    document.getElementById('activeBadge').textContent = `${calls.length} Active`
+    const tbody = document.getElementById('activeTable')
+    if (!calls.length) { tbody.innerHTML = '<tr><td colspan="4" class="empty">ไม่มีสายที่กำลังโทร</td></tr>'; return }
+    tbody.innerHTML = calls.map(c => `
+      <tr><td>${c.phone}</td><td>${c.name}</td><td>${c.duration}</td><td>${c.messageCount} ข้อความ</td></tr>
+    `).join('')
+  }
+
+  async function loadLogs() {
+    const campaignId = document.getElementById('logCampaignFilter').value
+    const url = campaignId ? `/api/calls?campaignId=${encodeURIComponent(campaignId)}&limit=100` : '/api/calls?limit=100'
+    const res = await apiFetch(url)
+    const logs = await res.json()
+    const tbody = document.getElementById('logTable')
+    if (!logs.length) { tbody.innerHTML = '<tr><td colspan="5" class="empty">ยังไม่มีข้อมูล</td></tr>'; return }
+    tbody.innerHTML = logs.map(l => `
+      <tr>
+        <td>${l.phone || ''}</td>
+        <td>${l.name || ''}</td>
+        <td><span class="badge-outcome ${l.outcome || ''}">${l.outcome || ''}</span></td>
+        <td>${l.summary || ''}</td>
+        <td>${(l.timestamp || '').substring(0, 16)}</td>
+      </tr>`).join('')
+  }
+
+  async function loadCampaigns() {
+    const res = await apiFetch('/api/campaigns')
+    const campaigns = await res.json()
+    populateCampaignSelects(campaigns)
+    const tbody = document.getElementById('campaignTable')
+    if (!campaigns.length) { tbody.innerHTML = '<tr><td colspan="6" class="empty">ยังไม่มี campaign</td></tr>'; return }
+    tbody.innerHTML = campaigns.map(c => `
+      <tr>
+        <td>${c.id}</td>
+        <td>${c.name || ''}</td>
+        <td>${c.status || ''}</td>
+        <td>${c.type || ''}</td>
+        <td>${c.voice_id || ''}</td>
+        <td>
+          <button class="action-link" onclick="openCampaignEdit('${c.id}')">แก้ไข</button>
+          <button class="action-link" onclick="startCampaign('${c.id}')">▶ เริ่ม</button>
+          <button class="action-link danger" onclick="stopCampaign('${c.id}')">■ หยุด</button>
+        </td>
+      </tr>`).join('')
+  }
+
+  function openCampaignEdit(id) {
+    const c = campaignsCache.find(x => x.id === id)
+    if (!c) return
+    document.getElementById('editCampaignId').textContent = id
+    document.getElementById('editName').value = c.name || ''
+    document.getElementById('editVoiceId').value = c.voice_id || ''
+    document.getElementById('editStatus').value = c.status === 'paused' ? 'paused' : 'active'
+    document.getElementById('editScript').value = c.script || c.system_prompt || ''
+    document.getElementById('smsInterested').checked = c.sms_interested === 'TRUE' || c.sms_interested === true
+    document.getElementById('smsNotInterested').checked = c.sms_not_interested === 'TRUE' || c.sms_not_interested === true
+    document.getElementById('smsCallback').checked = c.sms_callback === 'TRUE' || c.sms_callback === true
+    document.getElementById('smsNoAnswer').checked = c.sms_no_answer === 'TRUE' || c.sms_no_answer === true
+    document.getElementById('smsAngry').checked = c.sms_angry === 'TRUE' || c.sms_angry === true
+    document.getElementById('campaignEditMsg').textContent = ''
+    document.getElementById('campaignEditPanel').style.display = 'block'
+  }
+
+  function closeCampaignEdit() {
+    document.getElementById('campaignEditPanel').style.display = 'none'
+  }
+
+  async function saveCampaign() {
+    const id = document.getElementById('editCampaignId').textContent
+    const msgEl = document.getElementById('campaignEditMsg')
+    const scriptKey = campaignsCache.find(c => c.id === id)?.system_prompt !== undefined && campaignsCache.find(c => c.id === id)?.script === undefined
+      ? 'system_prompt' : 'script'
+    const updates = {
+      name: document.getElementById('editName').value,
+      voice_id: document.getElementById('editVoiceId').value,
+      status: document.getElementById('editStatus').value,
+      [scriptKey]: document.getElementById('editScript').value,
+      sms_interested: document.getElementById('smsInterested').checked ? 'TRUE' : 'FALSE',
+      sms_not_interested: document.getElementById('smsNotInterested').checked ? 'TRUE' : 'FALSE',
+      sms_callback: document.getElementById('smsCallback').checked ? 'TRUE' : 'FALSE',
+      sms_no_answer: document.getElementById('smsNoAnswer').checked ? 'TRUE' : 'FALSE',
+      sms_angry: document.getElementById('smsAngry').checked ? 'TRUE' : 'FALSE',
+    }
+    try {
+      const res = await apiFetch(`/api/campaigns/${encodeURIComponent(id)}`, { method: 'PATCH', body: updates })
+      const data = await res.json()
+      if (!res.ok) { msgEl.className = 'msg error'; msgEl.textContent = data.error || 'บันทึกไม่สำเร็จ'; return }
+      msgEl.className = 'msg ok'; msgEl.textContent = '✓ บันทึกแล้ว'
+      loadCampaigns()
+    } catch (e) {}
+  }
+
+  async function startCampaign(id) {
+    await apiFetch('/api/campaign/start', { method: 'POST', body: { campaignId: id } })
+    setTimeout(loadStats, 2000)
+  }
+
+  async function stopCampaign(id) {
+    await apiFetch('/api/campaign/stop', { method: 'POST', body: { campaignId: id } })
+  }
+
+  async function testCall() {
+    const phone = document.getElementById('testPhone').value.trim()
+    const name = document.getElementById('testName').value.trim()
+    const campaignId = document.getElementById('testCampaign').value
+    const msgEl = document.getElementById('testCallMsg')
+    if (!phone || !campaignId) { msgEl.className = 'msg error'; msgEl.textContent = 'กรอกเบอร์และเลือก campaign ก่อน'; return }
+    msgEl.className = 'msg'; msgEl.textContent = 'กำลังยิงโทร...'
+    try {
+      const res = await apiFetch('/api/calls/test', { method: 'POST', body: { phone, name, campaignId } })
+      const data = await res.json()
+      if (!res.ok) { msgEl.className = 'msg error'; msgEl.textContent = data.error || 'ล้มเหลว'; return }
+      msgEl.className = 'msg ok'; msgEl.textContent = `✓ กำลังโทรไป ${phone}`
+      setTimeout(loadActive, 3000)
+    } catch (e) {}
+  }
+
+  async function loadContacts() {
+    const campaignId = document.getElementById('contactsFilterCampaign').value
+    const status = document.getElementById('contactsFilterStatus').value
+    const params = new URLSearchParams()
+    if (campaignId) params.set('campaignId', campaignId)
+    if (status) params.set('status', status)
+    const res = await apiFetch('/api/contacts?' + params.toString())
+    const contacts = await res.json()
+    const tbody = document.getElementById('contactsTable')
+    if (!contacts.length) { tbody.innerHTML = '<tr><td colspan="5" class="empty">ยังไม่มีข้อมูล</td></tr>'; return }
+    tbody.innerHTML = contacts.map(c => `
+      <tr>
+        <td>${c.phone}</td>
+        <td>${c.name || ''}</td>
+        <td>${c.campaign || ''}</td>
+        <td>${c.status || ''}</td>
+        <td><button class="action-link danger" onclick="deleteContact('${c.phone}')">ลบ</button></td>
+      </tr>`).join('')
+  }
+
+  async function addContact() {
+    const phone = document.getElementById('contactPhone').value.trim()
+    const name = document.getElementById('contactName').value.trim()
+    const campaign = document.getElementById('contactCampaign').value
+    const msgEl = document.getElementById('addContactMsg')
+    if (!phone || !campaign) { msgEl.className = 'msg error'; msgEl.textContent = 'กรอกเบอร์และเลือก campaign ก่อน'; return }
+    try {
+      const res = await apiFetch('/api/contacts', { method: 'POST', body: { phone, name, campaign } })
+      const data = await res.json()
+      if (!res.ok) { msgEl.className = 'msg error'; msgEl.textContent = data.error || 'เพิ่มไม่สำเร็จ'; return }
+      msgEl.className = 'msg ok'; msgEl.textContent = '✓ เพิ่มแล้ว'
+      document.getElementById('contactPhone').value = ''
+      document.getElementById('contactName').value = ''
+      loadContacts()
+    } catch (e) {}
+  }
+
+  async function deleteContact(phone) {
+    await apiFetch(`/api/contacts/${encodeURIComponent(phone)}`, { method: 'DELETE' })
+    loadContacts()
+  }
+
+  window.onload = async () => {
+    if (!token) { showLogin(); return }
+    try {
+      await apiFetch('/api/stats')
+      showApp()
+    } catch (e) {
+      showLogin()
+    }
+  }
+
+  setInterval(() => { if (token) { loadActive(); loadStats() } }, 10000)
+</script>
+</body>
+</html>
