@@ -221,6 +221,16 @@
     return `${m}:${String(s).padStart(2, '0')}`
   }
 
+  // แปลง ISO timestamp (UTC) เป็นเวลาไทย (Asia/Bangkok, UTC+7)
+  function formatDateTH(iso) {
+    if (!iso) return ''
+    const d = new Date(iso)
+    if (isNaN(d)) return iso
+    return new Intl.DateTimeFormat('sv-SE', {
+      timeZone: 'Asia/Bangkok', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit'
+    }).format(d)
+  }
+
   async function apiFetch(url, options = {}) {
     options.headers = Object.assign({}, options.headers, { 'Authorization': 'Bearer ' + token })
     if (options.body && typeof options.body !== 'string') {
@@ -647,7 +657,7 @@
         <td><span class="pill ${esc(l.outcome)}">${esc(l.outcome)}</span></td>
         <td>${esc((l.summary || '').substring(0, 60))}</td>
         <td>${formatDuration(l.duration)}</td>
-        <td>${esc((l.timestamp || '').substring(0, 16)).replace('T', ' ')}</td>
+        <td>${esc(formatDateTH(l.timestamp))}</td>
       </tr>`).join('')
   }
 
@@ -681,7 +691,7 @@
     const c = historyCache[index]
     if (!c) return
     document.getElementById('modalTitle').textContent = `${c.name || ''} — ${c.phone || ''}`
-    document.getElementById('modalSubtitle').textContent = (c.timestamp || '').substring(0, 16).replace('T', ' ')
+    document.getElementById('modalSubtitle').textContent = formatDateTH(c.timestamp)
     document.getElementById('modalMeta').innerHTML = `
       <div>ผล<b>${esc(c.outcome)}</b></div>
       <div>เวลาคุย<b>${formatDuration(c.duration)}</b></div>
