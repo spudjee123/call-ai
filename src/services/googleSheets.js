@@ -7,7 +7,8 @@ const SHEETS = {
   CONTACTS: 'Contacts',
   CAMPAIGNS: 'Campaigns',
   RESULTS: 'Call Results',
-  TEMPLATES: 'SMS Templates'
+  TEMPLATES: 'SMS Templates',
+  BLOCKLIST: 'Blocklist'
 }
 
 let sheets = null
@@ -91,6 +92,28 @@ async function appendRowByFields(sheetName, fields) {
   await appendRow(sheetName, row)
 }
 
+// append หลายแถวพร้อมกันในครั้งเดียว (1 Sheets API call แทนที่จะยิงทีละแถว) — ใช้ตอน bulk import
+async function appendRowsByFields(sheetName, fieldsArray) {
+  const { headers } = await getSheetData(sheetName)
+  const client = await getClient()
+  const values = fieldsArray.map(fields => headers.map(h => (fields[h] !== undefined ? fields[h] : '')))
+  await client.spreadsheets.values.append({
+    spreadsheetId: SPREADSHEET_ID,
+    range: sheetName,
+    valueInputOption: 'RAW',
+    requestBody: { values },
+  })
+}
+
+// Blocklist อาจยังไม่ถูกสร้างเป็นชีตแยก — กันพังถ้ายังไม่มี ให้ถือว่าลิสต์ว่าง
+async function getBlocklistRows() {
+  try {
+    return await getRows(SHEETS.BLOCKLIST)
+  } catch (err) {
+    return []
+  }
+}
+
 const sheetsService = {
   async getCampaign(campaignId) {
     const rows = await getRows(SHEETS.CAMPAIGNS)
@@ -104,6 +127,10 @@ const sheetsService = {
 
   async getCampaigns() {
     return getRows(SHEETS.CAMPAIGNS)
+  },
+
+  async addCampaign(fields) {
+    await appendRowByFields(SHEETS.CAMPAIGNS, { status: 'active', type: 'outbound', ...fields })
   },
 
   async updateCampaign(id, updates) {
@@ -123,8 +150,19 @@ const sheetsService = {
     )
   },
 
+  async getContact(phone) {
+    const rows = await getRows(SHEETS.CONTACTS)
+    return rows.find(r => r.phone === phone) || null
+  },
+
   async addContact(fields) {
     await appendRowByFields(SHEETS.CONTACTS, { status: 'pending', ...fields })
+  },
+
+  // นำเข้าหลายเบอร์พร้อมกัน (paste จาก Excel/Sheets) — 1 request แทนยิงทีละเบอร์
+  async addContactsBulk(contactsArr) {
+    const rows = contactsArr.map(c => ({ status: 'pending', ...c }))
+    await appendRowsByFields(SHEETS.CONTACTS, rows)
   },
 
   async updateContact(phone, updates) {
@@ -133,6 +171,19 @@ const sheetsService = {
 
   async updateContactStatus(phone, status) {
     return updateRowByKey(SHEETS.CONTACTS, 'phone', phone, { status })
+  },
+
+  async getBlocklist() {
+    return getBlocklistRows()
+  },
+
+  async isBlocked(phone) {
+    const list = await getBlocklistRows()
+    return list.some(b => b.phone === phone)
+  },
+
+  async addToBlocklist(phone, reason) {
+    await appendRowByFields(SHEETS.BLOCKLIST, { phone, reason: reason || '', blocked_at: new Date().toISOString() })
   },
 
   async saveCallResult(result) {
@@ -151,7 +202,7 @@ const sheetsService = {
     return filtered.slice(-limit).reverse()
   },
 
-  async getStats() {
+  async getStats({ days = 7 } = {}) {
     const rows = await getRows(SHEETS.RESULTS)
     const total = rows.length
     const outcomes = {}
@@ -161,18 +212,38 @@ const sheetsService = {
     let durationCount = 0
     let callsToday = 0
 
+    const dayBuckets = []
+    for (let i = days - 1; i >= 0; i--) {
+      const key = new Date(Date.now() - i * 86400000).toISOString().slice(0, 10)
+      dayBuckets.push({ key, calls: 0, interested: 0 })
+    }
+    const bucketMap = new Map(dayBuckets.map(b => [b.key, b]))
+
     rows.forEach(r => {
       outcomes[r.outcome] = (outcomes[r.outcome] || 0) + 1
       if (r.campaign_id) byCampaign[r.campaign_id] = (byCampaign[r.campaign_id] || 0) + 1
       const duration = Number(r.duration)
       if (!Number.isNaN(duration) && duration > 0) { durationSum += duration; durationCount++ }
       if ((r.timestamp || '').startsWith(today)) callsToday++
+
+      const bucket = bucketMap.get((r.timestamp || '').slice(0, 10))
+      if (bucket) {
+        bucket.calls++
+        if (r.outcome === 'interested') bucket.interested++
+      }
     })
 
     const avgDuration = durationCount ? Math.round(durationSum / durationCount) : 0
     const conversionRate = total ? Math.round(((outcomes.interested || 0) / total) * 1000) / 10 : 0
 
-    return { total, outcomes, byCampaign, avgDuration, callsToday, conversionRate }
+    return {
+      total, outcomes, byCampaign, avgDuration, callsToday, conversionRate,
+      dailyTrend: {
+        labels: dayBuckets.map(b => b.key),
+        calls: dayBuckets.map(b => b.calls),
+        interested: dayBuckets.map(b => b.interested),
+      },
+    }
   }
 }
 

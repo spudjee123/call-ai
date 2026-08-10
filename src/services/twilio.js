@@ -2,11 +2,18 @@ const twilio = require('twilio')
 const callSessions = require('../utils/callSessions')
 const { askClaude } = require('./claude')
 const { synthesizeSpeech } = require('./tts')
+const { sheetsService } = require('./googleSheets')
+const healthMonitor = require('../utils/healthMonitor')
 
 const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
 
 
 async function makeOutboundCall(contact, campaign) {
+  if (await sheetsService.isBlocked(contact.phone)) {
+    console.log(`[Twilio] Skipped ${contact.phone} — อยู่ใน Do-not-call list`)
+    return null
+  }
+
   const session = {
     callSid: null,
     phone: contact.phone,
@@ -29,6 +36,7 @@ async function makeOutboundCall(contact, campaign) {
       console.log(`[PreGen] Greeting ready: "${text.substring(0, 60)}" (${chunks.length} chunks)`)
     } catch (err) {
       console.error('[PreGen] Failed:', err.message)
+      healthMonitor.reportError('tts', err.message)
     }
   })()
 
@@ -60,4 +68,9 @@ async function sendSms(to, body) {
   })
 }
 
-module.exports = { makeOutboundCall, sendSms }
+// วางสายทันที — ใช้กับปุ่มฉุกเฉินใน /admin
+async function hangupCall(callSid) {
+  return client.calls(callSid).update({ status: 'completed' })
+}
+
+module.exports = { makeOutboundCall, sendSms, hangupCall }

@@ -2,6 +2,7 @@ const callSessions = require('../utils/callSessions')
 const { transcribeStream } = require('../services/googleSTT')
 const { askClaude, askClaudeStream } = require('../services/claude')
 const { synthesizeSpeechStream } = require('../services/tts')
+const healthMonitor = require('../utils/healthMonitor')
 
 function shouldBlockEndCall(session, aiResponse) {
   const userMessages = session.messages.filter(m => m.role === 'user')
@@ -114,6 +115,7 @@ function registerWebSocket(fastify) {
       } catch (err) {
         if (err.code !== 'ERR_CANCELED' && err.name !== 'CanceledError') {
           console.error('[Silence TTS error]', err.message)
+          healthMonitor.reportError('tts', err.message)
         }
       } finally {
         ttsAbortController = null
@@ -129,6 +131,7 @@ function registerWebSocket(fastify) {
 
       if (silencePromptCount >= 2) {
         pendingEndCall = true
+        currentSession.hangupReason = 'silence_timeout'
         const closeDelay = totalSent * 20 + 4000
         setTimeout(() => { if (socket.readyState === socket.OPEN) socket.close() }, closeDelay)
       }
@@ -168,6 +171,7 @@ function registerWebSocket(fastify) {
       } catch (err) {
         if (err.code !== 'ERR_CANCELED' && err.name !== 'CanceledError') {
           console.error('[Audio Stream error]', err.message)
+          healthMonitor.reportError('tts', err.message)
         }
       } finally {
         greetingAbortController = null
@@ -312,6 +316,7 @@ function registerWebSocket(fastify) {
                 } catch (err) {
                   if (err.code !== 'ERR_CANCELED' && err.name !== 'CanceledError') {
                     console.error('[TTS error]', err.message)
+                    healthMonitor.reportError('tts', err.message)
                   }
                 }
               }
@@ -330,11 +335,13 @@ function registerWebSocket(fastify) {
               } catch (err) {
                 if (err.code !== 'ERR_CANCELED' && err.name !== 'CanceledError') {
                   console.error('[Guard TTS error]', err.message)
+                  healthMonitor.reportError('tts', err.message)
                 }
               }
             }
           } catch (err) {
             console.error('[AI/TTS error]', err.message)
+            healthMonitor.reportError('ai_tts', err.message)
           } finally {
             clearTimeout(processingGuard)
             if (prewarmPromise === myPrewarm) clearPrewarm()
@@ -364,6 +371,7 @@ function registerWebSocket(fastify) {
 
           if (fullText.includes('[END_CALL]')) {
             pendingEndCall = true
+            currentSession.hangupReason = 'ai_ended'
             // Fallback: ปิดสายถ้า mark ไม่มาภายในเวลาที่คาดไว้
             const fallbackDelay = totalSent * 20 + 5000
             setTimeout(() => { if (socket.readyState === socket.OPEN) socket.close() }, fallbackDelay)
@@ -458,6 +466,9 @@ function registerWebSocket(fastify) {
       callActive = false
       clearSilenceTimer()
       if (sttStream) { sttStream.end(); sttStream = null }
+      // ถ้ายังไม่มีเหตุผลปิดสายถูก tag ไว้เลย (ไม่ใช่ AI ปิดปกติ/หมดเวลาเงียบ) แปลว่าอีกฝั่งวางสายเอง
+      const endedSession = callSessions.get(callSid)
+      if (endedSession && !endedSession.hangupReason) endedSession.hangupReason = 'customer_hangup'
     })
 
     socket.on('error', (err) => {

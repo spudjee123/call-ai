@@ -19,6 +19,33 @@ module.exports = async function contactsRoutes(fastify) {
     return reply.send({ message: 'Contact added' })
   })
 
+  // นำเข้าหลายเบอร์พร้อมกัน (paste จาก Excel/Google Sheets) — 1 Sheets API call
+  fastify.post('/api/contacts/bulk', async (req, reply) => {
+    const { contacts, campaign } = req.body || {}
+    if (!Array.isArray(contacts) || !contacts.length || !campaign) {
+      return reply.code(400).send({ error: 'contacts[] and campaign required' })
+    }
+    const rows = contacts
+      .filter(c => c.phone)
+      .map(c => ({ phone: c.phone, name: c.name || '', campaign, status: 'pending' }))
+    if (!rows.length) return reply.code(400).send({ error: 'No valid rows' })
+
+    await sheetsService.addContactsBulk(rows)
+    return reply.send({ message: 'Contacts imported', count: rows.length })
+  })
+
+  // Do-not-call list
+  fastify.get('/api/blocklist', async (req, reply) => {
+    return reply.send(await sheetsService.getBlocklist())
+  })
+
+  fastify.post('/api/blocklist', async (req, reply) => {
+    const { phone, reason } = req.body || {}
+    if (!phone) return reply.code(400).send({ error: 'phone required' })
+    await sheetsService.addToBlocklist(phone, reason)
+    return reply.send({ message: 'Blocked' })
+  })
+
   // แก้ไข contact (เช่น เปลี่ยน status, ชื่อ, campaign)
   fastify.patch('/api/contacts/:phone', async (req, reply) => {
     const updated = await sheetsService.updateContact(req.params.phone, req.body || {})

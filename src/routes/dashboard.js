@@ -1,5 +1,7 @@
 const { sheetsService } = require('../services/googleSheets')
 const callSessions = require('../utils/callSessions')
+const twilioService = require('../services/twilio')
+const healthMonitor = require('../utils/healthMonitor')
 
 module.exports = async function dashboardRoutes(fastify) {
 
@@ -38,9 +40,28 @@ module.exports = async function dashboardRoutes(fastify) {
     })
   })
 
-  // สถิติ summary
+  // สถิติ summary — ?days=7|30|90
   fastify.get('/api/stats', async (req, reply) => {
-    const stats = await sheetsService.getStats()
+    const days = Number(req.query.days) || 7
+    const stats = await sheetsService.getStats({ days })
     return reply.send(stats)
+  })
+
+  // วางสายทันที — ปุ่มฉุกเฉินใน /admin
+  fastify.post('/api/calls/active/:callSid/hangup', async (req, reply) => {
+    const session = callSessions.get(req.params.callSid)
+    if (!session) return reply.code(404).send({ error: 'Call not found or already ended' })
+    session.hangupReason = 'manual_hangup'
+    try {
+      await twilioService.hangupCall(req.params.callSid)
+      return reply.send({ message: 'Call ended' })
+    } catch (err) {
+      return reply.code(500).send({ error: err.message })
+    }
+  })
+
+  // สถานะระบบ — TTS/STT/AI error ล่าสุดในช่วง 10 นาทีที่ผ่านมา
+  fastify.get('/api/health/status', async (req, reply) => {
+    return reply.send(healthMonitor.getStatus())
   })
 }

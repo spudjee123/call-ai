@@ -1,5 +1,6 @@
 const speech = require('@google-cloud/speech')
 const { mulawBufferToPcm16 } = require('../utils/audioConverter')
+const healthMonitor = require('../utils/healthMonitor')
 
 const clientOptions = {}
 if (process.env.GOOGLE_CREDENTIALS_JSON) {
@@ -71,6 +72,7 @@ function transcribeStream(onTranscript, onInterim) {
         if (code11Count % 5 === 0) console.log(`[STT] Stream reset (code 11) ×${code11Count}`)
       } else {
         console.error('[STT error]', err.message)
+        healthMonitor.reportError('stt', err.message)
       }
 
       if (stream === currentStream) {

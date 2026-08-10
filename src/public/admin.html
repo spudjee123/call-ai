@@ -6,739 +6,1312 @@
 <title>Call AI — Control Center</title>
 <style>
   :root {
-    --bg: #f4f5f8;
-    --surface: #ffffff;
-    --border: #e5e7eb;
-    --text: #1f2430;
-    --text-muted: #6b7280;
-    --primary: #3b82f6;
-    --primary-dark: #2563eb;
-    --success: #16a34a;
-    --success-bg: #dcfce7;
-    --danger: #dc2626;
-    --danger-bg: #fee2e2;
-    --warning: #d97706;
-    --warning-bg: #fef3c7;
-    --muted-bg: #eef0f4;
-    --sidebar-bg: #14162b;
-    --sidebar-text: #a9acc9;
-    --sidebar-active: #262a52;
-    --radius: 12px;
-    --radius-sm: 8px;
-    --shadow: 0 1px 3px rgba(16, 24, 40, 0.08);
+    --bg: #f2f1f7;
+    --mesh-1: #8b7bff; --mesh-2: #5ec8ff; --mesh-3: #ff9ecf;
+    --dot: rgba(20,20,40,.06);
+    --glass-bg: rgba(255,255,255,.58);
+    --glass-bg-strong: rgba(255,255,255,.78);
+    --glass-border: rgba(255,255,255,.65);
+    --surface-2: rgba(255,255,255,.62);
+    --text: #1a1a1f;
+    --text-2: #63636d;
+    --text-3: #8b8b94;
+    --accent: #6a5cff;
+    --accent-2: #17c3e6;
+    --accent-hover: #5a4ce6;
+    --accent-soft: rgba(106,92,255,.12);
+    --success: #1f9d55; --success-soft: rgba(31,157,85,.14);
+    --danger: #e0263f; --danger-soft: rgba(224,38,63,.12);
+    --warning: #d98216; --warning-soft: rgba(217,130,22,.14);
+    --sidebar-bg: rgba(24,22,38,.72);
+    --sidebar-text: rgba(255,255,255,.66);
+    --sidebar-text-active: #ffffff;
+    --sidebar-active-bg: rgba(255,255,255,.14);
+    --shadow-card: 0 1px 1px rgba(20,10,60,.03), 0 12px 32px rgba(20,10,60,.10);
+    --shadow-pop: 0 24px 70px rgba(10,5,40,.35);
+    --radius-lg: 24px;
+    --radius-md: 16px;
+    --radius-sm: 12px;
   }
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: -apple-system, "Segoe UI", sans-serif; background: var(--bg); color: var(--text); }
-  a { color: inherit; }
-
-  input[type=text], input[type=password], input[type=tel], select, textarea {
-    padding: 9px 12px; border-radius: var(--radius-sm); border: 1px solid var(--border);
-    font-size: 14px; font-family: inherit; background: #fff; color: var(--text);
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #06060a;
+      --mesh-1: #4d3fc7; --mesh-2: #1478a8; --mesh-3: #a83a72;
+      --dot: rgba(255,255,255,.055);
+      --glass-bg: rgba(30,28,42,.55);
+      --glass-bg-strong: rgba(30,28,42,.78);
+      --glass-border: rgba(255,255,255,.10);
+      --surface-2: rgba(255,255,255,.07);
+      --text: #f3f2fa;
+      --text-2: #a4a3b3;
+      --text-3: #78778a;
+      --accent: #8b7bff;
+      --accent-2: #34d3f0;
+      --accent-hover: #a396ff;
+      --accent-soft: rgba(139,123,255,.2);
+      --success: #35d573; --success-soft: rgba(53,213,115,.16);
+      --danger: #ff5468; --danger-soft: rgba(255,84,104,.18);
+      --warning: #ffab3a; --warning-soft: rgba(255,171,58,.18);
+      --sidebar-bg: rgba(10,9,16,.75);
+      --sidebar-text: rgba(255,255,255,.6);
+      --sidebar-active-bg: rgba(255,255,255,.12);
+      --shadow-card: 0 1px 1px rgba(0,0,0,.4), 0 12px 32px rgba(0,0,0,.5);
+      --shadow-pop: 0 24px 70px rgba(0,0,0,.65);
+    }
   }
-  input:focus, select:focus, textarea:focus { outline: 2px solid var(--primary); outline-offset: -1px; }
-  textarea { width: 100%; min-height: 160px; resize: vertical; line-height: 1.5; }
+  :root[data-theme="dark"] {
+    --bg: #06060a; --mesh-1: #4d3fc7; --mesh-2: #1478a8; --mesh-3: #a83a72; --dot: rgba(255,255,255,.055);
+    --glass-bg: rgba(30,28,42,.55); --glass-bg-strong: rgba(30,28,42,.78); --glass-border: rgba(255,255,255,.10);
+    --surface-2: rgba(255,255,255,.07); --text: #f3f2fa; --text-2: #a4a3b3; --text-3: #78778a;
+    --accent: #8b7bff; --accent-2: #34d3f0; --accent-hover: #a396ff; --accent-soft: rgba(139,123,255,.2);
+    --success: #35d573; --success-soft: rgba(53,213,115,.16); --danger: #ff5468; --danger-soft: rgba(255,84,104,.18);
+    --warning: #ffab3a; --warning-soft: rgba(255,171,58,.18); --sidebar-bg: rgba(10,9,16,.75);
+    --sidebar-text: rgba(255,255,255,.6); --sidebar-active-bg: rgba(255,255,255,.12);
+    --shadow-card: 0 1px 1px rgba(0,0,0,.4), 0 12px 32px rgba(0,0,0,.5); --shadow-pop: 0 24px 70px rgba(0,0,0,.65);
+  }
 
-  button, .btn { padding: 9px 16px; border-radius: var(--radius-sm); border: 1px solid var(--border);
-    font-size: 14px; cursor: pointer; background: #fff; color: var(--text); transition: opacity .15s; }
-  button:hover { opacity: 0.85; }
-  button:disabled { opacity: 0.5; cursor: not-allowed; }
-  .btn-primary { background: var(--primary); color: white; border: none; }
-  .btn-success { background: var(--success); color: white; border: none; }
-  .btn-danger { background: var(--danger); color: white; border: none; }
-  .btn-sm { padding: 5px 10px; font-size: 12px; }
-  .btn-ghost { background: transparent; border: none; color: var(--primary); padding: 0; margin-right: 12px; font-size: 13px; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; min-height: 100%; }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased; overflow-x: hidden; position: relative;
+  }
+  .mesh {
+    position: fixed; inset: 0; z-index: -1; pointer-events: none;
+    background:
+      radial-gradient(circle at 12% 8%, color-mix(in srgb, var(--mesh-1) 38%, transparent), transparent 42%),
+      radial-gradient(circle at 85% 12%, color-mix(in srgb, var(--mesh-2) 32%, transparent), transparent 45%),
+      radial-gradient(circle at 70% 85%, color-mix(in srgb, var(--mesh-3) 28%, transparent), transparent 45%),
+      radial-gradient(circle at 15% 80%, color-mix(in srgb, var(--accent-2) 22%, transparent), transparent 40%),
+      var(--bg);
+  }
+  .mesh::after {
+    content: ""; position: absolute; inset: 0;
+    background-image: radial-gradient(circle, var(--dot) 1px, transparent 1px);
+    background-size: 26px 26px;
+  }
+  .num { font-family: ui-monospace, "SF Mono", "Cascadia Code", Consolas, monospace; font-variant-numeric: tabular-nums; }
+  h1, h2, h3 { text-wrap: balance; font-weight: 650; letter-spacing: -0.015em; margin: 0; }
+  p { margin: 0; }
+  a { color: inherit; text-decoration: none; }
+  button { font-family: inherit; }
+  svg { display: block; }
+  @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .001ms !important; transition-duration: .001ms !important; } }
+
+  /* ---------- shell ---------- */
+  .shell { display: flex; min-height: 100vh; width: 100%; }
+  .sidebar {
+    width: 232px; flex-shrink: 0; background: var(--sidebar-bg); backdrop-filter: blur(28px) saturate(1.7);
+    -webkit-backdrop-filter: blur(28px) saturate(1.7); border-right: 1px solid var(--glass-border);
+    position: sticky; top: 0; align-self: flex-start; height: 100vh;
+    display: flex; flex-direction: column; z-index: 20;
+  }
+  .sidebar-header { padding: 22px 20px 14px; }
+  .sidebar-header .mark { display: flex; align-items: center; gap: 10px; color: #fff; font-weight: 650; font-size: 15px; }
+  .sidebar-header .mark .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--success); box-shadow: 0 0 0 3px rgba(53,213,115,.25); }
+  .sidebar-header .sub { color: var(--sidebar-text); font-size: 12px; margin-top: 3px; padding-left: 19px; }
+  .nav { flex: 1; padding: 8px 12px; display: flex; flex-direction: column; gap: 2px; }
+  .nav button {
+    all: unset; cursor: pointer; color: var(--sidebar-text); font-size: 13.5px; font-weight: 500;
+    padding: 9px 12px; border-radius: 12px; display: flex; align-items: center; gap: 11px;
+    transition: background .15s ease, color .15s ease;
+  }
+  .nav button svg { width: 18px; height: 18px; flex-shrink: 0; opacity: .85; }
+  .nav button:hover { background: rgba(255,255,255,.08); color: #fff; }
+  .nav button.active { background: var(--sidebar-active-bg); color: var(--sidebar-text-active); }
+  .nav button.active svg { opacity: 1; }
+  .sidebar-footer { padding: 14px; border-top: 1px solid var(--glass-border); }
+  .sidebar-footer button {
+    all: unset; cursor: pointer; width: 100%; color: var(--sidebar-text); font-size: 13px;
+    padding: 9px 12px; border-radius: 12px; display: flex; align-items: center; gap: 10px;
+  }
+  .sidebar-footer button:hover { background: rgba(255,255,255,.08); color: #fff; }
+  .sidebar-footer button svg { width: 16px; height: 16px; }
+
+  .main { flex: 1; min-width: 0; }
+  .topbar { padding: 22px clamp(16px,3vw,36px) 4px; display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 10px; }
+  .topbar h1 { font-size: clamp(22px,2.4vw,28px); }
+  .live-badge {
+    display: inline-flex; align-items: center; gap: 6px; background: var(--success-soft); color: var(--success);
+    font-size: 12.5px; font-weight: 650; padding: 5px 12px 5px 9px; border-radius: 999px;
+  }
+  .live-badge .pulse { width: 6px; height: 6px; border-radius: 50%; background: var(--success); animation: pulse 1.4s infinite; }
+  .live-badge.danger { background: var(--danger-soft); color: var(--danger); }
+  .live-badge.danger .pulse { background: var(--danger); }
+  .live-badge.clickable { cursor: pointer; border: none; font-family: inherit; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
+  .page { padding: 18px clamp(16px,3vw,36px) 60px; max-width: 1320px; }
+
+  /* ---------- glass primitives ---------- */
+  .card {
+    background: var(--glass-bg); border: 1px solid var(--glass-border); border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-card); margin-bottom: 20px; backdrop-filter: blur(22px) saturate(1.5);
+    -webkit-backdrop-filter: blur(22px) saturate(1.5);
+  }
+  .card-head { padding: 20px 24px; display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+  .card-head h2 { font-size: 16px; }
+  .card-body { padding: 0 24px 24px; }
+  .card-body.pad-top { padding-top: 24px; }
+
+  .segmented { display: inline-flex; gap: 3px; background: var(--surface-2); padding: 3px; border-radius: 999px; border: 1px solid var(--glass-border); }
+  .segmented button { all: unset; cursor: pointer; font-size: 12.5px; font-weight: 600; padding: 7px 14px; border-radius: 999px; color: var(--text-2); }
+  .segmented button.active { background: var(--glass-bg-strong); color: var(--text); box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+
+  .btn {
+    display: inline-flex; align-items: center; gap: 7px; font-size: 13.5px; font-weight: 600;
+    padding: 9px 16px; border-radius: 999px; border: 1px solid var(--glass-border); background: var(--surface-2);
+    color: var(--text); cursor: pointer; transition: transform .12s ease, background .15s ease, opacity .15s;
+  }
+  .btn svg { width: 15px; height: 15px; }
+  .btn:hover { background: var(--glass-bg-strong); }
+  .btn:active { transform: scale(.96); }
+  .btn:disabled { opacity: .5; cursor: not-allowed; }
+  .btn-accent { background: linear-gradient(135deg, var(--accent), var(--accent-2)); border-color: transparent; color: #fff; }
+  .btn-accent:hover { filter: brightness(1.08); }
+  .btn-danger { background: var(--danger); border-color: var(--danger); color: #fff; }
+  .btn-danger:hover { opacity: .88; }
+  .btn-ghost { background: transparent; border-color: transparent; padding: 6px 10px; color: var(--accent); }
   .btn-ghost.danger { color: var(--danger); }
+  .btn-sm { padding: 6px 12px; font-size: 12.5px; }
+  .btn-icon { padding: 8px; border-radius: 999px; }
 
+  input[type=text], input[type=tel], input[type=search], input[type=password], select, textarea {
+    font-family: inherit; font-size: 14px; padding: 10px 13px; border-radius: var(--radius-sm);
+    border: 1px solid var(--glass-border); background: var(--surface-2); color: var(--text); width: 100%;
+  }
+  input::placeholder, textarea::placeholder { color: var(--text-3); }
+  input:focus, select:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: 0; border-color: transparent; }
+  textarea { min-height: 140px; resize: vertical; line-height: 1.55; }
+  .field { display: flex; flex-direction: column; gap: 6px; }
+  .field label { font-size: 12px; color: var(--text-2); font-weight: 600; }
   .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
-  .card { background: var(--surface); border-radius: var(--radius); box-shadow: var(--shadow); margin-bottom: 20px; border: 1px solid var(--border); }
-  .card-header { padding: 16px 20px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }
-  .card-header h2 { font-size: 15px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
-  .card-body { padding: 20px; }
+  .grid-2 { display: grid; grid-template-columns: 1.3fr 1fr; gap: 20px; }
+  @media (max-width: 980px) { .grid-2 { grid-template-columns: 1fr; } }
+  .search-wrap { position: relative; flex: 1; min-width: 160px; }
+  .search-wrap svg { position: absolute; left: 12px; top: 50%; transform: translateY(-50%); width: 15px; height: 15px; color: var(--text-3); }
+  .search-wrap input { padding-left: 34px; }
 
   table { width: 100%; border-collapse: collapse; }
-  th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--border); font-size: 13px; }
-  th { background: var(--muted-bg); font-weight: 600; color: var(--text-muted); font-size: 12px; text-transform: uppercase; letter-spacing: .03em; }
-  tbody tr:hover { background: #fafbfc; }
+  th { text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--text-3); font-weight: 650; padding: 0 10px 10px; }
+  td { padding: 13px 10px; border-top: 1px solid var(--glass-border); font-size: 13.5px; vertical-align: middle; }
   tbody tr.clickable { cursor: pointer; }
+  tbody tr.clickable:hover { background: rgba(255,255,255,.15); }
+  .table-scroll { overflow-x: auto; }
+  .empty { text-align: center; color: var(--text-3); padding: 40px 20px; font-size: 13.5px; }
 
-  .pill { padding: 3px 10px; border-radius: 999px; font-size: 11px; font-weight: 600; display: inline-block; }
-  .interested { background: var(--success-bg); color: #166534; }
-  .not_interested, .angry, .failed { background: var(--danger-bg); color: #991b1b; }
-  .callback { background: var(--warning-bg); color: #92400e; }
-  .no_answer, .busy, .canceled, .pending { background: var(--muted-bg); color: #4b5563; }
-  .called, .active { background: var(--success-bg); color: #166534; }
-  .deleted, .paused { background: var(--danger-bg); color: #991b1b; }
+  .pill { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; font-weight: 650; padding: 4px 10px; border-radius: 999px; white-space: nowrap; }
+  .pill.interested, .pill.called, .pill.active { background: var(--success-soft); color: var(--success); }
+  .pill.not_interested, .pill.angry, .pill.deleted, .pill.failed { background: var(--danger-soft); color: var(--danger); }
+  .pill.callback { background: var(--warning-soft); color: var(--warning); }
+  .pill.no_answer, .pill.pending, .pill.paused, .pill.busy, .pill.canceled, .pill.no_conversation { background: var(--surface-2); color: var(--text-2); border: 1px solid var(--glass-border); }
+  .pill.completed, .pill.connected, .pill.retry_pending { background: var(--accent-soft); color: var(--accent); }
 
-  .live-dot { display: inline-block; width: 8px; height: 8px; background: var(--success); border-radius: 50%; animation: pulse 1.2s infinite; }
-  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
-  .empty { text-align: center; color: #aaa; padding: 32px; font-size: 13px; }
-  .msg { font-size: 13px; color: var(--text-muted); min-height: 18px; }
-  .msg.error { color: var(--danger); }
-  .msg.ok { color: var(--success); }
+  .switch { position: relative; display: inline-block; width: 42px; height: 25px; flex-shrink: 0; }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .switch .track { position: absolute; inset: 0; background: var(--surface-2); border: 1px solid var(--glass-border); border-radius: 999px; transition: background .18s ease; cursor: pointer; }
+  .switch .track::before { content: ""; position: absolute; width: 19px; height: 19px; left: 2px; top: 2px; background: #fff; border-radius: 50%; box-shadow: 0 1px 3px rgba(0,0,0,.3); transition: transform .18s ease; }
+  .switch input:checked + .track { background: var(--success); }
+  .switch input:checked + .track::before { transform: translateX(17px); }
+  .switch-row { display: flex; align-items: center; justify-content: space-between; padding: 11px 0; border-top: 1px solid var(--glass-border); font-size: 13.5px; }
+  .switch-row:first-of-type { border-top: none; }
 
-  /* ---- layout shell ---- */
-  .shell { display: flex; min-height: 100vh; }
-  .sidebar { width: 220px; background: var(--sidebar-bg); color: var(--sidebar-text); flex-shrink: 0;
-    display: flex; flex-direction: column; position: fixed; top: 0; left: 0; bottom: 0; z-index: 10; }
-  .sidebar-header { padding: 20px; font-weight: 700; color: #fff; font-size: 15px; border-bottom: 1px solid rgba(255,255,255,.08); }
-  .sidebar-header .sub { font-weight: 400; font-size: 11px; color: var(--sidebar-text); margin-top: 2px; }
-  .nav { flex: 1; padding: 12px; display: flex; flex-direction: column; gap: 2px; }
-  .nav a { text-decoration: none; padding: 10px 12px; border-radius: var(--radius-sm); font-size: 14px;
-    display: flex; align-items: center; gap: 10px; color: var(--sidebar-text); }
-  .nav a:hover { background: rgba(255,255,255,.06); }
-  .nav a.active { background: var(--sidebar-active); color: #fff; }
-  .sidebar-footer { padding: 16px; border-top: 1px solid rgba(255,255,255,.08); }
-  .sidebar-footer button { width: 100%; background: rgba(255,255,255,.06); color: var(--sidebar-text); border: none; }
+  /* ---------- stat tiles ---------- */
+  .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(148px, 1fr)); gap: 14px; margin-bottom: 20px; }
+  .stat-tile { background: var(--glass-bg); backdrop-filter: blur(22px) saturate(1.5); border: 1px solid var(--glass-border); border-radius: var(--radius-lg); box-shadow: var(--shadow-card); padding: 18px 20px; }
+  .stat-tile .label { font-size: 12.5px; color: var(--text-2); font-weight: 600; margin-bottom: 8px; }
+  .stat-tile .value { font-size: 28px; font-weight: 700; letter-spacing: -.01em; }
+  .stat-tile .value.accent { color: var(--accent); }
+  .stat-tile .value.success { color: var(--success); }
+  .stat-tile .value.warning { color: var(--warning); }
 
-  .main { margin-left: 220px; flex: 1; min-width: 0; }
-  .topbar { background: var(--surface); border-bottom: 1px solid var(--border); padding: 16px 28px;
-    display: flex; align-items: center; justify-content: space-between; position: sticky; top: 0; z-index: 5; }
-  .topbar h1 { font-size: 17px; font-weight: 700; }
-  .badge { background: #eef2ff; color: var(--primary-dark); padding: 4px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; }
-  .page { padding: 24px 28px; max-width: 1200px; }
+  /* ---------- gradient campaign cards ---------- */
+  .campaign-strip { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 16px; margin-bottom: 20px; }
+  .gcard {
+    position: relative; overflow: hidden; border-radius: var(--radius-lg); padding: 20px; min-height: 158px;
+    color: #fff; display: flex; flex-direction: column; justify-content: space-between;
+    box-shadow: 0 16px 40px -12px rgba(20,10,60,.35); cursor: pointer; transition: transform .18s ease;
+  }
+  .gcard:hover { transform: translateY(-3px); }
+  .gcard::after {
+    content: ""; position: absolute; inset: 0; opacity: .5; mix-blend-mode: overlay;
+    background-image: radial-gradient(circle at 1px 1px, rgba(255,255,255,.35) 1px, transparent 0);
+    background-size: 14px 14px;
+  }
+  .gcard.g0 { background: linear-gradient(135deg, #6a5cff 0%, #17c3e6 100%); }
+  .gcard.g1 { background: linear-gradient(135deg, #ff8a65 0%, #ffce54 100%); }
+  .gcard.g2 { background: linear-gradient(135deg, #17c3e6 0%, #6a5cff 100%); }
+  .gcard.g3 { background: linear-gradient(135deg, #ff6fa8 0%, #ff9ecf 100%); }
+  .gcard.dim { filter: saturate(.55) brightness(.8); }
+  .gcard .top-row { display: flex; justify-content: space-between; align-items: flex-start; z-index: 1; position: relative; }
+  .gcard .chip { width: 32px; height: 24px; border-radius: 6px; background: rgba(255,255,255,.28); display: flex; align-items: center; justify-content: center; }
+  .gcard .chip svg { width: 15px; height: 15px; }
+  .gcard .pill { background: rgba(255,255,255,.24); color: #fff; }
+  .gcard .name { font-size: 15px; font-weight: 650; z-index: 1; position: relative; margin: 14px 0 8px; }
+  .gcard .stats { display: flex; gap: 18px; z-index: 1; position: relative; margin-bottom: 10px; }
+  .gcard .stats .n { font-size: 19px; font-weight: 700; }
+  .gcard .stats .l { font-size: 10.5px; opacity: .8; text-transform: uppercase; letter-spacing: .04em; }
+  .gcard .progress { height: 5px; border-radius: 999px; background: rgba(255,255,255,.25); overflow: hidden; z-index: 1; position: relative; }
+  .gcard .progress-fill { height: 100%; background: rgba(255,255,255,.85); border-radius: 999px; }
 
-  @media (max-width: 760px) {
-    .sidebar { width: 64px; }
-    .sidebar .label, .sidebar-header .sub, .sidebar-header .full { display: none; }
-    .main { margin-left: 64px; }
+  /* ---------- glow hero ---------- */
+  .glow-hero {
+    position: relative; border-radius: var(--radius-lg); padding: 22px 24px; overflow: hidden;
+    background: linear-gradient(160deg, rgba(20,18,32,.92), rgba(10,9,18,.96)); color: #fff;
+    box-shadow: var(--shadow-pop); margin-bottom: 20px;
+  }
+  .glow-hero::before {
+    content: ""; position: absolute; inset: -2px; border-radius: inherit; padding: 2px; z-index: 0;
+    background: conic-gradient(from 0deg, #6a5cff, #17c3e6, #ff9ecf, #ffce54, #6a5cff);
+    -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+    -webkit-mask-composite: xor; mask-composite: exclude; opacity: .85; filter: blur(.4px);
+    animation: spin 7s linear infinite;
+  }
+  @media (prefers-reduced-motion: reduce) { .glow-hero::before { animation: none; } }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .glow-hero .inner { position: relative; z-index: 1; display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+  .glow-hero h3 { font-size: 17px; margin-bottom: 4px; }
+  .glow-hero p { font-size: 12.5px; color: rgba(255,255,255,.6); }
+  .glow-hero .btn { background: rgba(255,255,255,.12); border-color: rgba(255,255,255,.18); color: #fff; }
+  .glow-hero .btn:hover { background: rgba(255,255,255,.2); }
+  .idle-hero {
+    border-radius: var(--radius-lg); padding: 18px 24px; margin-bottom: 20px; display: flex; align-items: center; gap: 12px;
+    color: var(--text-2); font-size: 13.5px; background: var(--glass-bg); border: 1px solid var(--glass-border);
+    backdrop-filter: blur(22px) saturate(1.5);
   }
 
-  /* ---- dashboard stats ---- */
-  .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 14px; margin-bottom: 20px; }
-  .stat-card { background: var(--surface); padding: 18px; border-radius: var(--radius); box-shadow: var(--shadow); border: 1px solid var(--border); }
-  .stat-card .label { font-size: 12px; color: var(--text-muted); margin-bottom: 6px; }
-  .stat-card .value { font-size: 26px; font-weight: 700; }
-  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
-  @media (max-width: 980px) { .grid-2 { grid-template-columns: 1fr; } }
+  /* ---------- chart ---------- */
+  .chart-wrap { position: relative; }
+  .chart-annot {
+    position: absolute; top: 14px; background: var(--glass-bg-strong); border: 1px solid var(--glass-border);
+    padding: 4px 10px; border-radius: 999px; font-size: 11px; font-weight: 650; backdrop-filter: blur(10px);
+    display: flex; align-items: center; gap: 5px; box-shadow: var(--shadow-card);
+  }
+  .chart-annot .d { width: 5px; height: 5px; border-radius: 50%; background: var(--accent); }
 
-  .bar-row { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; font-size: 13px; }
-  .bar-label { width: 110px; color: var(--text-muted); flex-shrink: 0; }
-  .bar-track { flex: 1; background: var(--muted-bg); border-radius: 6px; height: 10px; overflow: hidden; }
-  .bar-fill { height: 100%; border-radius: 6px; background: var(--primary); }
-  .bar-value { width: 46px; text-align: right; font-weight: 600; flex-shrink: 0; }
+  .bar-row { display: flex; align-items: center; gap: 12px; padding: 9px 0; }
+  .bar-label { width: 110px; flex-shrink: 0; font-size: 13px; color: var(--text-2); }
+  .bar-track { flex: 1; height: 8px; background: var(--surface-2); border-radius: 999px; overflow: hidden; }
+  .bar-fill { height: 100%; border-radius: 999px; background: linear-gradient(90deg, var(--accent), var(--accent-2)); transition: width .5s cubic-bezier(.2,.8,.2,1); }
+  .bar-value { width: 34px; text-align: right; font-size: 13px; font-weight: 650; flex-shrink: 0; }
 
-  /* ---- login ---- */
-  #loginScreen { min-height: 100vh; display: flex; align-items: center; justify-content: center; background: var(--sidebar-bg); }
-  .login-box { background: var(--surface); padding: 36px 32px; border-radius: var(--radius); box-shadow: 0 20px 50px rgba(0,0,0,.35); width: 320px; text-align: center; }
-  .login-box h1 { font-size: 17px; margin-bottom: 4px; }
-  .login-box .sub { font-size: 12px; color: var(--text-muted); margin-bottom: 20px; }
+  .qa-row { display: flex; align-items: center; gap: 12px; padding: 12px 0; border-top: 1px solid var(--glass-border); cursor: pointer; }
+  .qa-row:first-child { border-top: none; }
+  .qa-row .badge { width: 34px; height: 34px; border-radius: 50%; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+  .qa-row .badge svg { width: 16px; height: 16px; }
+  .qa-row .label { flex: 1; font-size: 13.5px; font-weight: 600; }
+  .qa-row .chev { color: var(--text-3); width: 16px; height: 16px; }
+  .qa-row:hover .label { color: var(--accent); }
+
+  .import-zone {
+    width: 100%; min-height: 130px; font-family: ui-monospace, "SF Mono", Consolas, monospace; font-size: 12.5px;
+    border: 1.5px dashed var(--glass-border); background: var(--surface-2); border-radius: var(--radius-sm);
+    padding: 12px 14px; resize: vertical; line-height: 1.6; color: var(--text);
+  }
+  .import-zone:focus { border-style: solid; border-color: var(--accent); outline: none; }
+  .import-summary { display: flex; align-items: center; gap: 14px; font-size: 12.5px; color: var(--text-2); margin: 10px 0; flex-wrap: wrap; }
+  .import-summary b.ok { color: var(--success); } .import-summary b.bad { color: var(--danger); }
+  .import-preview { max-height: 220px; overflow-y: auto; border: 1px solid var(--glass-border); border-radius: var(--radius-sm); }
+  .import-preview table { font-size: 12.5px; }
+  .import-preview td { padding: 8px 10px; }
+  .row-invalid td { opacity: .45; text-decoration: line-through; }
+  .tab-toggle { display: flex; gap: 4px; background: var(--surface-2); padding: 3px; border-radius: 10px; border: 1px solid var(--glass-border); margin-bottom: 14px; width: fit-content; }
+  .tab-toggle button { all: unset; cursor: pointer; font-size: 12.5px; font-weight: 600; padding: 7px 14px; border-radius: 8px; color: var(--text-2); }
+  .tab-toggle button.active { background: var(--glass-bg-strong); color: var(--text); box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+  .tab-panel { display: none; } .tab-panel.active { display: block; }
+
+  /* ---------- modal + confirm + toast ---------- */
+  .overlay { position: fixed; inset: 0; background: rgba(10,8,20,.45); backdrop-filter: blur(8px); display: none; align-items: center; justify-content: center; z-index: 60; padding: 20px; }
+  .overlay.open { display: flex; }
+  .modal { background: var(--glass-bg-strong); backdrop-filter: blur(30px) saturate(1.6); border-radius: var(--radius-lg); width: 100%; max-width: 680px; max-height: 84vh; display: flex; flex-direction: column; overflow: hidden; box-shadow: var(--shadow-pop); border: 1px solid var(--glass-border); animation: pop .18s cubic-bezier(.2,.9,.3,1); }
+  @keyframes pop { from { opacity: 0; transform: scale(.96) } to { opacity: 1; transform: scale(1) } }
+  .modal-head { padding: 18px 22px; border-bottom: 1px solid var(--glass-border); display: flex; justify-content: space-between; align-items: flex-start; }
+  .modal-head h3 { font-size: 16px; }
+  .modal-head .sub { font-size: 12.5px; color: var(--text-2); margin-top: 3px; }
+  .modal-close { all: unset; cursor: pointer; color: var(--text-3); padding: 4px; border-radius: 8px; }
+  .modal-close:hover { background: var(--surface-2); color: var(--text); }
+  .modal-meta { padding: 14px 22px; background: var(--surface-2); border-bottom: 1px solid var(--glass-border); display: grid; grid-template-columns: repeat(auto-fit, minmax(150px,1fr)); gap: 10px; }
+  .modal-meta .k { font-size: 11px; color: var(--text-3); text-transform: uppercase; letter-spacing: .03em; margin-bottom: 3px; }
+  .modal-meta .v { font-size: 13.5px; font-weight: 600; }
+  .modal-messages { padding: 18px 22px; overflow-y: auto; flex: 1; display: flex; flex-direction: column; gap: 10px; }
+  .bubble { max-width: 74%; padding: 10px 14px; border-radius: 16px; font-size: 13.5px; line-height: 1.5; }
+  .bubble.ai { align-self: flex-start; background: var(--surface-2); border: 1px solid var(--glass-border); border-bottom-left-radius: 5px; }
+  .bubble.user { align-self: flex-end; background: linear-gradient(135deg, var(--accent), var(--accent-2)); color: #fff; border-bottom-right-radius: 5px; }
+  .bubble-label { font-size: 10px; opacity: .6; margin-bottom: 3px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; }
+
+  .confirm-box { background: var(--glass-bg-strong); backdrop-filter: blur(30px); border-radius: var(--radius-md); width: 100%; max-width: 340px; padding: 24px 22px 18px; text-align: center; box-shadow: var(--shadow-pop); border: 1px solid var(--glass-border); animation: pop .18s cubic-bezier(.2,.9,.3,1); }
+  .confirm-icon { width: 46px; height: 46px; border-radius: 50%; margin: 0 auto 14px; display: flex; align-items: center; justify-content: center; }
+  .confirm-icon.danger { background: var(--danger-soft); color: var(--danger); }
+  .confirm-icon.safe { background: var(--accent-soft); color: var(--accent); }
+  .confirm-icon svg { width: 22px; height: 22px; }
+  .confirm-box h3 { font-size: 15.5px; margin-bottom: 6px; }
+  .confirm-box p { font-size: 13px; color: var(--text-2); line-height: 1.5; margin-bottom: 18px; }
+  .confirm-actions { display: flex; gap: 10px; }
+  .confirm-actions .btn { flex: 1; justify-content: center; }
+
+  .toast-stack { position: fixed; bottom: 22px; left: 50%; transform: translateX(-50%); z-index: 80; display: flex; flex-direction: column; gap: 8px; align-items: center; }
+  .toast { display: flex; align-items: center; gap: 8px; background: var(--text); color: var(--bg); font-size: 13px; font-weight: 600; padding: 10px 18px; border-radius: 999px; box-shadow: var(--shadow-pop); animation: toastin .22s cubic-bezier(.2,.9,.3,1); }
+  .toast svg { width: 15px; height: 15px; flex-shrink: 0; }
+  .toast.success svg { color: var(--success); }
+  .toast.danger svg { color: #ff8a80; }
+  @keyframes toastin { from { opacity:0; transform: translateY(8px) } to { opacity:1; transform: translateY(0) } }
+
+  ::selection { background: var(--accent-soft); }
+  button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible, [tabindex]:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 2px;
+  }
+
+  /* ---------- login ---------- */
+  #loginScreen { min-height: 100vh; display: flex; align-items: center; justify-content: center; background: var(--sidebar-bg); position: relative; }
+  .login-box { background: var(--glass-bg-strong); backdrop-filter: blur(30px) saturate(1.6); padding: 36px 32px; border-radius: var(--radius-lg); box-shadow: var(--shadow-pop); width: 320px; text-align: center; border: 1px solid var(--glass-border); position: relative; z-index: 1; }
+  .login-box h1 { font-size: 17px; margin-bottom: 4px; color: #fff; }
+  .login-box .sub { font-size: 12px; color: rgba(255,255,255,.6); margin-bottom: 20px; }
   .login-box input { width: 100%; margin-bottom: 12px; }
   .login-box button { width: 100%; }
-
   #app { display: none; }
 
-  /* ---- modal ---- */
-  .modal-overlay { position: fixed; inset: 0; background: rgba(15,17,30,.5); display: none;
-    align-items: center; justify-content: center; z-index: 50; padding: 20px; }
-  .modal-overlay.open { display: flex; }
-  .modal-box { background: var(--surface); border-radius: var(--radius); width: 100%; max-width: 720px;
-    max-height: 85vh; display: flex; flex-direction: column; overflow: hidden; box-shadow: 0 20px 50px rgba(0,0,0,.3); }
-  .modal-header { padding: 16px 20px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
-  .modal-header h3 { font-size: 15px; }
-  .modal-header .sub { font-size: 12px; color: var(--text-muted); }
-  .modal-close { background: none; border: none; font-size: 20px; cursor: pointer; color: var(--text-muted); padding: 0 4px; }
-  .modal-meta { padding: 12px 20px; border-bottom: 1px solid var(--border); font-size: 12px; color: var(--text-muted);
-    display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 8px; background: #fafbfc; }
-  .modal-meta b { color: var(--text); display: block; font-size: 13px; font-weight: 600; margin-top: 2px; }
-  .modal-messages { padding: 16px 20px; overflow-y: auto; flex: 1; display: flex; flex-direction: column; gap: 10px; background: #fbfbfc; }
-  .bubble { max-width: 75%; padding: 10px 14px; border-radius: 14px; font-size: 14px; line-height: 1.45; }
-  .bubble.ai { align-self: flex-start; background: #eef2ff; color: #1e293b; border-bottom-left-radius: 4px; }
-  .bubble.user { align-self: flex-end; background: var(--primary); color: #fff; border-bottom-right-radius: 4px; }
-  .bubble-label { font-size: 10px; opacity: .65; margin-bottom: 3px; font-weight: 700; text-transform: uppercase; letter-spacing: .03em; }
+  /* ---------- responsive ---------- */
+  @media (max-width: 1024px) {
+    .sidebar { width: 76px; }
+    .sidebar .label, .sidebar-header .sub, .sidebar-header .full-name { display: none; }
+    .sidebar-header { padding: 20px 0 14px; display: flex; justify-content: center; }
+    .sidebar-header .mark { flex-direction: column; gap: 4px; }
+    .nav button { justify-content: center; padding: 12px; }
+    .sidebar-footer button { justify-content: center; padding: 12px; }
+  }
+  @media (max-width: 680px) {
+    .shell { flex-direction: column; }
+    .sidebar {
+      position: fixed; top: auto; bottom: 0; left: 0; right: 0; width: 100%; height: auto;
+      flex-direction: row; border-right: none; border-top: 1px solid var(--glass-border); z-index: 40;
+      padding-bottom: env(safe-area-inset-bottom);
+    }
+    .sidebar-header, .sidebar-footer { display: none; }
+    .nav { flex-direction: row; justify-content: space-around; padding: 8px; }
+    .nav button { flex-direction: column; gap: 3px; font-size: 10px; padding: 6px 8px; }
+    .nav button svg { width: 20px; height: 20px; }
+    .main { padding-bottom: 70px; }
+    .topbar { padding: 18px 16px 4px; }
+    .page { padding: 14px 16px 40px; }
+    .grid-2 { grid-template-columns: 1fr; }
+    .stats-grid { grid-template-columns: repeat(2, 1fr); }
+    .modal-meta { grid-template-columns: 1fr 1fr; }
+  }
 </style>
 </head>
 <body>
 
-  <div id="loginScreen">
-    <div class="login-box">
-      <h1>Call AI — Control Center</h1>
-      <div class="sub">กรอกรหัสผ่านเพื่อเข้าใช้งาน</div>
-      <input type="password" id="loginPassword" placeholder="รหัสผ่าน" onkeydown="if(event.key==='Enter') login()">
-      <button class="btn-primary" onclick="login()">เข้าสู่ระบบ</button>
-      <div class="msg error" id="loginError"></div>
-    </div>
+<div class="mesh"></div>
+
+<div id="loginScreen">
+  <div class="login-box">
+    <h1>Call AI — Control Center</h1>
+    <div class="sub">กรอกรหัสผ่านเพื่อเข้าใช้งาน</div>
+    <input type="password" id="loginPassword" placeholder="รหัสผ่าน" onkeydown="if(event.key==='Enter') login()">
+    <button class="btn btn-accent" onclick="login()">เข้าสู่ระบบ</button>
+    <div class="msg error" id="loginError" style="font-size:13px; color:#ff8a80; min-height:18px; margin-top:6px"></div>
   </div>
+</div>
 
-  <div id="app">
-    <div class="shell">
-      <div class="sidebar">
-        <div class="sidebar-header">
-          <div class="full">Call AI</div>
-          <div class="sub">Control Center</div>
-        </div>
-        <nav class="nav">
-          <a href="#/dashboard" data-page="dashboard">📊 <span class="label">Dashboard</span></a>
-          <a href="#/campaigns" data-page="campaigns">📢 <span class="label">Campaigns</span></a>
-          <a href="#/contacts" data-page="contacts">👥 <span class="label">เบอร์ติดต่อ</span></a>
-          <a href="#/test" data-page="test">📞 <span class="label">ทดสอบโทร</span></a>
-          <a href="#/history" data-page="history">📋 <span class="label">ประวัติการโทร</span></a>
-        </nav>
-        <div class="sidebar-footer">
-          <button onclick="logout()"><span class="label">ออกจากระบบ</span> ⏻</button>
-        </div>
+<div id="app">
+  <div class="shell">
+    <div class="sidebar">
+      <div class="sidebar-header">
+        <div class="mark"><span class="dot"></span> <span class="full-name">Call AI</span></div>
+        <div class="sub">Control Center</div>
       </div>
-
-      <div class="main">
-        <div class="topbar">
-          <h1 id="pageTitle">Dashboard</h1>
-          <span class="badge" id="activeBadge">0 Active</span>
-        </div>
-        <div class="page" id="pageContent"></div>
+      <nav class="nav" id="nav"></nav>
+      <div class="sidebar-footer">
+        <button onclick="logout()">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+          <span class="label">ออกจากระบบ</span>
+        </button>
       </div>
     </div>
-  </div>
 
-  <div class="modal-overlay" id="transcriptModal">
-    <div class="modal-box">
-      <div class="modal-header">
-        <div>
-          <h3 id="modalTitle">บทสนทนา</h3>
-          <div class="sub" id="modalSubtitle"></div>
+    <div class="main">
+      <div class="topbar">
+        <h1 id="pageTitle">Dashboard</h1>
+        <div class="row" style="gap:8px">
+          <button class="live-badge clickable" id="healthPill"><span class="pulse"></span> กำลังตรวจสอบ...</button>
+          <span class="live-badge" id="activeBadge"><span class="pulse"></span> <span id="activeCount">0</span> สายที่กำลังคุยอยู่</span>
         </div>
-        <button class="modal-close" onclick="closeModal()">✕</button>
       </div>
-      <div class="modal-meta" id="modalMeta"></div>
-      <div class="modal-messages" id="modalMessages"></div>
+      <div class="page" id="pageContent"></div>
     </div>
   </div>
+</div>
+
+<div class="overlay" id="modalOverlay">
+  <div class="modal">
+    <div class="modal-head">
+      <div><h3 id="modalTitle"></h3><div class="sub" id="modalSubtitle"></div></div>
+      <button class="modal-close" onclick="closeModal()">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </div>
+    <div class="modal-meta" id="modalMeta"></div>
+    <div class="modal-messages" id="modalMessages"></div>
+  </div>
+</div>
+
+<div class="overlay" id="confirmOverlay"></div>
+<div class="toast-stack" id="toastStack"></div>
 
 <script>
-  let token = localStorage.getItem('callai_token') || null
-  let campaignsCache = []
-  let historyCache = []
-  let liveModalCallSid = null
-  let liveModalTimer = null
+/* ==================== icons ==================== */
+const ICONS = {
+  dashboard: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="12" width="4" height="9" rx="1"/><rect x="10" y="7" width="4" height="14" rx="1"/><rect x="17" y="3" width="4" height="18" rx="1"/></svg>',
+  campaigns: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11v2a2 2 0 0 0 2 2h1l3 5 1-.5-2-4.5h6l6 4V5l-6 4H6a2 2 0 0 0-2 2Z"/><path d="M15 9v6"/></svg>',
+  contacts: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H7a4 4 0 0 0-4 4v2"/><circle cx="10" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>',
+  test: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.127.96.36 1.903.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.907.34 1.85.573 2.81.7A2 2 0 0 1 22 16.92z"/></svg>',
+  history: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l3 3"/></svg>',
+  search: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>',
+  plus: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>',
+  trash: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>',
+  chat: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>',
+  hangup: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M10.68 13.31a16 16 0 0 0 3.41 2.6l1.27-1.27a2 2 0 0 1 2.11-.45c.86.32 1.76.55 2.68.68A2 2 0 0 1 22 16.92V19a2 2 0 0 1-2.18 2A19.79 19.79 0 0 1 2 3.18 2 2 0 0 1 4 1h2.09a2 2 0 0 1 2 1.72c.127.96.36 1.903.7 2.81a2 2 0 0 1-.45 2.11z"/><line x1="1" y1="1" x2="23" y2="23"/></svg>',
+  play: '<svg viewBox="0 0 24 24" fill="currentColor"><polygon points="6 3 20 12 6 21 6 3"/></svg>',
+  pause: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/></svg>',
+  edit: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>',
+  warn: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>',
+  check: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>',
+  waveform: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="3" y1="10" x2="3" y2="14"/><line x1="7" y1="6" x2="7" y2="18"/><line x1="11" y1="2" x2="11" y2="22"/><line x1="15" y1="6" x2="15" y2="18"/><line x1="19" y1="10" x2="19" y2="14"/></svg>',
+  download: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>',
+  chevron: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>',
+  clipboard: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="8" y="2" width="8" height="4" rx="1"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><path d="M9 12h6"/><path d="M9 16h6"/></svg>',
+  sheet: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="3" y1="15" x2="21" y2="15"/><line x1="9" y1="3" x2="9" y2="21"/><line x1="15" y1="3" x2="15" y2="21"/></svg>',
+  block: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="4.9" y1="4.9" x2="19.1" y2="19.1"/></svg>',
+}
+const icon = (name, cls) => `<span class="${cls||''}" style="display:inline-flex">${ICONS[name]||''}</span>`
+const HANGUP_LABELS = { ai_ended: 'AI ปิดสายปกติ', customer_hangup: 'ลูกค้าวางสายเอง', silence_timeout: 'หมดเวลาเงียบ ไม่ตอบสนอง', manual_hangup: 'เจ้าหน้าที่ตัดสาย (ปุ่มฉุกเฉิน)' }
+const CALL_STATUS_LABELS = { completed: 'เชื่อมสายสำเร็จ', 'no-answer': 'ไม่รับสาย', busy: 'สายไม่ว่าง', failed: 'โทรไม่ติด', canceled: 'ยกเลิกก่อนโทร' }
 
-  function esc(str) {
-    const d = document.createElement('div')
-    d.textContent = str == null ? '' : String(str)
-    return d.innerHTML
+/* ==================== auth / fetch ==================== */
+let token = localStorage.getItem('callai_token') || null
+
+function esc(s){ const d=document.createElement('div'); d.textContent = s==null?'':String(s); return d.innerHTML }
+function fmtDur(sec){ sec=Number(sec)||0; const m=Math.floor(sec/60), s=Math.floor(sec%60); return `${m}:${String(s).padStart(2,'0')}` }
+function fmtDate(iso){ if(!iso) return ''; const d=new Date(iso); if(isNaN(d)) return iso; return new Intl.DateTimeFormat('sv-SE',{timeZone:'Asia/Bangkok',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}).format(d) }
+
+async function apiFetch(url, options = {}) {
+  options.headers = Object.assign({}, options.headers, { 'Authorization': 'Bearer ' + token })
+  if (options.body && typeof options.body !== 'string') {
+    options.headers['Content-Type'] = 'application/json'
+    options.body = JSON.stringify(options.body)
   }
-
-  function formatDuration(sec) {
-    sec = Number(sec) || 0
-    const m = Math.floor(sec / 60), s = Math.floor(sec % 60)
-    return `${m}:${String(s).padStart(2, '0')}`
-  }
-
-  // แปลง ISO timestamp (UTC) เป็นเวลาไทย (Asia/Bangkok, UTC+7)
-  function formatDateTH(iso) {
-    if (!iso) return ''
-    const d = new Date(iso)
-    if (isNaN(d)) return iso
-    return new Intl.DateTimeFormat('sv-SE', {
-      timeZone: 'Asia/Bangkok', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit'
-    }).format(d)
-  }
-
-  async function apiFetch(url, options = {}) {
-    options.headers = Object.assign({}, options.headers, { 'Authorization': 'Bearer ' + token })
-    if (options.body && typeof options.body !== 'string') {
-      options.headers['Content-Type'] = 'application/json'
-      options.body = JSON.stringify(options.body)
-    }
-    const res = await fetch(url, options)
-    if (res.status === 401) {
-      token = null
-      localStorage.removeItem('callai_token')
-      showLogin()
-      throw new Error('Unauthorized')
-    }
-    return res
-  }
-
-  function showLogin() {
-    document.getElementById('loginScreen').style.display = 'flex'
-    document.getElementById('app').style.display = 'none'
-  }
-
-  function showApp() {
-    document.getElementById('loginScreen').style.display = 'none'
-    document.getElementById('app').style.display = 'block'
-    refreshActiveGlobal()
-    renderPage()
-  }
-
-  async function login() {
-    const password = document.getElementById('loginPassword').value
-    const errEl = document.getElementById('loginError')
-    errEl.textContent = ''
-    try {
-      const res = await fetch('/api/auth/login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ password })
-      })
-      const data = await res.json()
-      if (!res.ok) { errEl.textContent = data.error || 'เข้าสู่ระบบไม่สำเร็จ'; return }
-      token = data.token
-      localStorage.setItem('callai_token', token)
-      showApp()
-    } catch (e) {
-      errEl.textContent = 'เชื่อมต่อไม่ได้'
-    }
-  }
-
-  async function logout() {
-    try { await apiFetch('/api/auth/logout', { method: 'POST' }) } catch (e) {}
+  const res = await fetch(url, options)
+  if (res.status === 401) {
     token = null
     localStorage.removeItem('callai_token')
     showLogin()
+    throw new Error('Unauthorized')
   }
+  return res
+}
 
-  // ==================== ROUTER ====================
-  const PAGES = ['dashboard', 'campaigns', 'contacts', 'test', 'history']
-  const PAGE_TITLES = { dashboard: 'Dashboard', campaigns: 'จัดการ Campaign', contacts: 'เบอร์ติดต่อ', test: 'ทดสอบโทร', history: 'ประวัติการโทร' }
+function showLogin() {
+  document.getElementById('loginScreen').style.display = 'flex'
+  document.getElementById('app').style.display = 'none'
+}
+function showApp() {
+  document.getElementById('loginScreen').style.display = 'none'
+  document.getElementById('app').style.display = 'block'
+  buildNav()
+  refreshActiveGlobal()
+  pollHealth()
+  render()
+}
 
-  function currentPage() {
-    const hash = location.hash.replace(/^#\/?/, '') || 'dashboard'
-    return PAGES.includes(hash) ? hash : 'dashboard'
-  }
+async function login() {
+  const password = document.getElementById('loginPassword').value
+  const errEl = document.getElementById('loginError')
+  errEl.textContent = ''
+  try {
+    const res = await fetch('/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password }) })
+    const data = await res.json()
+    if (!res.ok) { errEl.textContent = data.error || 'เข้าสู่ระบบไม่สำเร็จ'; return }
+    token = data.token
+    localStorage.setItem('callai_token', token)
+    showApp()
+  } catch (e) { errEl.textContent = 'เชื่อมต่อไม่ได้' }
+}
+async function logout() {
+  try { await apiFetch('/api/auth/logout', { method: 'POST' }) } catch (e) {}
+  token = null
+  localStorage.removeItem('callai_token')
+  showLogin()
+}
 
-  function renderPage() {
-    const page = currentPage()
-    document.querySelectorAll('.nav a').forEach(a => a.classList.toggle('active', a.dataset.page === page))
-    document.getElementById('pageTitle').textContent = PAGE_TITLES[page]
-    document.getElementById('pageContent').innerHTML = TEMPLATES[page]()
-    INIT[page]()
-  }
-
-  window.addEventListener('hashchange', renderPage)
-
-  // ==================== TEMPLATES ====================
-  const TEMPLATES = {
-    dashboard: () => `
-      <div class="stats-grid">
-        <div class="stat-card"><div class="label">โทรทั้งหมด</div><div class="value" id="statTotal">-</div></div>
-        <div class="stat-card"><div class="label">สนใจ</div><div class="value" style="color:var(--success)" id="statInterested">-</div></div>
-        <div class="stat-card"><div class="label">นัด Callback</div><div class="value" style="color:var(--warning)" id="statCallback">-</div></div>
-        <div class="stat-card"><div class="label">ไม่รับสาย</div><div class="value" style="color:var(--text-muted)" id="statNoAnswer">-</div></div>
-        <div class="stat-card"><div class="label">Conversion Rate</div><div class="value" id="statConversion">-</div></div>
-        <div class="stat-card"><div class="label">เวลาคุยเฉลี่ย</div><div class="value" id="statAvgDuration">-</div></div>
-        <div class="stat-card"><div class="label">โทรวันนี้</div><div class="value" id="statToday">-</div></div>
+/* ==================== toast / confirm / modal ==================== */
+function toast(msg, type='success'){
+  const stack = document.getElementById('toastStack')
+  const el = document.createElement('div')
+  el.className = 'toast ' + type
+  el.innerHTML = icon(type==='danger'?'warn':'check') + `<span>${esc(msg)}</span>`
+  stack.appendChild(el)
+  setTimeout(() => { el.style.transition='opacity .2s'; el.style.opacity='0'; setTimeout(()=>el.remove(), 200) }, 2600)
+}
+function openConfirm({title, message, confirmLabel='ยืนยัน', danger=true, onConfirm}){
+  const ov = document.getElementById('confirmOverlay')
+  ov.innerHTML = `
+    <div class="confirm-box">
+      <div class="confirm-icon ${danger?'danger':'safe'}">${icon(danger?'warn':'check')}</div>
+      <h3>${esc(title)}</h3>
+      <p>${esc(message)}</p>
+      <div class="confirm-actions">
+        <button class="btn" onclick="document.getElementById('confirmOverlay').classList.remove('open')">ยกเลิก</button>
+        <button class="btn ${danger?'btn-danger':'btn-accent'}" id="confirmYes">${esc(confirmLabel)}</button>
       </div>
-      <div class="grid-2">
-        <div class="card">
-          <div class="card-header"><h2>สัดส่วนผลการโทร</h2><button class="btn btn-sm" onclick="loadStats()">รีเฟรช</button></div>
-          <div class="card-body" id="outcomeBars"><div class="empty">กำลังโหลด...</div></div>
-        </div>
-        <div class="card">
-          <div class="card-header"><h2><span class="live-dot"></span> Active Calls</h2><button class="btn btn-sm" onclick="refreshActiveGlobal()">รีเฟรช</button></div>
-          <div class="card-body">
-            <table>
-              <thead><tr><th>เบอร์</th><th>ชื่อ</th><th>เวลา</th><th></th></tr></thead>
-              <tbody id="activeTable"><tr><td colspan="4" class="empty">ไม่มีสายที่กำลังโทร</td></tr></tbody>
-            </table>
-          </div>
-        </div>
-      </div>`,
+    </div>`
+  ov.classList.add('open')
+  document.getElementById('confirmYes').onclick = async () => { ov.classList.remove('open'); await onConfirm() }
+}
+function closeModal(){ stopLivePolling(); document.getElementById('modalOverlay').classList.remove('open') }
+let liveModalTimer = null
+function stopLivePolling(){ if(liveModalTimer){ clearInterval(liveModalTimer); liveModalTimer = null } }
 
-    campaigns: () => `
-      <div class="card">
-        <div class="card-header"><h2>Campaigns</h2><button class="btn btn-sm" onclick="loadCampaigns()">รีเฟรช</button></div>
-        <div class="card-body">
-          <table>
-            <thead><tr><th>ID</th><th>ชื่อ</th><th>สถานะ</th><th>ประเภท</th><th>Voice</th><th>Actions</th></tr></thead>
-            <tbody id="campaignTable"><tr><td colspan="6" class="empty">กำลังโหลด...</td></tr></tbody>
-          </table>
-          <div id="campaignEditPanel" style="display:none; margin-top:20px; border-top:1px solid var(--border); padding-top:18px;">
-            <h3 style="font-size:14px; margin-bottom:12px;">แก้ไข Campaign: <span id="editCampaignId"></span></h3>
-            <div class="row" style="margin-bottom:10px;">
-              <input type="text" id="editName" placeholder="ชื่อ campaign" style="flex:1">
-              <input type="text" id="editVoiceId" placeholder="Voice ID">
-              <select id="editStatus"><option value="active">active</option><option value="paused">paused</option></select>
-            </div>
-            <label style="font-size:12px;color:var(--text-muted)">Prompt / Script</label>
-            <textarea id="editScript" placeholder="System prompt ที่ AI ใช้พูดกับลูกค้า"></textarea>
-            <label style="font-size:12px;color:var(--text-muted)">ส่ง SMS follow-up เมื่อผลเป็น:</label>
-            <div class="row" style="margin:10px 0 16px; font-size:13px;">
-              <label class="row" style="gap:4px"><input type="checkbox" id="smsInterested"> สนใจ</label>
-              <label class="row" style="gap:4px"><input type="checkbox" id="smsNotInterested"> ไม่สนใจ</label>
-              <label class="row" style="gap:4px"><input type="checkbox" id="smsCallback"> Callback</label>
-              <label class="row" style="gap:4px"><input type="checkbox" id="smsNoAnswer"> ไม่รับสาย</label>
-              <label class="row" style="gap:4px"><input type="checkbox" id="smsAngry"> โกรธ</label>
-            </div>
-            <div class="row">
-              <button class="btn-primary" onclick="saveCampaign()">บันทึก</button>
-              <button onclick="closeCampaignEdit()">ยกเลิก</button>
-              <span class="msg" id="campaignEditMsg"></span>
-            </div>
-          </div>
-        </div>
-      </div>`,
+function parseTranscript(str){
+  if (!str) return []
+  return str.split(' | ').map(turn => {
+    const idx = turn.indexOf(': ')
+    if (idx === -1) return { role: 'ai', text: turn }
+    const label = turn.slice(0, idx)
+    return { role: label === 'ลูกค้า' ? 'user' : 'ai', text: turn.slice(idx + 2) }
+  })
+}
+function renderBubbles(turns){
+  if (!turns.length) return `<div class="empty">ยังไม่มีบทสนทนา</div>`
+  return turns.map(t => `<div class="bubble ${t.role}"><div class="bubble-label">${t.role==='user'?'ลูกค้า':'AI'}</div><div>${esc(t.text)}</div></div>`).join('')
+}
+function openHistoryModal(i){
+  stopLivePolling()
+  const c = historyCache[i]
+  if (!c) return
+  document.getElementById('modalTitle').textContent = `${c.name || ''} — ${c.phone || ''}`
+  document.getElementById('modalSubtitle').textContent = fmtDate(c.timestamp)
+  document.getElementById('modalMeta').innerHTML = `
+    <div><div class="k">การเชื่อมต่อ</div><div class="v"><span class="pill ${esc(c.call_status)}">${esc(CALL_STATUS_LABELS[c.call_status] || c.call_status)}</span></div></div>
+    <div><div class="k">ผล</div><div class="v">${c.outcome && c.outcome!=='-' ? `<span class="pill ${esc(c.outcome)}">${esc(c.outcome)}</span>` : '—'}</div></div>
+    <div><div class="k">วางสายโดย</div><div class="v">${c.hangup_reason ? esc(HANGUP_LABELS[c.hangup_reason]||c.hangup_reason) : '—'}</div></div>
+    <div><div class="k">เวลาคุย</div><div class="v num">${fmtDur(c.duration)}</div></div>
+    <div><div class="k">สรุป</div><div class="v">${esc(c.summary) || '-'}</div></div>
+    <div><div class="k">สิ่งที่ควรทำต่อ</div><div class="v">${esc(c.next_action) || '-'}</div></div>`
+  document.getElementById('modalMessages').innerHTML = renderBubbles(parseTranscript(c.transcript))
+  document.getElementById('modalOverlay').classList.add('open')
+}
+async function loadLiveMessages(callSid){
+  try {
+    const res = await apiFetch(`/api/calls/active/${encodeURIComponent(callSid)}`)
+    if (!res.ok) { stopLivePolling(); return }
+    const data = await res.json()
+    document.getElementById('modalSubtitle').textContent = 'กำลังคุยอยู่ · ' + fmtDur(data.duration)
+    const turns = (data.messages || []).map(m => ({ role: m.role === 'user' ? 'user' : 'ai', text: m.content }))
+    document.getElementById('modalMessages').innerHTML = renderBubbles(turns)
+  } catch (e) {}
+}
+function openLiveModal(callSid, phone, name){
+  stopLivePolling()
+  document.getElementById('modalTitle').textContent = `${name || ''} — ${phone || ''}`
+  document.getElementById('modalMeta').innerHTML = `<div><div class="k">สถานะ</div><div class="v" style="color:var(--success)">● กำลังคุยอยู่สด</div></div>`
+  document.getElementById('modalMessages').innerHTML = '<div class="empty">กำลังโหลด...</div>'
+  document.getElementById('modalOverlay').classList.add('open')
+  loadLiveMessages(callSid)
+  liveModalTimer = setInterval(() => loadLiveMessages(callSid), 3000)
+}
 
-    contacts: () => `
+/* ==================== router ==================== */
+const PAGES = ['dashboard','campaigns','contacts','test','history']
+const TITLES = { dashboard:'Dashboard', campaigns:'Campaigns', contacts:'เบอร์ติดต่อ', test:'ทดสอบโทร', history:'ประวัติการโทร' }
+const NAV_ICON = { dashboard:'dashboard', campaigns:'campaigns', contacts:'contacts', test:'test', history:'history' }
+
+function buildNav(){
+  document.getElementById('nav').innerHTML = PAGES.map(p =>
+    `<button data-p="${p}" onclick="go('${p}')">${icon(NAV_ICON[p])}<span class="label">${TITLES[p]}</span></button>`
+  ).join('')
+}
+function go(page){ location.hash = '#/' + page }
+window.addEventListener('hashchange', render)
+function currentPage(){ const h = location.hash.replace(/^#\/?/,'') || 'dashboard'; return PAGES.includes(h) ? h : 'dashboard' }
+
+function render(){
+  const p = currentPage()
+  document.querySelectorAll('#nav button').forEach(b => b.classList.toggle('active', b.dataset.p === p))
+  document.getElementById('pageTitle').textContent = TITLES[p]
+  document.getElementById('pageContent').innerHTML = TEMPLATES[p]()
+  INIT[p] && INIT[p]()
+}
+
+/* ==================== caches ==================== */
+let campaignsCache = []
+let contactsCache = []
+let historyCache = []
+let statsCache = null
+let historyDays = 7
+
+/* ==================== templates ==================== */
+const TEMPLATES = {
+  dashboard: () => `
+    <div class="row" style="justify-content:space-between; margin-bottom:16px">
+      <div class="segmented" id="rangeSeg">
+        <button class="active" data-r="7">7 วัน</button>
+        <button data-r="30">30 วัน</button>
+        <button data-r="90">ไตรมาส</button>
+      </div>
+      <div class="row" style="gap:14px">
+        <span style="font-size:11.5px; color:var(--text-3)">${icon('history')} อัปเดตล่าสุด <span class="num" id="lastUpdated">-</span></span>
+        <button class="btn btn-sm" onclick="loadStats()">รีเฟรช</button>
+      </div>
+    </div>
+    <div id="heroSlot"></div>
+    <div class="stats-grid" id="statsGrid"><div class="empty">กำลังโหลด...</div></div>
+    <div class="campaign-strip" id="campaignStrip"></div>
+    <div class="grid-2">
       <div class="card">
-        <div class="card-header"><h2>ลงชื่อเบอร์ใหม่</h2></div>
-        <div class="card-body">
-          <div class="row">
-            <input type="tel" id="contactPhone" placeholder="เบอร์โทร">
-            <input type="text" id="contactName" placeholder="ชื่อ">
-            <select id="contactCampaign" class="campaign-select"><option value="">-- เลือก Campaign --</option></select>
-            <button class="btn-primary" onclick="addContact()">+ เพิ่มเบอร์</button>
-          </div>
-          <div class="msg" id="addContactMsg"></div>
-        </div>
+        <div class="card-head"><h2>แนวโน้มการโทร</h2></div>
+        <div class="card-body chart-wrap" id="chartWrap"><div class="empty">กำลังโหลด...</div></div>
       </div>
       <div class="card">
-        <div class="card-header">
-          <h2>รายชื่อเบอร์</h2>
-          <div class="row">
-            <select id="contactsFilterCampaign" class="campaign-select" onchange="loadContacts()"><option value="">ทุก Campaign</option></select>
-            <select id="contactsFilterStatus" onchange="loadContacts()">
-              <option value="">ทุกสถานะ</option><option value="pending">pending</option><option value="called">called</option><option value="deleted">deleted</option>
-            </select>
-            <button class="btn btn-sm" onclick="loadContacts()">รีเฟรช</button>
-          </div>
-        </div>
-        <div class="card-body">
-          <table>
-            <thead><tr><th>เบอร์</th><th>ชื่อ</th><th>Campaign</th><th>สถานะ</th><th>Actions</th></tr></thead>
-            <tbody id="contactsTable"><tr><td colspan="5" class="empty">ยังไม่มีข้อมูล</td></tr></tbody>
-          </table>
-        </div>
-      </div>`,
-
-    test: () => `
+        <div class="card-head"><h2>สัดส่วนผลการโทร</h2></div>
+        <div class="card-body" id="outcomeBars"><div class="empty">กำลังโหลด...</div></div>
+      </div>
+    </div>
+    <div class="grid-2">
       <div class="card">
-        <div class="card-header"><h2>📞 ยิงโทรทดสอบ</h2></div>
-        <div class="card-body">
-          <p style="font-size:13px; color:var(--text-muted); margin-bottom:16px;">ใช้ pipeline เดียวกับแคมเปญจริง — เสียค่าโทร/AI จริง ไม่บันทึกลง Contacts sheet</p>
-          <div class="row">
-            <input type="tel" id="testPhone" placeholder="เบอร์โทร เช่น +66812345678">
-            <input type="text" id="testName" placeholder="ชื่อ (ไม่บังคับ)">
-            <select id="testCampaign" class="campaign-select"><option value="">-- เลือก Campaign --</option></select>
-            <button class="btn-primary" onclick="testCall()">📞 โทรทดสอบ</button>
-          </div>
-          <div class="msg" id="testCallMsg"></div>
-        </div>
-      </div>`,
-
-    history: () => `
+        <div class="card-head"><h2>สายล่าสุด</h2><button class="btn btn-ghost btn-sm" onclick="go('history')">ดูทั้งหมด ${icon('chevron')}</button></div>
+        <div class="card-body" id="recentCalls"><div class="empty">กำลังโหลด...</div></div>
+      </div>
       <div class="card">
-        <div class="card-header">
-          <h2>ประวัติการโทร</h2>
+        <div class="card-head"><h2>ทางลัด</h2></div>
+        <div class="card-body">
+          <div class="qa-row" onclick="go('test')"><div class="badge" style="background:var(--danger-soft); color:var(--danger)">${icon('test')}</div><div class="label">ยิงโทรทดสอบ</div>${icon('chevron','chev')}</div>
+          <div class="qa-row" onclick="go('contacts')"><div class="badge" style="background:var(--surface-2)">${icon('contacts')}</div><div class="label">จัดการเบอร์ติดต่อ</div>${icon('chevron','chev')}</div>
+          <div class="qa-row" onclick="go('campaigns')"><div class="badge" style="background:var(--success-soft); color:var(--success)">${icon('campaigns')}</div><div class="label">แก้ไข Prompt แคมเปญ</div>${icon('chevron','chev')}</div>
+        </div>
+      </div>
+    </div>`,
+
+  campaigns: () => `
+    <div class="card">
+      <div class="card-head">
+        <h2>Campaigns</h2>
+        <button class="btn btn-accent btn-sm" onclick="openCampaignCreate()">${icon('plus')} Campaign ใหม่</button>
+      </div>
+      <div class="card-body table-scroll">
+        <table>
+          <thead><tr><th>ชื่อ</th><th>สถานะ</th><th>ประเภท</th><th>Voice</th><th></th></tr></thead>
+          <tbody id="campaignTable"><tr><td colspan="5" class="empty">กำลังโหลด...</td></tr></tbody>
+        </table>
+        <div id="campaignPanel"></div>
+      </div>
+    </div>`,
+
+  contacts: () => `
+    <div class="card">
+      <div class="card-head"><h2>ลงชื่อเบอร์</h2></div>
+      <div class="card-body">
+        <div class="tab-toggle" id="addTabs">
+          <button data-t="single" class="active">เพิ่มทีละคน</button>
+          <button data-t="bulk">${icon('sheet')} นำเข้าจาก Excel / Sheets</button>
+        </div>
+
+        <div class="tab-panel active" id="tab-single">
           <div class="row">
-            <select id="logCampaignFilter" class="campaign-select" onchange="loadLogs()"><option value="">ทุก Campaign</option></select>
-            <button class="btn btn-sm" onclick="loadLogs()">รีเฟรช</button>
+            <div class="field" style="flex:1; min-width:160px"><input type="tel" id="contactPhone" placeholder="เบอร์โทร"></div>
+            <div class="field" style="flex:1; min-width:160px"><input type="text" id="contactName" placeholder="ชื่อ"></div>
+            <div class="field" style="min-width:180px"><select id="contactCampaign" class="campaign-select"><option value="">-- เลือก Campaign --</option></select></div>
+            <button class="btn btn-accent" onclick="addContact()">${icon('plus')} เพิ่มเบอร์</button>
+          </div>
+          <div class="msg" id="addContactMsg" style="font-size:13px; color:var(--text-2); min-height:18px; margin-top:6px"></div>
+        </div>
+
+        <div class="tab-panel" id="tab-bulk">
+          <p style="font-size:12.5px; color:var(--text-2); margin-bottom:10px">
+            เปิดไฟล์ใน Google Sheets หรือ Excel ให้มี 2 คอลัมน์ (<b>เบอร์โทร</b>, <b>ชื่อ</b>) แล้วเลือกช่วงที่ต้องการ กด Ctrl/⌘+C แล้วมาวาง (Ctrl/⌘+V) ในช่องด้านล่างนี้ได้เลย
+          </p>
+          <textarea class="import-zone" id="bulkPaste" placeholder="วางข้อมูลจาก Excel / Google Sheets ตรงนี้&#10;เช่น:&#10;0812345678&#9;สมชาย ใจดี&#10;0898765432&#9;วิภา สุขเจริญ" oninput="handleBulkPaste(this.value)"></textarea>
+          <div class="import-summary" id="importSummary" style="display:none"></div>
+          <div class="import-preview" id="importPreview" style="display:none"></div>
+          <div class="row" style="margin-top:14px">
+            <div class="field" style="min-width:220px"><select id="bulkCampaign"><option value="">-- เลือก Campaign ให้ทั้งชุด --</option></select></div>
+            <button class="btn btn-accent" id="bulkImportBtn" disabled onclick="runBulkImport()">${icon('plus')} นำเข้า <span id="bulkImportCount">0</span> เบอร์</button>
           </div>
         </div>
-        <div class="card-body">
-          <table>
-            <thead><tr><th>เบอร์</th><th>ชื่อ</th><th>ผล</th><th>สรุป</th><th>เวลาคุย</th><th>วันที่</th></tr></thead>
-            <tbody id="logTable"><tr><td colspan="6" class="empty">ยังไม่มีข้อมูล</td></tr></tbody>
-          </table>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-head">
+        <h2>รายชื่อเบอร์</h2>
+        <div class="search-wrap">${icon('search')}<input type="search" placeholder="ค้นหาเบอร์หรือชื่อ..." oninput="filterContacts(this.value)"></div>
+      </div>
+      <div class="card-body table-scroll">
+        <table>
+          <thead><tr><th>เบอร์</th><th>ชื่อ</th><th>Campaign</th><th>สถานะ</th><th></th></tr></thead>
+          <tbody id="contactsTable"><tr><td colspan="5" class="empty">กำลังโหลด...</td></tr></tbody>
+        </table>
+      </div>
+    </div>`,
+
+  test: () => `
+    <div class="card">
+      <div class="card-head"><h2>${icon('test')} ยิงโทรทดสอบ</h2></div>
+      <div class="card-body pad-top">
+        <p style="font-size:13px; color:var(--text-2); margin-bottom:18px">ใช้ pipeline เดียวกับแคมเปญจริง เสียค่าโทร/AI จริง ไม่บันทึกลง Contacts</p>
+        <div class="row">
+          <div class="field" style="flex:1; min-width:180px"><input type="tel" id="testPhone" placeholder="+66812345678"></div>
+          <div class="field" style="flex:1; min-width:160px"><input type="text" id="testName" placeholder="ชื่อ (ไม่บังคับ)"></div>
+          <div class="field" style="min-width:200px"><select id="testCampaign" class="campaign-select"><option value="">-- เลือก Campaign --</option></select></div>
+          <button class="btn btn-accent" onclick="testCall()">${icon('test')} โทรทดสอบ</button>
         </div>
-      </div>`,
-  }
+        <div class="msg" id="testCallMsg" style="font-size:13px; color:var(--text-2); min-height:18px; margin-top:6px"></div>
+      </div>
+    </div>`,
 
-  const INIT = {
-    dashboard: () => { loadStats(); refreshActiveGlobal() },
-    campaigns: () => loadCampaigns(),
-    contacts: () => { loadCampaigns(); loadContacts() },
-    test: () => loadCampaigns(),
-    history: () => { loadCampaigns(); loadLogs() },
-  }
+  history: () => `
+    <div class="card">
+      <div class="card-head">
+        <h2>ประวัติการโทร</h2>
+        <div class="row">
+          <select id="logCampaignFilter" class="campaign-select" onchange="loadLogs()"><option value="">ทุก Campaign</option></select>
+          <div class="search-wrap" style="max-width:220px">${icon('search')}<input type="search" placeholder="ค้นหาเบอร์หรือชื่อ..." oninput="filterHistoryLocal(this.value)"></div>
+          <button class="btn btn-sm" onclick="loadLogs()">รีเฟรช</button>
+          <button class="btn btn-sm" onclick="exportHistoryCsv()">${icon('download')} ออกรายงาน CSV</button>
+        </div>
+      </div>
+      <div class="card-body table-scroll">
+        <table>
+          <thead><tr><th>เบอร์</th><th>ชื่อ</th><th>การเชื่อมต่อ</th><th>ผล</th><th>สรุป</th><th>เวลาคุย</th><th>วันที่</th></tr></thead>
+          <tbody id="historyBody"><tr><td colspan="7" class="empty">กำลังโหลด...</td></tr></tbody>
+        </table>
+        <div style="text-align:center; margin-top:14px" id="historyLoadMoreWrap"></div>
+      </div>
+    </div>`,
+}
 
-  // ==================== CAMPAIGNS (shared dropdown data) ====================
-  function populateCampaignSelects() {
-    document.querySelectorAll('.campaign-select').forEach(sel => {
-      const current = sel.value
-      const keepFirst = sel.options[0]
-      sel.innerHTML = ''
-      sel.appendChild(keepFirst)
-      campaignsCache.forEach(c => {
-        const opt = document.createElement('option')
-        opt.value = c.id
-        opt.text = c.name || c.id
-        sel.appendChild(opt)
-      })
-      sel.value = current
+const INIT = {
+  dashboard: async () => {
+    document.getElementById('rangeSeg').addEventListener('click', e => {
+      const btn = e.target.closest('button'); if (!btn) return
+      document.querySelectorAll('#rangeSeg button').forEach(b=>b.classList.remove('active'))
+      btn.classList.add('active')
+      historyDays = Number(btn.dataset.r)
+      loadStats()
     })
-  }
+    await loadCampaigns()
+    await Promise.all([loadStats(), refreshActiveGlobal(true)])
+  },
+  campaigns: async () => { await loadCampaigns() },
+  contacts: async () => {
+    document.getElementById('addTabs').addEventListener('click', e => {
+      const btn = e.target.closest('button'); if (!btn) return
+      document.querySelectorAll('#addTabs button').forEach(b => b.classList.remove('active'))
+      btn.classList.add('active')
+      document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'))
+      document.getElementById('tab-' + btn.dataset.t).classList.add('active')
+    })
+    await loadCampaigns()
+    await loadContacts()
+  },
+  test: async () => { await loadCampaigns() },
+  history: async () => {
+    await loadCampaigns()
+    await loadLogs()
+  },
+}
 
-  async function loadCampaigns() {
-    const res = await apiFetch('/api/campaigns')
-    campaignsCache = await res.json()
-    populateCampaignSelects()
-    const tbody = document.getElementById('campaignTable')
-    if (!tbody) return
-    if (!campaignsCache.length) { tbody.innerHTML = '<tr><td colspan="6" class="empty">ยังไม่มี campaign</td></tr>'; return }
-    tbody.innerHTML = campaignsCache.map(c => `
-      <tr>
-        <td>${esc(c.id)}</td>
-        <td>${esc(c.name)}</td>
-        <td><span class="pill ${esc(c.status)}">${esc(c.status)}</span></td>
-        <td>${esc(c.type)}</td>
-        <td>${esc(c.voice_id)}</td>
-        <td>
-          <button class="btn-ghost" onclick="openCampaignEdit('${esc(c.id)}')">แก้ไข</button>
-          <button class="btn-ghost" onclick="startCampaign('${esc(c.id)}')">▶ เริ่ม</button>
-          <button class="btn-ghost danger" onclick="stopCampaign('${esc(c.id)}')">■ หยุด</button>
-        </td>
-      </tr>`).join('')
-  }
+/* ==================== campaigns ==================== */
+function populateCampaignSelects(){
+  document.querySelectorAll('.campaign-select').forEach(sel => {
+    const current = sel.value
+    const keepFirst = sel.options[0]
+    sel.innerHTML = ''
+    sel.appendChild(keepFirst)
+    campaignsCache.forEach(c => {
+      const opt = document.createElement('option')
+      opt.value = c.id
+      opt.text = c.name || c.id
+      sel.appendChild(opt)
+    })
+    sel.value = current
+  })
+}
+async function loadCampaigns(){
+  const res = await apiFetch('/api/campaigns')
+  campaignsCache = await res.json()
+  populateCampaignSelects()
+  renderCampaignTable()
+}
+function renderCampaignTable(){
+  const tbody = document.getElementById('campaignTable')
+  if (!tbody) return
+  if (!campaignsCache.length) { tbody.innerHTML = '<tr><td colspan="5" class="empty">ยังไม่มี campaign</td></tr>'; return }
+  tbody.innerHTML = campaignsCache.map(c => `
+    <tr>
+      <td><div style="font-weight:600">${esc(c.name)}</div><div class="num" style="font-size:11.5px;color:var(--text-3)">${esc(c.id)}</div></td>
+      <td><span class="pill ${esc(c.status)}">${esc(c.status)}</span></td>
+      <td style="color:var(--text-2)">${esc(c.type)}</td>
+      <td class="num" style="color:var(--text-2); font-size:12px">${esc(c.voice_id)}</td>
+      <td>
+        <div class="row" style="gap:2px; flex-wrap:nowrap">
+          <button class="btn btn-ghost btn-sm" onclick="openCampaignEdit('${esc(c.id)}')">${icon('edit')} แก้ไข</button>
+          <button class="btn btn-icon btn-sm" title="${c.status==='active'?'หยุด':'เริ่ม'}" onclick="${c.status==='active' ? `confirmStop('${esc(c.id)}')` : `confirmStart('${esc(c.id)}')`}">${icon(c.status==='active'?'pause':'play')}</button>
+        </div>
+      </td>
+    </tr>`).join('')
+}
 
-  function openCampaignEdit(id) {
-    const c = campaignsCache.find(x => x.id === id)
-    if (!c) return
-    document.getElementById('editCampaignId').textContent = id
-    document.getElementById('editName').value = c.name || ''
-    document.getElementById('editVoiceId').value = c.voice_id || ''
-    document.getElementById('editStatus').value = c.status === 'paused' ? 'paused' : 'active'
-    document.getElementById('editScript').value = c.script || c.system_prompt || ''
-    document.getElementById('smsInterested').checked = c.sms_interested === 'TRUE' || c.sms_interested === true
-    document.getElementById('smsNotInterested').checked = c.sms_not_interested === 'TRUE' || c.sms_not_interested === true
-    document.getElementById('smsCallback').checked = c.sms_callback === 'TRUE' || c.sms_callback === true
-    document.getElementById('smsNoAnswer').checked = c.sms_no_answer === 'TRUE' || c.sms_no_answer === true
-    document.getElementById('smsAngry').checked = c.sms_angry === 'TRUE' || c.sms_angry === true
-    document.getElementById('campaignEditMsg').textContent = ''
-    document.getElementById('campaignEditPanel').style.display = 'block'
+function campaignEditPanelHtml(c, isNew){
+  return `
+    <div style="margin-top:20px; border-top:1px solid var(--glass-border); padding-top:20px">
+      <h3 style="font-size:14.5px; margin-bottom:16px">${isNew ? 'สร้าง Campaign ใหม่' : 'แก้ไข: ' + esc(c.name)}</h3>
+      <div class="grid-2" style="margin-bottom:16px">
+        ${isNew ? `<div class="field"><label>Campaign ID (ตัวเล็ก ไม่มีเว้นวรรค)</label><input type="text" id="cf_id" placeholder="เช่น camp03"></div>` : `<input type="hidden" id="cf_id" value="${esc(c.id)}">`}
+        <div class="field"><label>ชื่อ Campaign</label><input type="text" id="cf_name" value="${esc(c.name||'')}"></div>
+        <div class="field"><label>Voice ID</label><input type="text" id="cf_voice" value="${esc(c.voice_id||'')}"></div>
+        <div class="field"><label>ประเภท</label><select id="cf_type"><option value="outbound" ${c.type==='inbound'?'':'selected'}>outbound</option><option value="inbound" ${c.type==='inbound'?'selected':''}>inbound</option></select></div>
+      </div>
+      <div class="field" style="margin-bottom:16px"><label>Prompt / Script</label><textarea id="cf_script" placeholder="System prompt ที่ AI ใช้พูดกับลูกค้า">${esc(c.script || c.system_prompt || '')}</textarea></div>
+      <label style="font-size:12px; color:var(--text-2); font-weight:600">ส่ง SMS follow-up เมื่อผลเป็น</label>
+      <div style="margin:6px 0 18px">
+        ${['interested','callback','not_interested','no_answer','angry'].map(k => `
+          <div class="switch-row">
+            <span>${k}</span>
+            <label class="switch"><input type="checkbox" id="cf_sms_${k}" ${(c['sms_'+k]==='TRUE'||c['sms_'+k]===true) ? 'checked':''}><span class="track"></span></label>
+          </div>`).join('')}
+      </div>
+      <div class="row">
+        <button class="btn btn-accent" onclick="${isNew ? 'createCampaign()' : 'saveCampaign()'}">${isNew?'สร้าง Campaign':'บันทึก'}</button>
+        <button class="btn" onclick="document.getElementById('campaignPanel').innerHTML=''">ยกเลิก</button>
+        <span class="msg" id="campaignEditMsg" style="font-size:13px; color:var(--text-2)"></span>
+      </div>
+    </div>`
+}
+function openCampaignEdit(id){
+  const c = campaignsCache.find(x => x.id === id)
+  if (!c) return
+  document.getElementById('campaignPanel').innerHTML = campaignEditPanelHtml(c, false)
+}
+function openCampaignCreate(){
+  document.getElementById('campaignPanel').innerHTML = campaignEditPanelHtml({ type: 'outbound' }, true)
+}
+function collectCampaignForm(){
+  const scriptKey = 'script'
+  return {
+    name: document.getElementById('cf_name').value,
+    voice_id: document.getElementById('cf_voice').value,
+    type: document.getElementById('cf_type').value,
+    [scriptKey]: document.getElementById('cf_script').value,
+    sms_interested: document.getElementById('cf_sms_interested').checked ? 'TRUE' : 'FALSE',
+    sms_callback: document.getElementById('cf_sms_callback').checked ? 'TRUE' : 'FALSE',
+    sms_not_interested: document.getElementById('cf_sms_not_interested').checked ? 'TRUE' : 'FALSE',
+    sms_no_answer: document.getElementById('cf_sms_no_answer').checked ? 'TRUE' : 'FALSE',
+    sms_angry: document.getElementById('cf_sms_angry').checked ? 'TRUE' : 'FALSE',
   }
-
-  function closeCampaignEdit() {
-    document.getElementById('campaignEditPanel').style.display = 'none'
-  }
-
-  async function saveCampaign() {
-    const id = document.getElementById('editCampaignId').textContent
-    const msgEl = document.getElementById('campaignEditMsg')
-    const existing = campaignsCache.find(c => c.id === id)
-    const scriptKey = (existing?.system_prompt !== undefined && existing?.script === undefined) ? 'system_prompt' : 'script'
-    const updates = {
-      name: document.getElementById('editName').value,
-      voice_id: document.getElementById('editVoiceId').value,
-      status: document.getElementById('editStatus').value,
-      [scriptKey]: document.getElementById('editScript').value,
-      sms_interested: document.getElementById('smsInterested').checked ? 'TRUE' : 'FALSE',
-      sms_not_interested: document.getElementById('smsNotInterested').checked ? 'TRUE' : 'FALSE',
-      sms_callback: document.getElementById('smsCallback').checked ? 'TRUE' : 'FALSE',
-      sms_no_answer: document.getElementById('smsNoAnswer').checked ? 'TRUE' : 'FALSE',
-      sms_angry: document.getElementById('smsAngry').checked ? 'TRUE' : 'FALSE',
-    }
-    try {
-      const res = await apiFetch(`/api/campaigns/${encodeURIComponent(id)}`, { method: 'PATCH', body: updates })
-      const data = await res.json()
-      if (!res.ok) { msgEl.className = 'msg error'; msgEl.textContent = data.error || 'บันทึกไม่สำเร็จ'; return }
-      msgEl.className = 'msg ok'; msgEl.textContent = '✓ บันทึกแล้ว'
+}
+async function saveCampaign(){
+  const id = document.getElementById('cf_id').value
+  const msgEl = document.getElementById('campaignEditMsg')
+  try {
+    const res = await apiFetch(`/api/campaigns/${encodeURIComponent(id)}`, { method: 'PATCH', body: collectCampaignForm() })
+    const data = await res.json()
+    if (!res.ok) { msgEl.textContent = data.error || 'บันทึกไม่สำเร็จ'; return }
+    toast('บันทึกแล้ว')
+    document.getElementById('campaignPanel').innerHTML = ''
+    loadCampaigns()
+  } catch (e) {}
+}
+async function createCampaign(){
+  const id = document.getElementById('cf_id').value.trim()
+  const msgEl = document.getElementById('campaignEditMsg')
+  if (!id) { msgEl.textContent = 'กรอก Campaign ID ก่อน'; return }
+  try {
+    const res = await apiFetch('/api/campaigns', { method: 'POST', body: { id, status: 'active', ...collectCampaignForm() } })
+    const data = await res.json()
+    if (!res.ok) { msgEl.textContent = data.error || 'สร้างไม่สำเร็จ'; return }
+    toast('สร้าง campaign แล้ว')
+    document.getElementById('campaignPanel').innerHTML = ''
+    loadCampaigns()
+  } catch (e) {}
+}
+function confirmStart(id){
+  const c = campaignsCache.find(x => x.id === id)
+  const pendingCount = contactsCache.filter(x => x.campaign === id && x.status === 'pending').length
+  openConfirm({
+    title: 'เริ่ม Campaign นี้?',
+    message: `"${c.name}" จะเริ่มโทรออกไปยังเบอร์ที่ค้างอยู่ทันที มีค่าใช้จ่ายจริงต่อสาย`,
+    confirmLabel: 'เริ่มโทร', danger: false,
+    onConfirm: async () => {
+      await apiFetch('/api/campaign/start', { method: 'POST', body: { campaignId: id } })
+      toast('เริ่ม campaign แล้ว')
       loadCampaigns()
-    } catch (e) {}
-  }
-
-  async function startCampaign(id) {
-    await apiFetch('/api/campaign/start', { method: 'POST', body: { campaignId: id } })
-    setTimeout(() => { if (currentPage() === 'dashboard') loadStats() }, 2000)
-  }
-
-  async function stopCampaign(id) {
-    await apiFetch('/api/campaign/stop', { method: 'POST', body: { campaignId: id } })
-  }
-
-  // ==================== DASHBOARD ====================
-  async function loadStats() {
-    const res = await apiFetch('/api/stats')
-    const stats = await res.json()
-    const setText = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v }
-    setText('statTotal', stats.total || 0)
-    setText('statInterested', (stats.outcomes && stats.outcomes.interested) || 0)
-    setText('statCallback', (stats.outcomes && stats.outcomes.callback) || 0)
-    setText('statNoAnswer', (stats.outcomes && stats.outcomes.no_answer) || 0)
-    setText('statConversion', (stats.conversionRate || 0) + '%')
-    setText('statAvgDuration', formatDuration(stats.avgDuration))
-    setText('statToday', stats.callsToday || 0)
-
-    const barsEl = document.getElementById('outcomeBars')
-    if (barsEl) {
-      const entries = Object.entries(stats.outcomes || {}).sort((a, b) => b[1] - a[1])
-      if (!entries.length) {
-        barsEl.innerHTML = '<div class="empty">ยังไม่มีข้อมูล</div>'
-      } else {
-        const total = stats.total || 1
-        barsEl.innerHTML = entries.map(([outcome, count]) => `
-          <div class="bar-row">
-            <div class="bar-label">${esc(outcome)}</div>
-            <div class="bar-track"><div class="bar-fill" style="width:${Math.round(count / total * 100)}%"></div></div>
-            <div class="bar-value">${count}</div>
-          </div>`).join('')
-      }
     }
+  })
+}
+function confirmStop(id){
+  const c = campaignsCache.find(x => x.id === id)
+  openConfirm({
+    title: 'หยุด Campaign นี้?',
+    message: `"${c.name}" จะหยุดโทรออกทันที สายที่คิวไว้จะไม่ถูกโทรต่อ`,
+    confirmLabel: 'หยุด Campaign',
+    onConfirm: async () => {
+      await apiFetch('/api/campaign/stop', { method: 'POST', body: { campaignId: id } })
+      toast('หยุด campaign แล้ว', 'danger')
+      loadCampaigns()
+    }
+  })
+}
+
+/* ==================== dashboard ==================== */
+async function loadStats(){
+  const res = await apiFetch('/api/stats?days=' + historyDays)
+  statsCache = await res.json()
+  const setText = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v }
+
+  const grid = document.getElementById('statsGrid')
+  if (grid) {
+    grid.innerHTML = `
+      <div class="stat-tile"><div class="label">โทรทั้งหมด</div><div class="value num">${statsCache.total||0}</div></div>
+      <div class="stat-tile"><div class="label">สนใจ</div><div class="value num success">${(statsCache.outcomes&&statsCache.outcomes.interested)||0}</div></div>
+      <div class="stat-tile"><div class="label">นัด Callback</div><div class="value num warning">${(statsCache.outcomes&&statsCache.outcomes.callback)||0}</div></div>
+      <div class="stat-tile"><div class="label">Conversion</div><div class="value num accent">${statsCache.conversionRate||0}%</div></div>
+      <div class="stat-tile"><div class="label">เวลาคุยเฉลี่ย</div><div class="value num">${fmtDur(statsCache.avgDuration)}</div></div>
+      <div class="stat-tile"><div class="label">โทรวันนี้</div><div class="value num">${statsCache.callsToday||0}</div></div>`
   }
 
-  async function refreshActiveGlobal() {
-    const res = await apiFetch('/api/calls/active')
-    const calls = await res.json()
-    document.getElementById('activeBadge').textContent = `${calls.length} Active`
-    const tbody = document.getElementById('activeTable')
-    if (!tbody) return
-    if (!calls.length) { tbody.innerHTML = '<tr><td colspan="4" class="empty">ไม่มีสายที่กำลังโทร</td></tr>'; return }
-    tbody.innerHTML = calls.map(c => `
-      <tr>
-        <td>${esc(c.phone)}</td>
-        <td>${esc(c.name)}</td>
-        <td>${formatDuration(c.duration)}</td>
-        <td><button class="btn-ghost" onclick="openLiveModal('${esc(c.callSid)}','${esc(c.phone)}','${esc(c.name)}')">ดูบทสนทนา</button></td>
-      </tr>`).join('')
+  const barsEl = document.getElementById('outcomeBars')
+  if (barsEl) {
+    const entries = Object.entries(statsCache.outcomes || {}).sort((a,b)=>b[1]-a[1])
+    barsEl.innerHTML = entries.length ? entries.map(([k,v]) => `
+      <div class="bar-row">
+        <div class="bar-label">${esc(k)}</div>
+        <div class="bar-track"><div class="bar-fill" style="width:${Math.round(v/(statsCache.total||1)*100)}%"></div></div>
+        <div class="bar-value num">${v}</div>
+      </div>`).join('') : '<div class="empty">ยังไม่มีข้อมูล</div>'
   }
 
-  setInterval(() => { if (token) refreshActiveGlobal() }, 10000)
-
-  // ==================== CONTACTS ====================
-  async function loadContacts() {
-    const campaignId = document.getElementById('contactsFilterCampaign').value
-    const status = document.getElementById('contactsFilterStatus').value
-    const params = new URLSearchParams()
-    if (campaignId) params.set('campaignId', campaignId)
-    if (status) params.set('status', status)
-    const res = await apiFetch('/api/contacts?' + params.toString())
-    const contacts = await res.json()
-    const tbody = document.getElementById('contactsTable')
-    if (!contacts.length) { tbody.innerHTML = '<tr><td colspan="5" class="empty">ยังไม่มีข้อมูล</td></tr>'; return }
-    tbody.innerHTML = contacts.map(c => `
-      <tr>
-        <td>${esc(c.phone)}</td>
-        <td>${esc(c.name)}</td>
-        <td>${esc(c.campaign)}</td>
-        <td><span class="pill ${esc(c.status)}">${esc(c.status)}</span></td>
-        <td><button class="btn-ghost danger" onclick="deleteContact('${esc(c.phone)}')">ลบ</button></td>
-      </tr>`).join('')
+  const chartWrap = document.getElementById('chartWrap')
+  if (chartWrap && statsCache.dailyTrend) {
+    chartWrap.innerHTML = buildComboChart(statsCache.dailyTrend.labels, statsCache.dailyTrend.calls, statsCache.dailyTrend.interested)
   }
 
-  async function addContact() {
-    const phone = document.getElementById('contactPhone').value.trim()
-    const name = document.getElementById('contactName').value.trim()
-    const campaign = document.getElementById('contactCampaign').value
-    const msgEl = document.getElementById('addContactMsg')
-    if (!phone || !campaign) { msgEl.className = 'msg error'; msgEl.textContent = 'กรอกเบอร์และเลือก campaign ก่อน'; return }
-    try {
-      const res = await apiFetch('/api/contacts', { method: 'POST', body: { phone, name, campaign } })
-      const data = await res.json()
-      if (!res.ok) { msgEl.className = 'msg error'; msgEl.textContent = data.error || 'เพิ่มไม่สำเร็จ'; return }
-      msgEl.className = 'msg ok'; msgEl.textContent = '✓ เพิ่มแล้ว'
-      document.getElementById('contactPhone').value = ''
-      document.getElementById('contactName').value = ''
-      loadContacts()
-    } catch (e) {}
+  renderCampaignStrip()
+
+  setText('lastUpdated', new Intl.DateTimeFormat('th-TH', { timeZone:'Asia/Bangkok', hour:'2-digit', minute:'2-digit', second:'2-digit' }).format(new Date()))
+}
+
+function renderCampaignStrip(){
+  const el = document.getElementById('campaignStrip')
+  if (!el) return
+  const grads = ['g0','g1','g2','g3']
+  el.innerHTML = campaignsCache.map((c,i) => {
+    const totalContacts = contactsCache.filter(x => x.campaign === c.id && x.status !== 'deleted').length
+    const called = (statsCache && statsCache.byCampaign && statsCache.byCampaign[c.id]) || 0
+    const pct = totalContacts ? Math.min(100, Math.round(called / totalContacts * 100)) : 0
+    return `
+    <div class="gcard ${grads[i % grads.length]} ${c.status==='paused'?'dim':''}" onclick="go('campaigns')">
+      <div class="top-row">
+        <div class="chip">${icon('waveform')}</div>
+        <span class="pill">${esc(c.status)}</span>
+      </div>
+      <div>
+        <div class="name">${esc(c.name)}</div>
+        <div class="stats">
+          <div><div class="n num">${totalContacts}</div><div class="l">เบอร์ทั้งหมด</div></div>
+          <div><div class="n num">${called}</div><div class="l">โทรแล้ว</div></div>
+        </div>
+        <div class="progress"><div class="progress-fill" style="width:${pct}%"></div></div>
+      </div>
+    </div>`
+  }).join('')
+}
+
+function buildComboChart(labels, bars, line){
+  const w = 640, h = 220, padL = 30, padR = 10, padT = 16, padB = 26
+  const innerW = w - padL - padR, innerH = h - padT - padB
+  const maxV = Math.max(1, ...bars) * 1.2
+  const bw = innerW / Math.max(1, bars.length)
+  const barsSvg = bars.map((v,i) => {
+    const bh = (v/maxV) * innerH
+    const x = padL + i*bw + bw*0.22
+    const y = padT + innerH - bh
+    return `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${(bw*0.56).toFixed(1)}" height="${bh.toFixed(1)}" rx="5" fill="var(--accent)" opacity="0.16"/>`
+  }).join('')
+  const pts = line.map((v,i) => {
+    const x = padL + i*bw + bw/2
+    const y = padT + innerH - (v/maxV)*innerH
+    return [x,y]
+  })
+  const linePath = pts.length ? pts.map((p,i)=> (i===0?'M':'L')+p[0].toFixed(1)+','+p[1].toFixed(1)).join(' ') : ''
+  const areaPath = pts.length ? linePath + ` L ${pts[pts.length-1][0].toFixed(1)},${(padT+innerH).toFixed(1)} L ${pts[0][0].toFixed(1)},${(padT+innerH).toFixed(1)} Z` : ''
+  const grid = [0,1,2,3].map(i => { const y = padT + i*innerH/3; return `<line x1="${padL}" y1="${y.toFixed(1)}" x2="${w-padR}" y2="${y.toFixed(1)}" stroke="var(--glass-border)" stroke-width="1"/>` }).join('')
+  const dotEvery = Math.max(1, Math.ceil(pts.length / 14))
+  const dots = pts.map((p,i) => (i % dotEvery === 0 || i === pts.length-1) ? `<circle cx="${p[0].toFixed(1)}" cy="${p[1].toFixed(1)}" r="${i===pts.length-1?5.5:3}" fill="${i===pts.length-1?'var(--accent)':'var(--glass-bg-strong)'}" stroke="var(--accent)" stroke-width="2"/>` : '').join('')
+  const labelEvery = Math.max(1, Math.ceil(labels.length / 8))
+  const labelsSvg = labels.map((l,i) => i % labelEvery === 0 ? `<text x="${(padL+i*bw+bw/2).toFixed(1)}" y="${h-6}" font-size="10.5" text-anchor="middle" fill="var(--text-3)">${esc(l.slice(5))}</text>` : '').join('')
+  return `<svg viewBox="0 0 ${w} ${h}" style="width:100%; height:auto; display:block" preserveAspectRatio="xMidYMid meet">
+    <defs><linearGradient id="chartGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="var(--accent)" stop-opacity="0.32"/>
+      <stop offset="100%" stop-color="var(--accent)" stop-opacity="0"/>
+    </linearGradient></defs>
+    ${grid}${barsSvg}
+    <path d="${areaPath}" fill="url(#chartGrad)"/>
+    <path d="${linePath}" fill="none" stroke="var(--accent)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+    ${dots}${labelsSvg}
+  </svg>`
+}
+
+async function refreshActiveGlobal(updateHero){
+  const res = await apiFetch('/api/calls/active')
+  const calls = await res.json()
+  document.getElementById('activeCount').textContent = calls.length
+  document.getElementById('activeBadge').classList.toggle('danger', false)
+
+  const heroSlot = document.getElementById('heroSlot')
+  if (heroSlot) {
+    heroSlot.innerHTML = calls.length ? `
+      <div class="glow-hero">
+        <div class="inner">
+          <div>
+            <h3>🔴 ${calls.length} สายกำลังคุยอยู่ตอนนี้</h3>
+            <p>${calls.map(c=>esc(c.name)).join(' · ')}</p>
+          </div>
+          <div class="row">
+            <button class="btn" onclick="openLiveModal('${esc(calls[0].callSid)}','${esc(calls[0].phone)}','${esc(calls[0].name)}')">${icon('chat')} ดูบทสนทนาสด</button>
+          </div>
+        </div>
+      </div>` : `
+      <div class="idle-hero">
+        <span style="width:8px; height:8px; border-radius:50%; background:var(--text-3); flex-shrink:0"></span>
+        ไม่มีสายที่กำลังคุยอยู่ตอนนี้ — พร้อมเริ่ม campaign ใหม่ได้ทุกเมื่อ
+      </div>`
   }
 
-  async function deleteContact(phone) {
-    await apiFetch(`/api/contacts/${encodeURIComponent(phone)}`, { method: 'DELETE' })
+  const recentEl = document.getElementById('recentCalls')
+  if (recentEl) {
+    recentEl.innerHTML = calls.length ? calls.slice(0,4).map(c => `
+      <div class="qa-row" onclick="openLiveModal('${esc(c.callSid)}','${esc(c.phone)}','${esc(c.name)}')">
+        <div class="badge" style="background:var(--success-soft); color:var(--success)">${icon('waveform')}</div>
+        <div class="label">${esc(c.name)} <span style="font-weight:400; color:var(--text-2)" class="num">· ${esc(c.phone)}</span></div>
+        <span class="pill active">กำลังคุย</span>
+      </div>`).join('') : '<div class="empty">ไม่มีสายที่กำลังคุยอยู่ตอนนี้</div>'
+  }
+}
+setInterval(() => { if (token) refreshActiveGlobal(currentPage()==='dashboard') }, 10000)
+
+async function pollHealth(){
+  try {
+    const res = await apiFetch('/api/health/status')
+    const data = await res.json()
+    const el = document.getElementById('healthPill')
+    if (!el) return
+    el.classList.toggle('danger', !data.ok)
+    el.innerHTML = data.ok
+      ? `<span class="pulse"></span> ระบบปกติ`
+      : `<span class="pulse"></span> พบข้อผิดพลาด ${data.count} ครั้งใน 10 นาที`
+  } catch (e) {}
+}
+setInterval(() => { if (token) pollHealth() }, 30000)
+
+/* ==================== contacts ==================== */
+async function loadContacts(){
+  const res = await apiFetch('/api/contacts')
+  contactsCache = await res.json()
+  filterContacts('')
+}
+function filterContacts(q){
+  q = q.trim().toLowerCase()
+  const rows = contactsCache.filter(c => !q || c.phone.includes(q) || (c.name||'').toLowerCase().includes(q))
+  const body = document.getElementById('contactsTable')
+  if (!body) return
+  if (!rows.length) { body.innerHTML = '<tr><td colspan="5" class="empty">ไม่พบข้อมูล</td></tr>'; return }
+  body.innerHTML = rows.map(c => `
+    <tr>
+      <td class="num">${esc(c.phone)}</td>
+      <td>${esc(c.name)}</td>
+      <td style="color:var(--text-2)">${esc((campaignsCache.find(x=>x.id===c.campaign)||{}).name || c.campaign)}</td>
+      <td>${c.status === 'retry_pending'
+          ? `<span class="pill retry_pending">รอโทรซ้ำ (${esc(c.retry_count||0)}/3)</span>`
+          : `<span class="pill ${esc(c.status)}">${esc(c.status)}</span>`}</td>
+      <td>
+        <button class="btn btn-icon btn-ghost" title="ห้ามโทรอีก" onclick="confirmBlockContact('${esc(c.phone)}')">${icon('block')}</button>
+        <button class="btn btn-icon btn-ghost danger" title="ลบ" onclick="confirmDeleteContact('${esc(c.phone)}')">${icon('trash')}</button>
+      </td>
+    </tr>`).join('')
+}
+async function addContact(){
+  const phone = document.getElementById('contactPhone').value.trim()
+  const name = document.getElementById('contactName').value.trim()
+  const campaign = document.getElementById('contactCampaign').value
+  const msgEl = document.getElementById('addContactMsg')
+  if (!phone || !campaign) { msgEl.textContent = 'กรอกเบอร์และเลือก campaign ก่อน'; return }
+  try {
+    const res = await apiFetch('/api/contacts', { method: 'POST', body: { phone, name, campaign } })
+    const data = await res.json()
+    if (!res.ok) { msgEl.textContent = data.error || 'เพิ่มไม่สำเร็จ'; return }
+    msgEl.textContent = ''
+    toast('เพิ่มเบอร์แล้ว')
+    document.getElementById('contactPhone').value = ''
+    document.getElementById('contactName').value = ''
     loadContacts()
-  }
-
-  // ==================== TEST CALL ====================
-  async function testCall() {
-    const phone = document.getElementById('testPhone').value.trim()
-    const name = document.getElementById('testName').value.trim()
-    const campaignId = document.getElementById('testCampaign').value
-    const msgEl = document.getElementById('testCallMsg')
-    if (!phone || !campaignId) { msgEl.className = 'msg error'; msgEl.textContent = 'กรอกเบอร์และเลือก campaign ก่อน'; return }
-    msgEl.className = 'msg'; msgEl.textContent = 'กำลังยิงโทร...'
-    try {
-      const res = await apiFetch('/api/calls/test', { method: 'POST', body: { phone, name, campaignId } })
-      const data = await res.json()
-      if (!res.ok) { msgEl.className = 'msg error'; msgEl.textContent = data.error || 'ล้มเหลว'; return }
-      msgEl.className = 'msg ok'; msgEl.textContent = `✓ กำลังโทรไป ${phone}`
-      setTimeout(refreshActiveGlobal, 3000)
-    } catch (e) {}
-  }
-
-  // ==================== HISTORY ====================
-  async function loadLogs() {
-    const campaignId = document.getElementById('logCampaignFilter').value
-    const url = campaignId ? `/api/calls?campaignId=${encodeURIComponent(campaignId)}&limit=100` : '/api/calls?limit=100'
-    const res = await apiFetch(url)
-    historyCache = await res.json()
-    const tbody = document.getElementById('logTable')
-    if (!historyCache.length) { tbody.innerHTML = '<tr><td colspan="6" class="empty">ยังไม่มีข้อมูล</td></tr>'; return }
-    tbody.innerHTML = historyCache.map((l, i) => `
-      <tr class="clickable" onclick="openHistoryModal(${i})">
-        <td>${esc(l.phone)}</td>
-        <td>${esc(l.name)}</td>
-        <td><span class="pill ${esc(l.outcome)}">${esc(l.outcome)}</span></td>
-        <td>${esc((l.summary || '').substring(0, 60))}</td>
-        <td>${formatDuration(l.duration)}</td>
-        <td>${esc(formatDateTH(l.timestamp))}</td>
-      </tr>`).join('')
-  }
-
-  // ==================== TRANSCRIPT MODAL ====================
-  function parseTranscript(str) {
-    if (!str) return []
-    return str.split(' | ').map(turn => {
-      const idx = turn.indexOf(': ')
-      if (idx === -1) return { role: 'ai', text: turn }
-      const label = turn.slice(0, idx)
-      return { role: label === 'ลูกค้า' ? 'user' : 'ai', text: turn.slice(idx + 2) }
-    })
-  }
-
-  function renderBubbles(turns) {
-    if (!turns.length) return '<div class="empty">ยังไม่มีบทสนทนา</div>'
-    return turns.map(t => `
-      <div class="bubble ${t.role}">
-        <div class="bubble-label">${t.role === 'user' ? 'ลูกค้า' : 'AI'}</div>
-        <div>${esc(t.text)}</div>
-      </div>`).join('')
-  }
-
-  function stopLivePolling() {
-    if (liveModalTimer) { clearInterval(liveModalTimer); liveModalTimer = null }
-    liveModalCallSid = null
-  }
-
-  function openHistoryModal(index) {
-    stopLivePolling()
-    const c = historyCache[index]
-    if (!c) return
-    document.getElementById('modalTitle').textContent = `${c.name || ''} — ${c.phone || ''}`
-    document.getElementById('modalSubtitle').textContent = formatDateTH(c.timestamp)
-    document.getElementById('modalMeta').innerHTML = `
-      <div>ผล<b>${esc(c.outcome)}</b></div>
-      <div>เวลาคุย<b>${formatDuration(c.duration)}</b></div>
-      <div>สรุป<b>${esc(c.summary) || '-'}</b></div>
-      <div>ประเด็นสำคัญ<b>${esc(c.key_points) || '-'}</b></div>
-      <div>สิ่งที่ควรทำต่อ<b>${esc(c.next_action) || '-'}</b></div>`
-    document.getElementById('modalMessages').innerHTML = renderBubbles(parseTranscript(c.transcript))
-    document.getElementById('transcriptModal').classList.add('open')
-  }
-
-  async function loadLiveMessages(callSid) {
-    try {
-      const res = await apiFetch(`/api/calls/active/${encodeURIComponent(callSid)}`)
-      if (!res.ok) { stopLivePolling(); return }
-      const data = await res.json()
-      document.getElementById('modalSubtitle').textContent = 'กำลังคุยอยู่ · ' + formatDuration(data.duration)
-      const turns = (data.messages || []).map(m => ({ role: m.role === 'user' ? 'user' : 'ai', text: m.content }))
-      document.getElementById('modalMessages').innerHTML = renderBubbles(turns)
-    } catch (e) {}
-  }
-
-  function openLiveModal(callSid, phone, name) {
-    stopLivePolling()
-    liveModalCallSid = callSid
-    document.getElementById('modalTitle').textContent = `${name || ''} — ${phone || ''}`
-    document.getElementById('modalMeta').innerHTML = `<div>สถานะ<b><span class="live-dot"></span> กำลังคุยอยู่</b></div>`
-    document.getElementById('modalMessages').innerHTML = '<div class="empty">กำลังโหลด...</div>'
-    document.getElementById('transcriptModal').classList.add('open')
-    loadLiveMessages(callSid)
-    liveModalTimer = setInterval(() => loadLiveMessages(callSid), 3000)
-  }
-
-  function closeModal() {
-    stopLivePolling()
-    document.getElementById('transcriptModal').classList.remove('open')
-  }
-
-  // ==================== BOOT ====================
-  window.onload = async () => {
-    if (!token) { showLogin(); return }
-    try {
-      await apiFetch('/api/stats')
-      showApp()
-    } catch (e) {
-      showLogin()
+  } catch (e) {}
+}
+function confirmDeleteContact(phone){
+  const c = contactsCache.find(x => x.phone === phone)
+  openConfirm({
+    title: 'ลบเบอร์นี้?',
+    message: `${c ? c.name + ' — ' : ''}${phone} จะถูกทำเครื่องหมายว่าลบแล้ว`,
+    confirmLabel: 'ลบเบอร์',
+    onConfirm: async () => {
+      await apiFetch(`/api/contacts/${encodeURIComponent(phone)}`, { method: 'DELETE' })
+      toast('ลบเบอร์แล้ว', 'danger')
+      loadContacts()
     }
+  })
+}
+function confirmBlockContact(phone){
+  const c = contactsCache.find(x => x.phone === phone)
+  openConfirm({
+    title: 'ห้ามโทรเบอร์นี้ถาวร?',
+    message: `${c ? c.name + ' — ' : ''}${phone} จะถูกเพิ่มเข้า Do-not-call list จะไม่ถูกโทรอีกในทุก campaign ต่อจากนี้`,
+    confirmLabel: 'บล็อกถาวร',
+    onConfirm: async () => {
+      await apiFetch('/api/blocklist', { method: 'POST', body: { phone, reason: 'blocked from admin' } })
+      toast('เพิ่ม ' + phone + ' เข้า Do-not-call list แล้ว', 'danger')
+    }
+  })
+}
+
+/* ==================== bulk import ==================== */
+let lastParsedRows = []
+function parsePastedContacts(text){
+  return text.split(/\r?\n/).map(l => l.trim()).filter(Boolean).map(line => {
+    const parts = line.includes('\t') ? line.split('\t') : line.split(',')
+    const phone = (parts[0] || '').trim()
+    const name = (parts[1] || '').trim()
+    const digits = phone.replace(/[^\d+]/g, '')
+    return { phone, name, valid: digits.length >= 9 }
+  })
+}
+function handleBulkPaste(text){
+  lastParsedRows = parsePastedContacts(text)
+  const summaryEl = document.getElementById('importSummary')
+  const previewEl = document.getElementById('importPreview')
+  const btn = document.getElementById('bulkImportBtn')
+  const countEl = document.getElementById('bulkImportCount')
+  const validCount = lastParsedRows.filter(r => r.valid).length
+  const invalidCount = lastParsedRows.length - validCount
+
+  if (!lastParsedRows.length) {
+    summaryEl.style.display = 'none'; previewEl.style.display = 'none'
+    btn.disabled = true; countEl.textContent = '0'
+    return
   }
+  summaryEl.style.display = 'flex'
+  summaryEl.innerHTML = `พบ <b>${lastParsedRows.length}</b> แถว &middot; ถูกต้อง <b class="ok">${validCount}</b>${invalidCount ? ` &middot; ข้าม <b class="bad">${invalidCount}</b> (เบอร์ไม่ถูกต้อง)` : ''}`
+  previewEl.style.display = 'block'
+  previewEl.innerHTML = `<table><tbody>${lastParsedRows.map(r => `
+    <tr class="${r.valid?'':'row-invalid'}">
+      <td class="num" style="width:36%">${esc(r.phone)}</td>
+      <td>${esc(r.name) || '<span style=\"color:var(--text-3)\">— ไม่มีชื่อ —</span>'}</td>
+      <td style="width:60px; text-align:right">${r.valid ? icon('check') : icon('warn')}</td>
+    </tr>`).join('')}</tbody></table>`
+  countEl.textContent = validCount
+  btn.disabled = validCount === 0
+}
+async function runBulkImport(){
+  const campaign = document.getElementById('bulkCampaign').value
+  if (!campaign) { toast('เลือก Campaign ก่อนนำเข้า', 'danger'); return }
+  const valid = lastParsedRows.filter(r => r.valid).map(r => ({ phone: r.phone, name: r.name }))
+  try {
+    const res = await apiFetch('/api/contacts/bulk', { method: 'POST', body: { contacts: valid, campaign } })
+    const data = await res.json()
+    if (!res.ok) { toast(data.error || 'นำเข้าไม่สำเร็จ', 'danger'); return }
+    toast(`นำเข้า ${data.count} เบอร์เรียบร้อย`)
+    document.getElementById('bulkPaste').value = ''
+    handleBulkPaste('')
+    loadContacts()
+  } catch (e) {}
+}
+
+/* ==================== test call ==================== */
+async function testCall(){
+  const phone = document.getElementById('testPhone').value.trim()
+  const name = document.getElementById('testName').value.trim()
+  const campaignId = document.getElementById('testCampaign').value
+  const msgEl = document.getElementById('testCallMsg')
+  if (!phone || !campaignId) { msgEl.textContent = 'กรอกเบอร์และเลือก campaign ก่อน'; return }
+  msgEl.textContent = 'กำลังยิงโทร...'
+  try {
+    const res = await apiFetch('/api/calls/test', { method: 'POST', body: { phone, name, campaignId } })
+    const data = await res.json()
+    if (!res.ok) { msgEl.textContent = data.error || 'ล้มเหลว'; return }
+    msgEl.textContent = ''
+    toast(`กำลังโทรไป ${phone}`)
+    setTimeout(() => refreshActiveGlobal(false), 3000)
+  } catch (e) {}
+}
+
+/* ==================== history ==================== */
+const HISTORY_PAGE_SIZE = 20
+let historyPage = 1
+let historyLocalQuery = ''
+
+async function loadLogs(){
+  const campaignId = document.getElementById('logCampaignFilter').value
+  const url = campaignId ? `/api/calls?campaignId=${encodeURIComponent(campaignId)}&limit=300` : '/api/calls?limit=300'
+  const res = await apiFetch(url)
+  historyCache = await res.json()
+  historyPage = 1
+  historyLocalQuery = ''
+  renderHistoryRows()
+}
+function filterHistoryLocal(q){ historyLocalQuery = q.trim().toLowerCase(); historyPage = 1; renderHistoryRows() }
+function loadMoreHistory(){ historyPage++; renderHistoryRows() }
+function renderHistoryRows(){
+  const q = historyLocalQuery
+  const all = historyCache.map((c,i) => ({...c, i})).filter(c => !q || (c.phone||'').includes(q) || (c.name||'').toLowerCase().includes(q))
+  const shown = all.slice(0, historyPage * HISTORY_PAGE_SIZE)
+  const body = document.getElementById('historyBody')
+  if (!body) return
+  if (!shown.length) { body.innerHTML = '<tr><td colspan="7" class="empty">ไม่พบข้อมูล</td></tr>'; document.getElementById('historyLoadMoreWrap').innerHTML = ''; return }
+  body.innerHTML = shown.map(c => `
+    <tr class="clickable" onclick="openHistoryModal(${c.i})">
+      <td class="num">${esc(c.phone)}</td>
+      <td>${esc(c.name)}</td>
+      <td><span class="pill ${esc(c.call_status)}">${esc(CALL_STATUS_LABELS[c.call_status] || c.call_status || '-')}</span></td>
+      <td>${c.outcome && c.outcome !== '-' ? `<span class="pill ${esc(c.outcome)}">${esc(c.outcome)}</span>` : '<span style="color:var(--text-3)">—</span>'}</td>
+      <td style="color:var(--text-2)">${esc((c.summary||'').substring(0,40))}</td>
+      <td class="num">${fmtDur(c.duration)}</td>
+      <td class="num" style="color:var(--text-2); font-size:12.5px">${esc(fmtDate(c.timestamp))}</td>
+    </tr>`).join('')
+  const wrap = document.getElementById('historyLoadMoreWrap')
+  wrap.innerHTML = shown.length < all.length
+    ? `<button class="btn btn-sm" onclick="loadMoreHistory()">โหลดเพิ่ม (เหลืออีก ${all.length - shown.length} รายการ)</button>`
+    : `<span style="font-size:12px; color:var(--text-3)">แสดงครบทั้งหมดแล้ว</span>`
+}
+function exportHistoryCsv(){
+  if (!historyCache.length) { toast('ไม่มีข้อมูลให้ออกรายงาน', 'danger'); return }
+  const cols = ['phone','name','call_status','outcome','summary','key_points','next_action','duration','timestamp']
+  const escCsv = v => `"${String(v==null?'':v).replace(/"/g,'""')}"`
+  const lines = [cols.join(',')].concat(historyCache.map(c => cols.map(k => escCsv(c[k])).join(',')))
+  const blob = new Blob(['﻿' + lines.join('\n')], { type: 'text/csv;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `call-history-${new Date().toISOString().slice(0,10)}.csv`
+  a.click()
+  URL.revokeObjectURL(url)
+  toast('ออกรายงาน CSV แล้ว')
+}
+
+/* ==================== boot ==================== */
+window.onload = async () => {
+  if (!token) { showLogin(); return }
+  try {
+    await apiFetch('/api/health/status')
+    showApp()
+  } catch (e) { showLogin() }
+}
 </script>
 </body>
 </html>

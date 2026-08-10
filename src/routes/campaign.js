@@ -9,6 +9,18 @@ module.exports = async function campaignRoutes(fastify) {
     return reply.send(campaigns)
   })
 
+  // สร้าง campaign ใหม่
+  fastify.post('/api/campaigns', async (req, reply) => {
+    const { id, name, type, voice_id, script, status } = req.body || {}
+    if (!id || !name) return reply.code(400).send({ error: 'id and name required' })
+
+    const existing = await sheetsService.getCampaign(id)
+    if (existing) return reply.code(409).send({ error: 'Campaign id already exists' })
+
+    await sheetsService.addCampaign({ id, name, type, voice_id, script, status })
+    return reply.send({ message: 'Campaign created' })
+  })
+
   // ดู campaign เดียว (สำหรับเปิดแก้ prompt)
   fastify.get('/api/campaigns/:id', async (req, reply) => {
     const campaign = await sheetsService.getCampaign(req.params.id)
