@@ -25,6 +25,19 @@ module.exports = async function dashboardRoutes(fastify) {
     return reply.send(active)
   })
 
+  // บทสนทนาสด ๆ ของสายที่กำลังคุยอยู่ — ให้ /admin poll ดูระหว่างสายยังไม่จบ
+  fastify.get('/api/calls/active/:callSid', async (req, reply) => {
+    const session = callSessions.get(req.params.callSid)
+    if (!session) return reply.code(404).send({ error: 'Call not found or already ended' })
+    return reply.send({
+      callSid: req.params.callSid,
+      phone: session.phone,
+      name: session.name,
+      duration: Math.floor((Date.now() - session.startTime) / 1000),
+      messages: session.messages,
+    })
+  })
+
   // สถิติ summary
   fastify.get('/api/stats', async (req, reply) => {
     const stats = await sheetsService.getStats()

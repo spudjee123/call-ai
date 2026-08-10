@@ -136,18 +136,7 @@ const sheetsService = {
   },
 
   async saveCallResult(result) {
-    await appendRow(SHEETS.RESULTS, [
-      result.call_id,
-      result.phone,
-      result.name,
-      result.campaign_id,
-      result.outcome,
-      result.summary,
-      result.key_points,
-      result.duration,
-      result.transcript,
-      new Date().toISOString()
-    ])
+    await appendRowByFields(SHEETS.RESULTS, { ...result, timestamp: new Date().toISOString() })
   },
 
   async getSmsTemplate(outcome) {
@@ -166,10 +155,24 @@ const sheetsService = {
     const rows = await getRows(SHEETS.RESULTS)
     const total = rows.length
     const outcomes = {}
+    const byCampaign = {}
+    const today = new Date().toISOString().slice(0, 10)
+    let durationSum = 0
+    let durationCount = 0
+    let callsToday = 0
+
     rows.forEach(r => {
       outcomes[r.outcome] = (outcomes[r.outcome] || 0) + 1
+      if (r.campaign_id) byCampaign[r.campaign_id] = (byCampaign[r.campaign_id] || 0) + 1
+      const duration = Number(r.duration)
+      if (!Number.isNaN(duration) && duration > 0) { durationSum += duration; durationCount++ }
+      if ((r.timestamp || '').startsWith(today)) callsToday++
     })
-    return { total, outcomes }
+
+    const avgDuration = durationCount ? Math.round(durationSum / durationCount) : 0
+    const conversionRate = total ? Math.round(((outcomes.interested || 0) / total) * 1000) / 10 : 0
+
+    return { total, outcomes, byCampaign, avgDuration, callsToday, conversionRate }
   }
 }
 

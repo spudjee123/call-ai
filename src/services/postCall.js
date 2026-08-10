@@ -34,6 +34,7 @@ async function postCallHandler(callSid, callStatus, duration, session) {
       outcome,
       summary,
       key_points: keyPoints,
+      next_action: nextAction,
       duration: duration || 0,
       transcript,
     })
