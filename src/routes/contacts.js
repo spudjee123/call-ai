@@ -82,6 +82,12 @@ module.exports = async function contactsRoutes(fastify) {
     return reply.send({ message: 'Blocked' })
   })
 
+  fastify.delete('/api/blocklist/:phone', async (req, reply) => {
+    const removed = await sheetsService.removeFromBlocklist(normalizePhone(req.params.phone))
+    if (!removed) return reply.code(404).send({ error: 'Phone not found in blocklist' })
+    return reply.send({ message: 'Unblocked' })
+  })
+
   // แก้ไข contact (เช่น เปลี่ยน status, ชื่อ, campaign)
   fastify.patch('/api/contacts/:phone', async (req, reply) => {
     const updated = await sheetsService.updateContact(normalizePhone(req.params.phone), req.body || {})

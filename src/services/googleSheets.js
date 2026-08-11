@@ -57,15 +57,21 @@ async function getRows(sheetName) {
   })
 }
 
+// หา index ของแถวด้วย key column — ใช้ร่วมกันทั้ง updateRowByKey และ deleteRowByKey กันตรรกะ drift แยกกัน
+function findRowIndex(headers, rows, keyField, keyValue) {
+  const keyIdx = headers.indexOf(keyField)
+  if (keyIdx === -1) return -1
+  return rows.findIndex(r => r[keyIdx] === keyValue)
+}
+
 // หา row ด้วย key column แล้วอัปเดตหลาย field พร้อมกันในครั้งเดียว (เขียนทับทั้งแถว)
 // ล็อกต่อชีต กัน read-modify-write ชนกันเมื่อหลายสายจบพร้อมกัน
 async function updateRowByKey(sheetName, keyField, keyValue, updates) {
   return withSheetLock(sheetName, async () => {
     const { headers, rows } = await getSheetData(sheetName)
-    const keyIdx = headers.indexOf(keyField)
-    if (keyIdx === -1) throw new Error(`Column '${keyField}' not found in ${sheetName}`)
+    if (headers.indexOf(keyField) === -1) throw new Error(`Column '${keyField}' not found in ${sheetName}`)
 
-    const rowIdx = rows.findIndex(r => r[keyIdx] === keyValue)
+    const rowIdx = findRowIndex(headers, rows, keyField, keyValue)
     if (rowIdx === -1) return false
 
     const row = [...rows[rowIdx]]
@@ -82,6 +88,40 @@ async function updateRowByKey(sheetName, keyField, keyValue, updates) {
       range: `${sheetName}!A${rowIdx + 2}:${lastCol}${rowIdx + 2}`,
       valueInputOption: 'RAW',
       requestBody: { values: [row] },
+    })
+    return true
+  })
+}
+
+// Sheets API ต้องใช้ sheetId ตัวเลข (ไม่ใช่ชื่อชีต) สำหรับ batchUpdate อย่าง deleteDimension
+// ไม่ cache ตั้งใจ — deleteRowByKey ใช้ไม่บ่อย (unblock เป็น action ที่กดนานๆ ครั้ง) การ cache ไว้เสี่ยงได้ sheetId
+// เก่าถ้ามีคนลบ/สร้างแท็บซ้ำชื่อเดิมระหว่าง process ยังรันอยู่ ซึ่งจะไปลบผิดแถวผิดชีตแบบเงียบๆ ไม่คุ้มกับที่ประหยัดได้
+async function getSheetId(sheetName) {
+  const client = await getClient()
+  const meta = await client.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID })
+  const sheet = (meta.data.sheets || []).find(s => s.properties.title === sheetName)
+  if (!sheet) throw new Error(`Sheet '${sheetName}' not found`)
+  return sheet.properties.sheetId
+}
+
+// ลบทั้งแถวจริง (ต่างจาก updateRowByKey ที่แก้ค่าในแถวเดิม) — ใช้กับชีตที่ไม่มี status column ให้ soft-delete เช่น Blocklist
+async function deleteRowByKey(sheetName, keyField, keyValue) {
+  return withSheetLock(sheetName, async () => {
+    const { headers, rows } = await getSheetData(sheetName)
+    const rowIdx = findRowIndex(headers, rows, keyField, keyValue)
+    if (rowIdx === -1) return false
+
+    const sheetId = await getSheetId(sheetName)
+    const client = await getClient()
+    await client.spreadsheets.batchUpdate({
+      spreadsheetId: SPREADSHEET_ID,
+      requestBody: {
+        requests: [{
+          deleteDimension: {
+            range: { sheetId, dimension: 'ROWS', startIndex: rowIdx + 1, endIndex: rowIdx + 2 }, // +1 เพราะแถวแรกคือ header
+          },
+        }],
+      },
     })
     return true
   })
@@ -196,6 +236,10 @@ const sheetsService = {
 
   async addToBlocklist(phone, reason) {
     await appendRowByFields(SHEETS.BLOCKLIST, { phone, reason: reason || '', blocked_at: new Date().toISOString() })
+  },
+
+  async removeFromBlocklist(phone) {
+    return deleteRowByKey(SHEETS.BLOCKLIST, 'phone', phone)
   },
 
   async saveCallResult(result) {

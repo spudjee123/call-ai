@@ -65,7 +65,21 @@
       "Bash(cd \"e:\\\\โปรแกรม\\\\Call Ai\" && find . -iname \"CLAUDE.md\" -not -path \"*/node_modules/*\" 2>/dev/null; ls ~/.claude/CLAUDE.md 2>/dev/null; echo done)",
       "Read(//c/Users/PC/.claude/**)",
       "Bash(node --check src/utils/callQueue.js)",
-      "Bash(node -e \"require\\('./src/utils/callQueue'\\); require\\('./src/routes/contacts'\\); console.log\\('load OK, no circular dep issues'\\)\")"
+      "Bash(node -e \"require\\('./src/utils/callQueue'\\); require\\('./src/routes/contacts'\\); console.log\\('load OK, no circular dep issues'\\)\")",
+      "Bash(curl -s \"https://call-ai-wg8s.onrender.com/admin\")",
+      "Bash(echo \"---exit code: $?---\")",
+      "Bash(curl -s -o /dev/null -w \"status: %{http_code}\\\\n\" \"https://call-ai-wg8s.onrender.com/admin\")",
+      "Bash(node --check src/services/googleSTT.js)",
+      "Bash(node --check /c/Users/PC/AppData/Local/Temp/claude/e----------Call-Ai/8e7b48a4-2349-4f7d-b713-7906ad8d117c/scratchpad/mock_check5.js)",
+      "Bash(rm -f /c/Users/PC/AppData/Local/Temp/claude/e----------Call-Ai/8e7b48a4-2349-4f7d-b713-7906ad8d117c/scratchpad/mock_check5.js)",
+      "Bash(node -e \"require\\('./src/services/googleSheets'\\); console.log\\('loads OK'\\)\")",
+      "Bash(node -e \"require\\('./src/routes/contacts'\\); console.log\\('OK'\\)\")",
+      "Bash(grep -n 'path.match\\(/\\\\^\\\\\\\\/api\\\\\\\\/contacts' /c/Users/PC/AppData/Local/Temp/claude/e----------Call-Ai/8e7b48a4-2349-4f7d-b713-7906ad8d117c/scratchpad/admin_mock_body.html)",
+      "Bash(node --check /c/Users/PC/AppData/Local/Temp/claude/e----------Call-Ai/8e7b48a4-2349-4f7d-b713-7906ad8d117c/scratchpad/mock_check6.js)",
+      "Bash(rm -f /c/Users/PC/AppData/Local/Temp/claude/e----------Call-Ai/8e7b48a4-2349-4f7d-b713-7906ad8d117c/scratchpad/mock_check6.js)",
+      "Bash(node --check /c/Users/PC/AppData/Local/Temp/claude/e----------Call-Ai/8e7b48a4-2349-4f7d-b713-7906ad8d117c/scratchpad/mock_check7.js)",
+      "Bash(rm -f /c/Users/PC/AppData/Local/Temp/claude/e----------Call-Ai/8e7b48a4-2349-4f7d-b713-7906ad8d117c/scratchpad/mock_check7.js)",
+      "Bash(node -e \"try{require.resolve\\('jsdom'\\);console.log\\('jsdom available'\\)}catch\\(e\\){console.log\\('jsdom NOT available'\\)}\")"
     ],
     "additionalDirectories": [
       "C:\\Users\\PC\\AppData\\Local\\Temp\\claude\\e----------Call-Ai\\8e7b48a4-2349-4f7d-b713-7906ad8d117c\\scratchpad"
