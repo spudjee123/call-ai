@@ -6,6 +6,7 @@
 <title>Call AI — Control Center</title>
 <style>
   :root {
+    color-scheme: light;
     --bg: #f2f1f7;
     --mesh-1: #8b7bff; --mesh-2: #5ec8ff; --mesh-3: #ff9ecf;
     --dot: rgba(20,20,40,.06);
@@ -35,6 +36,7 @@
   }
   @media (prefers-color-scheme: dark) {
     :root:not([data-theme="light"]) {
+      color-scheme: dark;
       --bg: #06060a;
       --mesh-1: #4d3fc7; --mesh-2: #1478a8; --mesh-3: #a83a72;
       --dot: rgba(255,255,255,.055);
@@ -60,6 +62,7 @@
     }
   }
   :root[data-theme="dark"] {
+    color-scheme: dark;
     --bg: #06060a; --mesh-1: #4d3fc7; --mesh-2: #1478a8; --mesh-3: #a83a72; --dot: rgba(255,255,255,.055);
     --glass-bg: rgba(30,28,42,.55); --glass-bg-strong: rgba(30,28,42,.78); --glass-border: rgba(255,255,255,.10);
     --surface-2: rgba(255,255,255,.07); --text: #f3f2fa; --text-2: #a4a3b3; --text-3: #78778a;
@@ -165,7 +168,7 @@
   }
   .btn svg { width: 15px; height: 15px; }
   .btn:hover { background: var(--glass-bg-strong); }
-  .btn:active { transform: scale(.96); }
+  .btn:active, .btn.btn-pressed { transform: scale(.93); filter: brightness(.88); }
   .btn:disabled { opacity: .5; cursor: not-allowed; }
   .btn-accent { background: linear-gradient(135deg, var(--accent), var(--accent-2)); border-color: transparent; color: #fff; }
   .btn-accent:hover { filter: brightness(1.08); }
@@ -485,8 +488,20 @@ const ICONS = {
   block: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="4.9" y1="4.9" x2="19.1" y2="19.1"/></svg>',
 }
 const icon = (name, cls) => `<span class="${cls||''}" style="display:inline-flex">${ICONS[name]||''}</span>`
-const HANGUP_LABELS = { ai_ended: 'AI ปิดสายปกติ', customer_hangup: 'ลูกค้าวางสายเอง', silence_timeout: 'หมดเวลาเงียบ ไม่ตอบสนอง', manual_hangup: 'เจ้าหน้าที่ตัดสาย (ปุ่มฉุกเฉิน)' }
+const HANGUP_LABELS = { ai_ended: 'AI ปิดสายปกติ', customer_hangup: 'ลูกค้าวางสายเอง', silence_timeout: 'หมดเวลาเงียบ ไม่ตอบสนอง', manual_hangup: 'เจ้าหน้าที่ตัดสาย (ปุ่มฉุกเฉิน)', max_duration: 'ครบเวลาสูงสุดของสาย' }
 const CALL_STATUS_LABELS = { completed: 'เชื่อมสายสำเร็จ', 'no-answer': 'ไม่รับสาย', busy: 'สายไม่ว่าง', failed: 'โทรไม่ติด', canceled: 'ยกเลิกก่อนโทร' }
+// ผลของบทสนทนา (ต่างจาก call_status ที่บอกแค่ว่าเชื่อมสายได้ไหม) — บางค่าซ้ำกับ call_status ได้
+// เพราะสายที่เชื่อมไม่ติด (busy/failed/no-answer/canceled) จะถูกเก็บเป็น outcome ตรงๆ ด้วยเช่นกัน
+const OUTCOME_LABELS = {
+  interested: 'ลูกค้าสนใจ',
+  not_interested: 'ลูกค้าไม่สนใจ',
+  callback: 'ขอให้โทรกลับใหม่',
+  no_answer: 'ไม่ตอบสนองระหว่างคุย',
+  angry: 'ลูกค้าไม่พอใจ',
+  completed: 'จบสาย (สรุปผลอัตโนมัติไม่สำเร็จ)',
+  no_conversation: 'เชื่อมสายได้แต่ไม่มีบทสนทนา',
+}
+function outcomeLabel(v){ if (!v || v === '-') return '—'; return OUTCOME_LABELS[v] || CALL_STATUS_LABELS[v] || v }
 
 /* ==================== auth / fetch ==================== */
 let token = localStorage.getItem('callai_token') || null
@@ -494,8 +509,11 @@ let token = localStorage.getItem('callai_token') || null
 function esc(s){ const d=document.createElement('div'); d.textContent = s==null?'':String(s); return d.innerHTML }
 // สำหรับค่าที่ถูกฝังใน onclick="fn('...')" — esc() เพียงอย่างเดียวไม่ escape ' หรือ " จึงหลุดออกจาก string/attribute ได้ถ้าค่ามี apostrophe (เช่น ชื่อลูกค้า "O'Brien")
 function escJsAttr(s){ const jsEscaped = (s==null?'':String(s)).replace(/\\/g,'\\\\').replace(/'/g,"\\'"); return esc(jsEscaped).replace(/"/g,'&quot;') }
+// สำหรับข้อความที่ฝังใน attribute ธรรมดา เช่น title="..." — esc() ไม่ escape เครื่องหมายคำพูดคู่
+function escAttr(s){ return esc(s).replace(/"/g,'&quot;') }
 function fmtDur(sec){ sec=Number(sec)||0; const m=Math.floor(sec/60), s=Math.floor(sec%60); return `${m}:${String(s).padStart(2,'0')}` }
 function fmtDate(iso){ if(!iso) return ''; const d=new Date(iso); if(isNaN(d)) return iso; return new Intl.DateTimeFormat('sv-SE',{timeZone:'Asia/Bangkok',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}).format(d) }
+function campaignName(id){ if(!id) return '—'; const c = campaignsCache.find(x => x.id === id); return c ? (c.name || c.id) : id }
 
 async function apiFetch(url, options = {}) {
   options.headers = Object.assign({}, options.headers, { 'Authorization': 'Bearer ' + token })
@@ -512,6 +530,15 @@ async function apiFetch(url, options = {}) {
   }
   return res
 }
+
+// เพิ่ม feedback ตอนกดปุ่ม แบบ delegate เดียวจบ — กัน render ทับปุ่มทันทีหลังกด (innerHTML rebuild)
+// จนแอนิเมชัน :active ของ CSS เล่นไม่ทัน เพราะปุ่มโดนแทนที่ก่อนตาเห็น
+document.addEventListener('pointerdown', e => {
+  const btn = e.target.closest('.btn')
+  if (!btn) return
+  btn.classList.add('btn-pressed')
+  setTimeout(() => btn.classList.remove('btn-pressed'), 160)
+})
 
 function showLogin() {
   document.getElementById('loginScreen').style.display = 'flex'
@@ -594,8 +621,9 @@ function openHistoryModal(i){
   document.getElementById('modalTitle').textContent = `${c.name || ''} — ${c.phone || ''}`
   document.getElementById('modalSubtitle').textContent = fmtDate(c.timestamp)
   document.getElementById('modalMeta').innerHTML = `
+    <div><div class="k">Campaign</div><div class="v">${esc(campaignName(c.campaign_id))}</div></div>
     <div><div class="k">การเชื่อมต่อ</div><div class="v"><span class="pill ${esc(c.call_status)}">${esc(CALL_STATUS_LABELS[c.call_status] || c.call_status)}</span></div></div>
-    <div><div class="k">ผล</div><div class="v">${c.outcome && c.outcome!=='-' ? `<span class="pill ${esc(c.outcome)}">${esc(c.outcome)}</span>` : '—'}</div></div>
+    <div><div class="k">ผล</div><div class="v">${c.outcome && c.outcome!=='-' ? `<span class="pill ${esc(c.outcome)}">${esc(outcomeLabel(c.outcome))}</span>` : '—'}</div></div>
     <div><div class="k">วางสายโดย</div><div class="v">${c.hangup_reason ? esc(HANGUP_LABELS[c.hangup_reason]||c.hangup_reason) : '—'}</div></div>
     <div><div class="k">เวลาคุย</div><div class="v num">${fmtDur(c.duration)}</div></div>
     <div><div class="k">สรุป</div><div class="v">${esc(c.summary) || '-'}</div></div>
@@ -645,9 +673,9 @@ function openLiveModal(callSid, phone, name){
 }
 
 /* ==================== router ==================== */
-const PAGES = ['dashboard','campaigns','contacts','test','history']
-const TITLES = { dashboard:'Dashboard', campaigns:'Campaigns', contacts:'เบอร์ติดต่อ', test:'ทดสอบโทร', history:'ประวัติการโทร' }
-const NAV_ICON = { dashboard:'dashboard', campaigns:'campaigns', contacts:'contacts', test:'test', history:'history' }
+const PAGES = ['dashboard','campaigns','contacts','test','history','lookup']
+const TITLES = { dashboard:'Dashboard', campaigns:'Campaigns', contacts:'เบอร์ติดต่อ', test:'ทดสอบโทร', history:'ประวัติการโทร', lookup:'ค้นหาเบอร์' }
+const NAV_ICON = { dashboard:'dashboard', campaigns:'campaigns', contacts:'contacts', test:'test', history:'history', lookup:'search' }
 
 function buildNav(){
   document.getElementById('nav').innerHTML = PAGES.map(p =>
@@ -723,8 +751,8 @@ const TEMPLATES = {
       </div>
       <div class="card-body table-scroll">
         <table>
-          <thead><tr><th>ชื่อ</th><th>สถานะ</th><th>ประเภท</th><th>Voice</th><th></th></tr></thead>
-          <tbody id="campaignTable"><tr><td colspan="5" class="empty">กำลังโหลด...</td></tr></tbody>
+          <thead><tr><th>ชื่อ</th><th>สถานะ</th><th>ประเภท</th><th>Voice</th><th>สถิติ</th><th></th></tr></thead>
+          <tbody id="campaignTable"><tr><td colspan="6" class="empty">กำลังโหลด...</td></tr></tbody>
         </table>
         <div id="campaignPanel"></div>
       </div>
@@ -766,12 +794,22 @@ const TEMPLATES = {
     <div class="card">
       <div class="card-head">
         <h2>รายชื่อเบอร์</h2>
-        <div class="search-wrap">${icon('search')}<input type="search" placeholder="ค้นหาเบอร์หรือชื่อ..." oninput="filterContacts(this.value)"></div>
+        <div class="search-wrap">${icon('search')}<input id="contactsSearchInput" type="search" placeholder="ค้นหาเบอร์หรือชื่อ..." oninput="filterContacts(this.value)"></div>
       </div>
-      <div class="card-body table-scroll">
+      <div class="card-body">
+        <div class="row" id="contactsBulkBar" style="display:none; margin-bottom:12px; justify-content:space-between; background:var(--surface-2); border:1px solid var(--glass-border); border-radius:var(--radius-sm); padding:10px 14px">
+          <span style="font-size:13px; color:var(--text-2)"><b id="contactsSelectedCount">0</b> เบอร์ที่เลือก</span>
+          <div class="row" style="gap:6px">
+            <button class="btn btn-sm btn-ghost danger" onclick="bulkBlockContacts()">${icon('block')} บล็อกที่เลือก</button>
+            <button class="btn btn-sm btn-danger" onclick="bulkDeleteContacts()">${icon('trash')} ลบที่เลือก</button>
+            <button class="btn btn-sm btn-ghost" onclick="clearContactsSelection()">ยกเลิกเลือก</button>
+          </div>
+        </div>
+      </div>
+      <div class="card-body table-scroll" style="padding-top:0">
         <table>
-          <thead><tr><th>เบอร์</th><th>ชื่อ</th><th>Campaign</th><th>สถานะ</th><th></th></tr></thead>
-          <tbody id="contactsTable"><tr><td colspan="5" class="empty">กำลังโหลด...</td></tr></tbody>
+          <thead><tr><th style="width:34px"><input type="checkbox" id="contactsSelectAll" onchange="toggleSelectAllContacts(this.checked)"></th><th>เบอร์</th><th>ชื่อ</th><th>Campaign</th><th>สถานะ</th><th></th></tr></thead>
+          <tbody id="contactsTable"><tr><td colspan="6" class="empty">กำลังโหลด...</td></tr></tbody>
         </table>
       </div>
     </div>`,
@@ -796,18 +834,47 @@ const TEMPLATES = {
       <div class="card-head">
         <h2>ประวัติการโทร</h2>
         <div class="row">
-          <select id="logCampaignFilter" class="campaign-select" onchange="loadLogs()"><option value="">ทุก Campaign</option></select>
-          <div class="search-wrap" style="max-width:220px">${icon('search')}<input type="search" placeholder="ค้นหาเบอร์หรือชื่อ..." oninput="filterHistoryLocal(this.value)"></div>
+          <select id="logCampaignFilter" class="campaign-select"><option value="">ทุก Campaign</option></select>
+          <select id="historyOutcomeFilter" onchange="historyFilterChanged()">
+            <option value="">ทุกผลลัพธ์</option>
+            <option value="interested">สนใจ</option>
+            <option value="not_interested">ไม่สนใจ</option>
+            <option value="callback">ขอให้โทรกลับ</option>
+            <option value="no_answer">ไม่ตอบสนองระหว่างคุย</option>
+            <option value="angry">ลูกค้าไม่พอใจ</option>
+            <option value="no_conversation">ไม่มีบทสนทนา</option>
+            <option value="no-answer">ไม่รับสาย</option>
+            <option value="busy">สายไม่ว่าง</option>
+            <option value="failed">โทรไม่ติด</option>
+            <option value="canceled">ยกเลิกก่อนโทร</option>
+          </select>
+          <input type="date" id="historyDateFrom" title="ตั้งแต่วันที่" onchange="historyFilterChanged()" style="width:auto">
+          <input type="date" id="historyDateTo" title="ถึงวันที่" onchange="historyFilterChanged()" style="width:auto">
+          <div class="search-wrap" style="max-width:220px">${icon('search')}<input id="historySearchInput" type="search" placeholder="ค้นหาเบอร์หรือชื่อ..." oninput="historyFilterChanged()" onkeydown="if(event.key==='Enter') loadLogs()"></div>
+          <button class="btn btn-sm btn-accent" onclick="loadLogs()">${icon('search')} ค้นหา</button>
           <button class="btn btn-sm" onclick="loadLogs()">รีเฟรช</button>
           <button class="btn btn-sm" onclick="exportHistoryCsv()">${icon('download')} ออกรายงาน CSV</button>
         </div>
       </div>
       <div class="card-body table-scroll">
         <table>
-          <thead><tr><th>เบอร์</th><th>ชื่อ</th><th>การเชื่อมต่อ</th><th>ผล</th><th>สรุป</th><th>เวลาคุย</th><th>วันที่</th></tr></thead>
-          <tbody id="historyBody"><tr><td colspan="7" class="empty">กำลังโหลด...</td></tr></tbody>
+          <thead><tr><th>เบอร์</th><th>ชื่อ</th><th>Campaign</th><th>การเชื่อมต่อ</th><th>ผล</th><th>สรุป</th><th>เวลาคุย</th><th>วันที่</th></tr></thead>
+          <tbody id="historyBody"><tr><td colspan="8" class="empty">กำลังโหลด...</td></tr></tbody>
         </table>
         <div style="text-align:center; margin-top:14px" id="historyLoadMoreWrap"></div>
+      </div>
+    </div>`,
+
+  lookup: () => `
+    <div class="card">
+      <div class="card-head"><h2>${icon('search')} ค้นหาเบอร์</h2></div>
+      <div class="card-body pad-top">
+        <p style="font-size:13px; color:var(--text-2); margin-bottom:14px">ดูข้อมูลทั้งหมดของเบอร์เดียว — สถานะ contact, Do-not-call list, และประวัติการโทรทุกครั้งในที่เดียว</p>
+        <div class="row">
+          <div class="search-wrap" style="max-width:280px">${icon('search')}<input id="lookupPhoneInput" type="tel" placeholder="กรอกเบอร์โทร เช่น 0812345678" onkeydown="if(event.key==='Enter') runLookup()"></div>
+          <button class="btn btn-accent" onclick="runLookup()">${icon('search')} ค้นหา</button>
+        </div>
+        <div id="lookupResult" style="margin-top:18px"></div>
       </div>
     </div>`,
 }
@@ -824,7 +891,7 @@ const INIT = {
     await loadCampaigns()
     await Promise.all([loadStats(), refreshActiveGlobal(true)])
   },
-  campaigns: async () => { await loadCampaigns() },
+  campaigns: async () => { await Promise.all([loadCampaigns(), loadStats('all')]); renderCampaignTable() },
   contacts: async () => {
     document.getElementById('addTabs').addEventListener('click', e => {
       const btn = e.target.closest('button'); if (!btn) return
@@ -841,6 +908,7 @@ const INIT = {
     await loadCampaigns()
     await loadLogs()
   },
+  lookup: async () => { await loadCampaigns() },
 }
 
 /* ==================== campaigns ==================== */
@@ -868,20 +936,26 @@ async function loadCampaigns(){
 function renderCampaignTable(){
   const tbody = document.getElementById('campaignTable')
   if (!tbody) return
-  if (!campaignsCache.length) { tbody.innerHTML = '<tr><td colspan="5" class="empty">ยังไม่มี campaign</td></tr>'; return }
-  tbody.innerHTML = campaignsCache.map(c => `
+  if (!campaignsCache.length) { tbody.innerHTML = '<tr><td colspan="6" class="empty">ยังไม่มี campaign</td></tr>'; return }
+  tbody.innerHTML = campaignsCache.map(c => {
+    const calls = (statsCache && statsCache.byCampaign && statsCache.byCampaign[c.id]) || 0
+    const interested = (statsCache && statsCache.interestedByCampaign && statsCache.interestedByCampaign[c.id]) || 0
+    const rate = calls ? Math.round(interested / calls * 100) : 0
+    return `
     <tr>
       <td><div style="font-weight:600">${esc(c.name)}</div><div class="num" style="font-size:11.5px;color:var(--text-3)">${esc(c.id)}</div></td>
       <td><span class="pill ${esc(c.status)}">${esc(c.status)}</span></td>
       <td style="color:var(--text-2)">${esc(c.type)}</td>
       <td class="num" style="color:var(--text-2); font-size:12px">${esc(c.voice_id)}</td>
+      <td class="num" style="color:var(--text-2); font-size:12.5px">${calls ? `${calls} สาย · ${rate}% สนใจ` : '—'}</td>
       <td>
         <div class="row" style="gap:2px; flex-wrap:nowrap">
           <button class="btn btn-ghost btn-sm" onclick="openCampaignEdit('${escJsAttr(c.id)}')">${icon('edit')} แก้ไข</button>
           <button class="btn btn-icon btn-sm" title="${c.status==='active'?'หยุด':'เริ่ม'}" onclick="${c.status==='active' ? `confirmStop('${escJsAttr(c.id)}')` : `confirmStart('${escJsAttr(c.id)}')`}">${icon(c.status==='active'?'pause':'play')}</button>
         </div>
       </td>
-    </tr>`).join('')
+    </tr>`
+  }).join('')
 }
 
 function campaignEditPanelHtml(c, isNew){
@@ -986,8 +1060,8 @@ function confirmStop(id){
 }
 
 /* ==================== dashboard ==================== */
-async function loadStats(){
-  const res = await apiFetch('/api/stats?days=' + historyDays)
+async function loadStats(days){
+  const res = await apiFetch('/api/stats?days=' + (days || historyDays))
   statsCache = await res.json()
   const setText = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v }
 
@@ -1140,16 +1214,68 @@ setInterval(() => { if (token) pollHealth() }, 30000)
 async function loadContacts(){
   const res = await apiFetch('/api/contacts')
   contactsCache = await res.json()
+  selectedContacts.clear()
+  updateContactsBulkBar()
   filterContacts('')
+}
+const selectedContacts = new Set()
+function updateContactsBulkBar(){
+  const bar = document.getElementById('contactsBulkBar')
+  if (!bar) return
+  bar.style.display = selectedContacts.size ? 'flex' : 'none'
+  const countEl = document.getElementById('contactsSelectedCount')
+  if (countEl) countEl.textContent = selectedContacts.size
+  const selectAll = document.getElementById('contactsSelectAll')
+  if (selectAll) selectAll.checked = contactsCache.length > 0 && selectedContacts.size === contactsCache.length
+}
+function toggleContactSelect(phone, checked){
+  if (checked) selectedContacts.add(phone); else selectedContacts.delete(phone)
+  updateContactsBulkBar()
+}
+function toggleSelectAllContacts(checked){
+  selectedContacts.clear()
+  if (checked) contactsCache.forEach(c => selectedContacts.add(c.phone))
+  updateContactsBulkBar()
+  filterContacts(document.getElementById('contactsSearchInput')?.value || '')
+}
+function clearContactsSelection(){ selectedContacts.clear(); updateContactsBulkBar(); filterContacts('') }
+function bulkBlockContacts(){
+  const phones = [...selectedContacts]
+  openConfirm({
+    title: `ห้ามโทร ${phones.length} เบอร์ที่เลือกถาวร?`,
+    message: 'เบอร์ทั้งหมดที่เลือกจะถูกเพิ่มเข้า Do-not-call list จะไม่ถูกโทรอีกในทุก campaign ต่อจากนี้',
+    confirmLabel: 'บล็อกทั้งหมด',
+    onConfirm: async () => {
+      await Promise.all(phones.map(phone => apiFetch('/api/blocklist', { method: 'POST', body: { phone, reason: 'bulk blocked from admin' } })))
+      toast(`บล็อก ${phones.length} เบอร์แล้ว`, 'danger')
+      selectedContacts.clear()
+      loadContacts()
+    }
+  })
+}
+function bulkDeleteContacts(){
+  const phones = [...selectedContacts]
+  openConfirm({
+    title: `ลบ ${phones.length} เบอร์ที่เลือก?`,
+    message: 'เบอร์ทั้งหมดที่เลือกจะถูกทำเครื่องหมายว่าลบแล้ว',
+    confirmLabel: 'ลบทั้งหมด',
+    onConfirm: async () => {
+      await Promise.all(phones.map(phone => apiFetch(`/api/contacts/${encodeURIComponent(phone)}`, { method: 'DELETE' })))
+      toast(`ลบ ${phones.length} เบอร์แล้ว`, 'danger')
+      selectedContacts.clear()
+      loadContacts()
+    }
+  })
 }
 function filterContacts(q){
   q = q.trim().toLowerCase()
   const rows = contactsCache.filter(c => !q || c.phone.includes(q) || (c.name||'').toLowerCase().includes(q))
   const body = document.getElementById('contactsTable')
   if (!body) return
-  if (!rows.length) { body.innerHTML = '<tr><td colspan="5" class="empty">ไม่พบข้อมูล</td></tr>'; return }
+  if (!rows.length) { body.innerHTML = '<tr><td colspan="6" class="empty">ไม่พบข้อมูล</td></tr>'; return }
   body.innerHTML = rows.map(c => `
     <tr>
+      <td><input type="checkbox" ${selectedContacts.has(c.phone)?'checked':''} onchange="toggleContactSelect('${escJsAttr(c.phone)}', this.checked)"></td>
       <td class="num">${esc(c.phone)}</td>
       <td>${esc(c.name)}</td>
       <td style="color:var(--text-2)">${esc((campaignsCache.find(x=>x.id===c.campaign)||{}).name || c.campaign)}</td>
@@ -1278,7 +1404,6 @@ async function testCall(){
 /* ==================== history ==================== */
 const HISTORY_PAGE_SIZE = 20
 let historyPage = 1
-let historyLocalQuery = ''
 
 async function loadLogs(){
   const campaignId = document.getElementById('logCampaignFilter').value
@@ -1286,38 +1411,59 @@ async function loadLogs(){
   const res = await apiFetch(url)
   historyCache = await res.json()
   historyPage = 1
-  historyLocalQuery = ''
   renderHistoryRows()
 }
-function filterHistoryLocal(q){ historyLocalQuery = q.trim().toLowerCase(); historyPage = 1; renderHistoryRows() }
+function historyFilterChanged(){ historyPage = 1; renderHistoryRows() }
 function loadMoreHistory(){ historyPage++; renderHistoryRows() }
+// ใช้ร่วมกันทั้งตารางและ CSV export เพื่อให้ export ตรงกับสิ่งที่กรองเห็นอยู่จริง
+function getFilteredHistory(){
+  const q = (document.getElementById('historySearchInput')?.value || '').trim().toLowerCase()
+  const outcomeFilter = document.getElementById('historyOutcomeFilter')?.value || ''
+  const dateFrom = document.getElementById('historyDateFrom')?.value || ''
+  const dateTo = document.getElementById('historyDateTo')?.value || ''
+  return historyCache.map((c,i) => ({...c, i})).filter(c => {
+    if (q && !((c.phone||'').includes(q) || (c.name||'').toLowerCase().includes(q))) return false
+    if (outcomeFilter && c.outcome !== outcomeFilter) return false
+    const day = (c.timestamp || '').slice(0, 10)
+    if (dateFrom && day < dateFrom) return false
+    if (dateTo && day > dateTo) return false
+    return true
+  })
+}
 function renderHistoryRows(){
-  const q = historyLocalQuery
-  const all = historyCache.map((c,i) => ({...c, i})).filter(c => !q || (c.phone||'').includes(q) || (c.name||'').toLowerCase().includes(q))
+  const all = getFilteredHistory()
   const shown = all.slice(0, historyPage * HISTORY_PAGE_SIZE)
   const body = document.getElementById('historyBody')
   if (!body) return
-  if (!shown.length) { body.innerHTML = '<tr><td colspan="7" class="empty">ไม่พบข้อมูล</td></tr>'; document.getElementById('historyLoadMoreWrap').innerHTML = ''; return }
-  body.innerHTML = shown.map(c => `
+  if (!shown.length) { body.innerHTML = '<tr><td colspan="8" class="empty">ไม่พบข้อมูล</td></tr>'; document.getElementById('historyLoadMoreWrap').innerHTML = ''; return }
+  body.innerHTML = shown.map(c => {
+    const needsFollowup = (c.next_action || '').trim() && c.next_action.trim() !== '-'
+    return `
     <tr class="clickable" onclick="openHistoryModal(${c.i})">
       <td class="num">${esc(c.phone)}</td>
       <td>${esc(c.name)}</td>
+      <td style="color:var(--text-2)">${esc(campaignName(c.campaign_id))}</td>
       <td><span class="pill ${esc(c.call_status)}">${esc(CALL_STATUS_LABELS[c.call_status] || c.call_status || '-')}</span></td>
-      <td>${c.outcome && c.outcome !== '-' ? `<span class="pill ${esc(c.outcome)}">${esc(c.outcome)}</span>` : '<span style="color:var(--text-3)">—</span>'}</td>
+      <td>
+        ${c.outcome && c.outcome !== '-' ? `<span class="pill ${esc(c.outcome)}">${esc(outcomeLabel(c.outcome))}</span>` : '<span style="color:var(--text-3)">—</span>'}
+        ${needsFollowup ? `<span title="${escAttr('ต้องติดตามต่อ: ' + c.next_action)}" style="margin-left:5px">📌</span>` : ''}
+      </td>
       <td style="color:var(--text-2)">${esc((c.summary||'').substring(0,40))}</td>
       <td class="num">${fmtDur(c.duration)}</td>
       <td class="num" style="color:var(--text-2); font-size:12.5px">${esc(fmtDate(c.timestamp))}</td>
-    </tr>`).join('')
+    </tr>`
+  }).join('')
   const wrap = document.getElementById('historyLoadMoreWrap')
   wrap.innerHTML = shown.length < all.length
     ? `<button class="btn btn-sm" onclick="loadMoreHistory()">โหลดเพิ่ม (เหลืออีก ${all.length - shown.length} รายการ)</button>`
-    : `<span style="font-size:12px; color:var(--text-3)">แสดงครบทั้งหมดแล้ว</span>`
+    : `<span style="font-size:12px; color:var(--text-3)">แสดงครบทั้งหมดแล้ว (${all.length} รายการ)</span>`
 }
 function exportHistoryCsv(){
-  if (!historyCache.length) { toast('ไม่มีข้อมูลให้ออกรายงาน', 'danger'); return }
-  const cols = ['phone','name','call_status','outcome','summary','key_points','next_action','duration','timestamp']
+  const rows = getFilteredHistory()
+  if (!rows.length) { toast('ไม่มีข้อมูลให้ออกรายงาน', 'danger'); return }
+  const cols = ['phone','name','campaign_id','call_status','outcome','summary','key_points','next_action','duration','timestamp']
   const escCsv = v => `"${String(v==null?'':v).replace(/"/g,'""')}"`
-  const lines = [cols.join(',')].concat(historyCache.map(c => cols.map(k => escCsv(c[k])).join(',')))
+  const lines = [cols.join(',')].concat(rows.map(c => cols.map(k => escCsv(c[k])).join(',')))
   const blob = new Blob(['﻿' + lines.join('\n')], { type: 'text/csv;charset=utf-8' })
   const url = URL.createObjectURL(blob)
   const a = document.createElement('a')
@@ -1326,6 +1472,63 @@ function exportHistoryCsv(){
   a.click()
   URL.revokeObjectURL(url)
   toast('ออกรายงาน CSV แล้ว')
+}
+
+/* ==================== lookup ==================== */
+async function runLookup(){
+  const raw = document.getElementById('lookupPhoneInput').value.trim()
+  const resultEl = document.getElementById('lookupResult')
+  if (!raw) { resultEl.innerHTML = '<div class="empty">กรอกเบอร์โทรก่อนค้นหา</div>'; return }
+  resultEl.innerHTML = '<div class="empty">กำลังค้นหา...</div>'
+  try {
+    const res = await apiFetch('/api/lookup/' + encodeURIComponent(raw))
+    if (!res.ok) { resultEl.innerHTML = '<div class="empty">ค้นหาไม่สำเร็จ</div>'; return }
+    const data = await res.json()
+    renderLookupResult(raw, data)
+  } catch (e) {
+    resultEl.innerHTML = '<div class="empty">ค้นหาไม่สำเร็จ</div>'
+  }
+}
+function renderLookupResult(phone, data){
+  const { contact, blocked, calls } = data || {}
+  const resultEl = document.getElementById('lookupResult')
+  // ให้ openHistoryModal เปิดจากรายการนี้ได้เลย เหมือนหน้าประวัติการโทร (ใช้ index อ้างอิงตัวเดียวกัน)
+  historyCache = calls || []
+
+  const contactCard = contact ? `
+    <div class="modal-meta" style="border-radius:var(--radius-sm); margin-bottom:14px">
+      <div><div class="k">ชื่อ</div><div class="v">${esc(contact.name) || '—'}</div></div>
+      <div><div class="k">Campaign</div><div class="v">${esc(campaignName(contact.campaign))}</div></div>
+      <div><div class="k">สถานะ</div><div class="v">${contact.status === 'retry_pending'
+        ? `<span class="pill retry_pending">รอโทรซ้ำ (${esc(contact.retry_count||0)}/3)</span>`
+        : `<span class="pill ${esc(contact.status)}">${esc(contact.status)}</span>`}</div></div>
+      ${contact.next_attempt_at ? `<div><div class="k">โทรซ้ำครั้งถัดไป</div><div class="v">${esc(fmtDate(contact.next_attempt_at))}</div></div>` : ''}
+    </div>` : `<div class="empty" style="margin-bottom:14px">ไม่พบเบอร์นี้ใน Contacts (แต่ยังดูประวัติการโทรได้ถ้ามี)</div>`
+
+  const blockBadge = blocked
+    ? `<div class="row" style="background:var(--danger-soft); color:var(--danger); border-radius:var(--radius-sm); padding:10px 14px; margin-bottom:14px; font-size:13px; font-weight:600">${icon('block')} เบอร์นี้อยู่ใน Do-not-call list — จะไม่ถูกโทรอีก</div>`
+    : ''
+
+  const historyRows = (calls && calls.length) ? calls.map((c,i) => `
+    <tr class="clickable" onclick="openHistoryModal(${i})">
+      <td style="color:var(--text-2)">${esc(campaignName(c.campaign_id))}</td>
+      <td><span class="pill ${esc(c.call_status)}">${esc(CALL_STATUS_LABELS[c.call_status] || c.call_status || '-')}</span></td>
+      <td>${c.outcome && c.outcome !== '-' ? `<span class="pill ${esc(c.outcome)}">${esc(outcomeLabel(c.outcome))}</span>` : '<span style="color:var(--text-3)">—</span>'}</td>
+      <td class="num">${fmtDur(c.duration)}</td>
+      <td class="num" style="color:var(--text-2); font-size:12.5px">${esc(fmtDate(c.timestamp))}</td>
+    </tr>`).join('') : '<tr><td colspan="5" class="empty">ยังไม่เคยโทรเบอร์นี้</td></tr>'
+
+  resultEl.innerHTML = `
+    ${contactCard}
+    ${blockBadge}
+    <h3 style="font-size:14.5px; margin-bottom:10px">ประวัติการโทร (${calls ? calls.length : 0} ครั้ง)</h3>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>Campaign</th><th>การเชื่อมต่อ</th><th>ผล</th><th>เวลาคุย</th><th>วันที่</th></tr></thead>
+        <tbody>${historyRows}</tbody>
+      </table>
+    </div>
+    ${!blocked ? `<div class="row" style="margin-top:14px"><button class="btn btn-sm btn-ghost danger" onclick="confirmBlockContact('${escJsAttr(phone)}')">${icon('block')} เพิ่มเข้า Do-not-call list</button></div>` : ''}`
 }
 
 /* ==================== boot ==================== */

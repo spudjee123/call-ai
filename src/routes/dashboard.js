@@ -3,6 +3,7 @@ const { sheetsService } = require('../services/googleSheets')
 const callSessions = require('../utils/callSessions')
 const twilioService = require('../services/twilio')
 const healthMonitor = require('../utils/healthMonitor')
+const { normalizePhone } = require('../utils/phone')
 
 module.exports = async function dashboardRoutes(fastify) {
 
@@ -41,10 +42,12 @@ module.exports = async function dashboardRoutes(fastify) {
     })
   })
 
-  // สถิติ summary — ?days=7|30|90
+  // สถิติ summary — ?days=7|30|90 หรือ ?days=all (ยอดสะสมทั้งหมด ไม่ผูกกับช่วงวัน)
   fastify.get('/api/stats', async (req, reply) => {
-    const days = Number(req.query.days) || 7
-    const stats = await sheetsService.getStats({ days })
+    const raw = req.query.days
+    const stats = raw === 'all'
+      ? await sheetsService.getStats({ allTime: true })
+      : await sheetsService.getStats({ days: Number(raw) || 7 })
     return reply.send(stats)
   })
 
@@ -64,6 +67,17 @@ module.exports = async function dashboardRoutes(fastify) {
   // สถานะระบบ — TTS/STT/AI error ล่าสุดในช่วง 10 นาทีที่ผ่านมา
   fastify.get('/api/health/status', async (req, reply) => {
     return reply.send(healthMonitor.getStatus())
+  })
+
+  // รวมข้อมูลทุกอย่างของเบอร์เดียวไว้จุดเดียว — contact, สถานะ blocklist, ประวัติการโทรทั้งหมด
+  fastify.get('/api/lookup/:phone', async (req, reply) => {
+    const phone = normalizePhone(req.params.phone)
+    const [contact, blocked, calls] = await Promise.all([
+      sheetsService.getContact(phone),
+      sheetsService.isBlocked(phone),
+      sheetsService.getCallResults({ phone, limit: 200 }),
+    ])
+    return reply.send({ contact, blocked, calls })
   })
 
   // Proxy ไฟล์บันทึกเสียงจาก Twilio (ต้อง Basic Auth ด้วย Account SID/Auth Token ที่ frontend ไม่ควรถือ)

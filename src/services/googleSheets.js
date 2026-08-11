@@ -213,18 +213,26 @@ const sheetsService = {
     return tmpl ? tmpl.template_text : null
   },
 
-  async getCallResults({ limit = 50, campaignId } = {}) {
+  async getCallResults({ limit = 50, campaignId, phone } = {}) {
     const rows = await getRows(SHEETS.RESULTS)
-    let filtered = campaignId ? rows.filter(r => r.campaign_id === campaignId) : rows
+    let filtered = rows
+    if (campaignId) filtered = filtered.filter(r => r.campaign_id === campaignId)
+    if (phone) filtered = filtered.filter(r => r.phone === phone)
     return filtered.slice(-limit).reverse()
   },
 
-  async getStats({ days = 7 } = {}) {
+  // allTime: true ใช้ตอนต้องการยอดสะสมทั้งหมดไม่ผูกกับตัวกรองวัน (เช่นสถิติต่อ campaign ในหน้า Campaigns)
+  async getStats({ days = 7, allTime = false } = {}) {
     const rows = await getRows(SHEETS.RESULTS)
-    const total = rows.length
+    const today = new Date().toISOString().slice(0, 10)
+    const cutoff = new Date(Date.now() - (days - 1) * 86400000).toISOString().slice(0, 10)
+    // total/outcomes/byCampaign/avgDuration/conversionRate ผูกกับช่วงวันที่เลือกจริง (เดิมไม่ผูก ทำให้ตัวเลขไม่ตรงกับกราฟที่กรองอยู่)
+    const filteredRows = allTime ? rows : rows.filter(r => (r.timestamp || '').slice(0, 10) >= cutoff)
+
+    const total = filteredRows.length
     const outcomes = {}
     const byCampaign = {}
-    const today = new Date().toISOString().slice(0, 10)
+    const interestedByCampaign = {}
     let durationSum = 0
     let durationCount = 0
     let callsToday = 0
@@ -236,13 +244,19 @@ const sheetsService = {
     }
     const bucketMap = new Map(dayBuckets.map(b => [b.key, b]))
 
-    rows.forEach(r => {
+    filteredRows.forEach(r => {
       outcomes[r.outcome] = (outcomes[r.outcome] || 0) + 1
-      if (r.campaign_id) byCampaign[r.campaign_id] = (byCampaign[r.campaign_id] || 0) + 1
+      if (r.campaign_id) {
+        byCampaign[r.campaign_id] = (byCampaign[r.campaign_id] || 0) + 1
+        if (r.outcome === 'interested') interestedByCampaign[r.campaign_id] = (interestedByCampaign[r.campaign_id] || 0) + 1
+      }
       const duration = Number(r.duration)
       if (!Number.isNaN(duration) && duration > 0) { durationSum += duration; durationCount++ }
-      if ((r.timestamp || '').startsWith(today)) callsToday++
+    })
 
+    // callsToday และกราฟรายวัน อิงจากข้อมูลทั้งหมดเสมอ ไม่ขึ้นกับตัวกรองช่วงวัน (bucket ของกราฟกรองตัวเองอยู่แล้วผ่าน dayBuckets)
+    rows.forEach(r => {
+      if ((r.timestamp || '').startsWith(today)) callsToday++
       const bucket = bucketMap.get((r.timestamp || '').slice(0, 10))
       if (bucket) {
         bucket.calls++
@@ -254,7 +268,7 @@ const sheetsService = {
     const conversionRate = total ? Math.round(((outcomes.interested || 0) / total) * 1000) / 10 : 0
 
     return {
-      total, outcomes, byCampaign, avgDuration, callsToday, conversionRate,
+      total, outcomes, byCampaign, interestedByCampaign, avgDuration, callsToday, conversionRate,
       dailyTrend: {
         labels: dayBuckets.map(b => b.key),
         calls: dayBuckets.map(b => b.calls),

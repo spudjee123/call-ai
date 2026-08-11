@@ -1,6 +1,6 @@
 const { sheetsService } = require('../services/googleSheets')
 const { callQueue } = require('../utils/callQueue')
-const { isValidPhone } = require('../utils/phone')
+const { isValidPhone, normalizePhone } = require('../utils/phone')
 
 module.exports = async function campaignRoutes(fastify) {
 
@@ -38,7 +38,8 @@ module.exports = async function campaignRoutes(fastify) {
 
   // ยิงโทรทดสอบเบอร์เดียว — ใช้ pipeline เดียวกับ campaign จริง แต่ไม่แตะ Contacts sheet
   fastify.post('/api/calls/test', async (req, reply) => {
-    const { phone, name, campaignId } = req.body || {}
+    const { name, campaignId } = req.body || {}
+    const phone = normalizePhone(req.body?.phone)
     if (!phone || !campaignId) {
       return reply.code(400).send({ error: 'phone and campaignId required' })
     }
