@@ -54,7 +54,21 @@
       "Bash(rm -f /c/Users/PC/AppData/Local/Temp/claude/e----------Call-Ai/8e7b48a4-2349-4f7d-b713-7906ad8d117c/scratchpad/mock_check2.js)",
       "Bash(node --check src/services/claude.js)",
       "Bash(node --check /c/Users/PC/AppData/Local/Temp/claude/e----------Call-Ai/8e7b48a4-2349-4f7d-b713-7906ad8d117c/scratchpad/mock_check3.js)",
-      "Bash(rm -f /c/Users/PC/AppData/Local/Temp/claude/e----------Call-Ai/8e7b48a4-2349-4f7d-b713-7906ad8d117c/scratchpad/mock_check3.js)"
+      "Bash(rm -f /c/Users/PC/AppData/Local/Temp/claude/e----------Call-Ai/8e7b48a4-2349-4f7d-b713-7906ad8d117c/scratchpad/mock_check3.js)",
+      "Bash(node --check src/routes/contacts.js)",
+      "Bash(node -e \"require\\('./src/routes/contacts'\\); console.log\\('loads OK'\\)\")",
+      "Bash(node --check /c/Users/PC/AppData/Local/Temp/claude/e----------Call-Ai/8e7b48a4-2349-4f7d-b713-7906ad8d117c/scratchpad/mock_check4.js)",
+      "Bash(rm -f /c/Users/PC/AppData/Local/Temp/claude/e----------Call-Ai/8e7b48a4-2349-4f7d-b713-7906ad8d117c/scratchpad/mock_check4.js)",
+      "Bash(git diff *)",
+      "Read(//tmp/**)",
+      "Bash(cat /tmp/diff_working.txt)",
+      "Bash(cd \"e:\\\\โปรแกรม\\\\Call Ai\" && find . -iname \"CLAUDE.md\" -not -path \"*/node_modules/*\" 2>/dev/null; ls ~/.claude/CLAUDE.md 2>/dev/null; echo done)",
+      "Read(//c/Users/PC/.claude/**)",
+      "Bash(node --check src/utils/callQueue.js)",
+      "Bash(node -e \"require\\('./src/utils/callQueue'\\); require\\('./src/routes/contacts'\\); console.log\\('load OK, no circular dep issues'\\)\")"
+    ],
+    "additionalDirectories": [
+      "C:\\Users\\PC\\AppData\\Local\\Temp\\claude\\e----------Call-Ai\\8e7b48a4-2349-4f7d-b713-7906ad8d117c\\scratchpad"
     ]
   }
 }

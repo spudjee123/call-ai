@@ -1,5 +1,6 @@
 const { sheetsService } = require('../services/googleSheets')
 const { isValidPhone, normalizePhone } = require('../utils/phone')
+const { callQueue } = require('../utils/callQueue')
 
 module.exports = async function contactsRoutes(fastify) {
 
@@ -38,6 +39,34 @@ module.exports = async function contactsRoutes(fastify) {
 
     await sheetsService.addContactsBulk(rows)
     return reply.send({ message: 'Contacts imported', count: rows.length })
+  })
+
+  // โทรออกหลายเบอร์ที่เลือกพร้อมกัน — เข้าคิวเดียวกับ campaign จริง (คุมสูงสุด MAX_CONCURRENT_CALLS สายพร้อมกัน)
+  // ใช้ campaign ที่ผูกกับแต่ละ contact อยู่แล้วในชีต ไม่ต้องเลือกใหม่
+  fastify.post('/api/contacts/call', async (req, reply) => {
+    const phones = Array.isArray(req.body?.phones) ? req.body.phones.map(normalizePhone) : []
+    if (!phones.length) return reply.code(400).send({ error: 'phones[] required' })
+
+    // ดึงทีเดียวแล้ว lookup ใน memory — กันยิง Sheets API ทีละเบอร์ (ช้า + เสี่ยงชน quota เวลาเลือกเยอะๆ)
+    // และกันเคส error กลางลูปหลังจากโทรบางเบอร์ไปแล้ว (ผู้ใช้กด retry ซ้ำจะโทรซ้ำเบอร์เดิม)
+    const [allContacts, allCampaigns] = await Promise.all([
+      sheetsService.getContacts(),
+      sheetsService.getCampaigns(),
+    ])
+    const contactByPhone = new Map(allContacts.map(c => [c.phone, c]))
+    const campaignById = new Map(allCampaigns.map(c => [c.id, c]))
+
+    let queued = 0
+    const skipped = []
+    for (const phone of phones) {
+      const contact = contactByPhone.get(phone)
+      if (!contact || contact.status === 'deleted') { skipped.push(phone); continue }
+      const campaign = campaignById.get(contact.campaign)
+      if (!campaign) { skipped.push(phone); continue }
+      callQueue.add({ contact, campaign })
+      queued++
+    }
+    return reply.send({ message: 'Queued', queued, skipped })
   })
 
   // Do-not-call list

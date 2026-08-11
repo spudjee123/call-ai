@@ -812,6 +812,7 @@ const TEMPLATES = {
         <div class="row" id="contactsBulkBar" style="display:none; margin-bottom:12px; justify-content:space-between; background:var(--surface-2); border:1px solid var(--glass-border); border-radius:var(--radius-sm); padding:10px 14px">
           <span style="font-size:13px; color:var(--text-2)"><b id="contactsSelectedCount">0</b> เบอร์ที่เลือก</span>
           <div class="row" style="gap:6px">
+            <button class="btn btn-sm btn-accent" onclick="bulkCallContacts()">${icon('test')} โทรที่เลือก</button>
             <button class="btn btn-sm btn-ghost danger" onclick="bulkBlockContacts()">${icon('block')} บล็อกที่เลือก</button>
             <button class="btn btn-sm btn-danger" onclick="bulkDeleteContacts()">${icon('trash')} ลบที่เลือก</button>
             <button class="btn btn-sm btn-ghost" onclick="clearContactsSelection()">ยกเลิกเลือก</button>
@@ -1251,6 +1252,22 @@ function toggleSelectAllContacts(checked){
   filterContacts(document.getElementById('contactsSearchInput')?.value || '')
 }
 function clearContactsSelection(){ selectedContacts.clear(); updateContactsBulkBar(); filterContacts('') }
+function bulkCallContacts(){
+  const phones = [...selectedContacts]
+  openConfirm({
+    title: `โทรออก ${phones.length} เบอร์ที่เลือก?`,
+    message: 'แต่ละเบอร์จะโทรตาม Campaign ที่ผูกไว้อยู่แล้ว เข้าคิวเดียวกับระบบจริง (โทรพร้อมกันสูงสุดตามที่ตั้งไว้ ที่เหลือรอคิว) มีค่าใช้จ่ายจริงต่อสาย',
+    confirmLabel: 'เริ่มโทร', danger: false,
+    onConfirm: async () => {
+      const res = await apiFetch('/api/contacts/call', { method: 'POST', body: { phones } })
+      const data = await res.json()
+      if (!res.ok) { toast(data.error || 'โทรไม่สำเร็จ', 'danger'); return }
+      toast(`เข้าคิวโทร ${data.queued} เบอร์แล้ว${data.skipped?.length ? ` (ข้าม ${data.skipped.length} เบอร์ — ไม่พบเบอร์หรือไม่มี campaign)` : ''}`)
+      selectedContacts.clear()
+      loadContacts()
+    }
+  })
+}
 function bulkBlockContacts(){
   const phones = [...selectedContacts]
   openConfirm({

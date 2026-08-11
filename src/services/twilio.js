@@ -8,7 +8,7 @@ const healthMonitor = require('../utils/healthMonitor')
 const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
 
 
-async function makeOutboundCall(contact, campaign) {
+async function makeOutboundCall(contact, campaign, onCallCreated) {
   if (await sheetsService.isBlocked(contact.phone)) {
     console.log(`[Twilio] Skipped ${contact.phone} — อยู่ใน Do-not-call list`)
     return null
@@ -52,6 +52,7 @@ async function makeOutboundCall(contact, campaign) {
 
   session.callSid = call.sid
   callSessions.set(call.sid, session)
+  onCallCreated?.(call) // แจ้งทันทีที่มี callSid จริง — ก่อนรอ greeting pregen เสร็จ (กัน race กับ webhook สถานะที่อาจมาเร็วกว่า)
 
   // ถ้า pre-gen ยังไม่เสร็จตอน call เชื่อมต่อ รอต่ออีกนิด
   await greetingPromise.catch(() => {})

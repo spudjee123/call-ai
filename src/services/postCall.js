@@ -2,11 +2,13 @@ const { v4: uuidv4 } = require('uuid')
 const { summarizeCall } = require('./claude')
 const { sheetsService } = require('./googleSheets')
 const { sendSms } = require('./twilio')
+const { callQueue } = require('../utils/callQueue')
 
 const MAX_RETRIES = 3
 const RETRY_DELAY_MS = 4 * 60 * 60 * 1000 // 4 ชั่วโมง
 
 async function postCallHandler(callSid, callStatus, duration, session) {
+  // สายจบจริงแล้ว (ไม่ว่าจะสำเร็จหรือ error ระหว่างประมวลผล) — คืน slot คิวให้โทรเบอร์ถัดไปได้เสมอ
   try {
     console.log(`[PostCall] Processing ${callSid} status=${callStatus}`)
 
@@ -61,6 +63,8 @@ async function postCallHandler(callSid, callStatus, duration, session) {
     console.log(`[PostCall] Done ${callSid} → ${outcome}`)
   } catch (err) {
     console.error(`[PostCall] Error for ${callSid}:`, err.message)
+  } finally {
+    callQueue.release(callSid)
   }
 }
 
