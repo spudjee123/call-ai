@@ -451,6 +451,7 @@
       </button>
     </div>
     <div class="modal-meta" id="modalMeta"></div>
+    <div id="modalRecording"></div>
     <div class="modal-messages" id="modalMessages"></div>
   </div>
 </div>
@@ -600,7 +601,27 @@ function openHistoryModal(i){
     <div><div class="k">สรุป</div><div class="v">${esc(c.summary) || '-'}</div></div>
     <div><div class="k">สิ่งที่ควรทำต่อ</div><div class="v">${esc(c.next_action) || '-'}</div></div>`
   document.getElementById('modalMessages').innerHTML = renderBubbles(parseTranscript(c.transcript))
+  renderRecordingSlot(c.recording_url)
   document.getElementById('modalOverlay').classList.add('open')
+}
+function renderRecordingSlot(recordingUrl){
+  const el = document.getElementById('modalRecording')
+  if (!recordingUrl) { el.innerHTML = ''; return }
+  el.innerHTML = `<div class="row" style="align-items:center; gap:8px; margin:10px 0"><span style="font-size:12px; color:var(--text-2)">🎧 บันทึกเสียงสาย</span><span id="recordingStatus" style="font-size:12px; color:var(--text-3)">กำลังโหลด...</span></div>`
+  loadRecording(recordingUrl)
+}
+async function loadRecording(recordingUrl){
+  const statusEl = document.getElementById('recordingStatus')
+  try {
+    const res = await apiFetch('/api/recordings/proxy?url=' + encodeURIComponent(recordingUrl))
+    if (!res.ok) throw new Error('fetch failed')
+    const blob = await res.blob()
+    const el = document.getElementById('modalRecording')
+    if (!el) return // ปิด modal ไปแล้วระหว่างโหลด
+    el.innerHTML = `<audio controls style="width:100%; margin:10px 0" src="${URL.createObjectURL(blob)}"></audio>`
+  } catch (e) {
+    if (statusEl) statusEl.textContent = 'โหลดไฟล์เสียงไม่สำเร็จ'
+  }
 }
 async function loadLiveMessages(callSid){
   try {
@@ -616,6 +637,7 @@ function openLiveModal(callSid, phone, name){
   stopLivePolling()
   document.getElementById('modalTitle').textContent = `${name || ''} — ${phone || ''}`
   document.getElementById('modalMeta').innerHTML = `<div><div class="k">สถานะ</div><div class="v" style="color:var(--success)">● กำลังคุยอยู่สด</div></div>`
+  document.getElementById('modalRecording').innerHTML = ''
   document.getElementById('modalMessages').innerHTML = '<div class="empty">กำลังโหลด...</div>'
   document.getElementById('modalOverlay').classList.add('open')
   loadLiveMessages(callSid)

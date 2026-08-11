@@ -3,6 +3,16 @@ const { v4: uuidv4 } = require('uuid')
 const { sheetsService } = require('../services/googleSheets')
 const callSessions = require('../utils/callSessions')
 
+// เริ่มบันทึกเสียงทั้งสาย (สองแชนแนลแยก AI/ลูกค้า) แบบขนานกับ media stream — ไม่บล็อก TwiML ที่เหลือ
+function addRecording(twiml) {
+  twiml.start().recording({
+    recordingChannels: 'dual',
+    recordingStatusCallback: `${process.env.BASE_URL}/webhook/recording`,
+    recordingStatusCallbackMethod: 'POST',
+    trim: 'do-not-trim',
+  })
+}
+
 module.exports = async function webhookRoutes(fastify) {
 
   // Twilio โทรออกแล้วลูกค้ารับสาย
@@ -15,6 +25,7 @@ module.exports = async function webhookRoutes(fastify) {
     const wsUrl = `${process.env.BASE_URL.replace(/^http/, 'ws')}/stream?callSid=${callSid}`
 
     const twiml = new twilio.twiml.VoiceResponse()
+    addRecording(twiml)
     const connect = twiml.connect()
     connect.stream({ url: wsUrl })
 
@@ -42,11 +53,27 @@ module.exports = async function webhookRoutes(fastify) {
     const wsUrl = `${process.env.BASE_URL.replace(/^http/, 'ws')}/stream?callSid=${callSid}`
 
     const twiml = new twilio.twiml.VoiceResponse()
+    addRecording(twiml)
     const connect = twiml.connect()
     connect.stream({ url: wsUrl })
 
     reply.header('Content-Type', 'text/xml')
     return reply.send(twiml.toString())
+  })
+
+  // Twilio แจ้งว่าไฟล์บันทึกเสียงพร้อมแล้ว — ผูกกับแถวผลการโทรผ่าน call_sid
+  // (มักมาถึงหลัง webhook/status สักพัก เพราะ Twilio ต้อง process ไฟล์เสียงก่อน)
+  fastify.post('/webhook/recording', async (req, reply) => {
+    const { CallSid, RecordingUrl, RecordingStatus } = req.body
+    if (RecordingStatus === 'completed' && CallSid && RecordingUrl) {
+      try {
+        const saved = await sheetsService.saveRecordingUrl(CallSid, RecordingUrl)
+        if (!saved) console.warn(`[Recording] ไม่พบแถวผลการโทรสำหรับ callSid=${CallSid}`)
+      } catch (err) {
+        console.error('[Recording] Save error:', err.message)
+      }
+    }
+    return reply.send({ ok: true })
   })
 
   // Twilio แจ้งสถานะสาย (วางสาย, ไม่รับ ฯลฯ)

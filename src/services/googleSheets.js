@@ -202,6 +202,11 @@ const sheetsService = {
     await appendRowByFields(SHEETS.RESULTS, { ...result, timestamp: new Date().toISOString() })
   },
 
+  // ผูก URL ไฟล์บันทึกเสียงเข้ากับแถวผลการโทรที่มีอยู่แล้ว (เรียกจาก recordingStatusCallback ของ Twilio)
+  async saveRecordingUrl(callSid, recordingUrl) {
+    return updateRowByKey(SHEETS.RESULTS, 'call_sid', callSid, { recording_url: recordingUrl })
+  },
+
   async getSmsTemplate(outcome) {
     const rows = await getRows(SHEETS.TEMPLATES)
     const tmpl = rows.find(r => r.outcome === outcome)

@@ -34,6 +34,7 @@ async function postCallHandler(callSid, callStatus, duration, session) {
     // บันทึกผลใน Google Sheets — แยก call_status (เชื่อมสายได้ไหม) ออกจาก outcome (ผลลัพธ์เชิงธุรกิจ)
     await sheetsService.saveCallResult({
       call_id: uuidv4(),
+      call_sid: callSid,
       phone: session.phone,
       name: session.name,
       campaign_id: session.campaign?.id || '',

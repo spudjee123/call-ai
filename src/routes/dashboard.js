@@ -1,3 +1,4 @@
+const axios = require('axios')
 const { sheetsService } = require('../services/googleSheets')
 const callSessions = require('../utils/callSessions')
 const twilioService = require('../services/twilio')
@@ -63,5 +64,24 @@ module.exports = async function dashboardRoutes(fastify) {
   // สถานะระบบ — TTS/STT/AI error ล่าสุดในช่วง 10 นาทีที่ผ่านมา
   fastify.get('/api/health/status', async (req, reply) => {
     return reply.send(healthMonitor.getStatus())
+  })
+
+  // Proxy ไฟล์บันทึกเสียงจาก Twilio (ต้อง Basic Auth ด้วย Account SID/Auth Token ที่ frontend ไม่ควรถือ)
+  fastify.get('/api/recordings/proxy', async (req, reply) => {
+    const { url } = req.query
+    const prefix = `https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_ACCOUNT_SID}/Recordings/`
+    if (!url || !url.startsWith(prefix)) {
+      return reply.code(400).send({ error: 'Invalid recording url' })
+    }
+    try {
+      const twilioRes = await axios.get(`${url}.mp3`, {
+        auth: { username: process.env.TWILIO_ACCOUNT_SID, password: process.env.TWILIO_AUTH_TOKEN },
+        responseType: 'stream',
+      })
+      reply.header('Content-Type', 'audio/mpeg')
+      return reply.send(twilioRes.data)
+    } catch (err) {
+      return reply.code(502).send({ error: 'Fetch recording failed' })
+    }
   })
 }
