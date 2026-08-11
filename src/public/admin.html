@@ -336,6 +336,10 @@
   .modal-meta { padding: 14px 22px; background: var(--surface-2); border-bottom: 1px solid var(--glass-border); display: grid; grid-template-columns: repeat(auto-fit, minmax(150px,1fr)); gap: 10px; }
   .modal-meta .k { font-size: 11px; color: var(--text-3); text-transform: uppercase; letter-spacing: .03em; margin-bottom: 3px; }
   .modal-meta .v { font-size: 13.5px; font-weight: 600; }
+  /* ข้อความยาว (สรุป/ประเด็นสำคัญ/สิ่งที่ควรทำต่อ) แยกออกมาเป็น block เต็มความกว้าง ไม่บีบอยู่ใน grid แคบๆ ของ .modal-meta */
+  .modal-notes { padding: 14px 22px; background: var(--surface-2); border-bottom: 1px solid var(--glass-border); display: flex; flex-direction: column; gap: 12px; }
+  .note-block .k { font-size: 11px; color: var(--text-3); text-transform: uppercase; letter-spacing: .03em; margin-bottom: 5px; }
+  .note-block .v { font-size: 13.5px; line-height: 1.65; white-space: pre-wrap; word-break: break-word; }
   .modal-messages { padding: 18px 22px; overflow-y: auto; flex: 1; display: flex; flex-direction: column; gap: 10px; }
   .bubble { max-width: 74%; padding: 10px 14px; border-radius: 16px; font-size: 13.5px; line-height: 1.5; }
   .bubble.ai { align-self: flex-start; background: var(--surface-2); border: 1px solid var(--glass-border); border-bottom-left-radius: 5px; }
@@ -454,6 +458,7 @@
       </button>
     </div>
     <div class="modal-meta" id="modalMeta"></div>
+    <div class="modal-notes" id="modalNotes"></div>
     <div id="modalRecording"></div>
     <div class="modal-messages" id="modalMessages"></div>
   </div>
@@ -625,9 +630,15 @@ function openHistoryModal(i){
     <div><div class="k">การเชื่อมต่อ</div><div class="v"><span class="pill ${esc(c.call_status)}">${esc(CALL_STATUS_LABELS[c.call_status] || c.call_status)}</span></div></div>
     <div><div class="k">ผล</div><div class="v">${c.outcome && c.outcome!=='-' ? `<span class="pill ${esc(c.outcome)}">${esc(outcomeLabel(c.outcome))}</span>` : '—'}</div></div>
     <div><div class="k">วางสายโดย</div><div class="v">${c.hangup_reason ? esc(HANGUP_LABELS[c.hangup_reason]||c.hangup_reason) : '—'}</div></div>
-    <div><div class="k">เวลาคุย</div><div class="v num">${fmtDur(c.duration)}</div></div>
-    <div><div class="k">สรุป</div><div class="v">${esc(c.summary) || '-'}</div></div>
-    <div><div class="k">สิ่งที่ควรทำต่อ</div><div class="v">${esc(c.next_action) || '-'}</div></div>`
+    <div><div class="k">เวลาคุย</div><div class="v num">${fmtDur(c.duration)}</div></div>`
+  const notes = [
+    ['สรุป', c.summary],
+    ['ประเด็นสำคัญ', c.key_points],
+    ['สิ่งที่ควรทำต่อ', c.next_action],
+  ].filter(([, v]) => v && v.trim())
+  document.getElementById('modalNotes').innerHTML = notes.length
+    ? notes.map(([k,v]) => `<div class="note-block"><div class="k">${esc(k)}</div><div class="v">${esc(v)}</div></div>`).join('')
+    : ''
   document.getElementById('modalMessages').innerHTML = renderBubbles(parseTranscript(c.transcript))
   renderRecordingSlot(c.recording_url)
   document.getElementById('modalOverlay').classList.add('open')
@@ -665,6 +676,7 @@ function openLiveModal(callSid, phone, name){
   stopLivePolling()
   document.getElementById('modalTitle').textContent = `${name || ''} — ${phone || ''}`
   document.getElementById('modalMeta').innerHTML = `<div><div class="k">สถานะ</div><div class="v" style="color:var(--success)">● กำลังคุยอยู่สด</div></div>`
+  document.getElementById('modalNotes').innerHTML = ''
   document.getElementById('modalRecording').innerHTML = ''
   document.getElementById('modalMessages').innerHTML = '<div class="empty">กำลังโหลด...</div>'
   document.getElementById('modalOverlay').classList.add('open')

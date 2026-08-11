@@ -51,7 +51,10 @@
       "Bash(node --check /c/Users/PC/AppData/Local/Temp/claude/e----------Call-Ai/8e7b48a4-2349-4f7d-b713-7906ad8d117c/scratchpad/mock_check.js)",
       "Bash(rm -f /c/Users/PC/AppData/Local/Temp/claude/e----------Call-Ai/8e7b48a4-2349-4f7d-b713-7906ad8d117c/scratchpad/mock_check.js)",
       "Bash(node --check /c/Users/PC/AppData/Local/Temp/claude/e----------Call-Ai/8e7b48a4-2349-4f7d-b713-7906ad8d117c/scratchpad/mock_check2.js)",
-      "Bash(rm -f /c/Users/PC/AppData/Local/Temp/claude/e----------Call-Ai/8e7b48a4-2349-4f7d-b713-7906ad8d117c/scratchpad/mock_check2.js)"
+      "Bash(rm -f /c/Users/PC/AppData/Local/Temp/claude/e----------Call-Ai/8e7b48a4-2349-4f7d-b713-7906ad8d117c/scratchpad/mock_check2.js)",
+      "Bash(node --check src/services/claude.js)",
+      "Bash(node --check /c/Users/PC/AppData/Local/Temp/claude/e----------Call-Ai/8e7b48a4-2349-4f7d-b713-7906ad8d117c/scratchpad/mock_check3.js)",
+      "Bash(rm -f /c/Users/PC/AppData/Local/Temp/claude/e----------Call-Ai/8e7b48a4-2349-4f7d-b713-7906ad8d117c/scratchpad/mock_check3.js)"
     ]
   }
 }

@@ -30,7 +30,7 @@ async function summarizeCall(session) {
       content: `วิเคราะห์บทสนทนานี้และตอบในรูปแบบ JSON:
 ${transcript}
 
-ตอบแบบนี้เท่านั้น:
+ตอบเป็น JSON ดิบเท่านั้น ห้ามใช้ code block หรือ \`\`\` ห้ามมีข้อความอื่นนอกเหนือจาก JSON:
 {
   "outcome": "interested | not_interested | callback | no_answer | angry",
   "summary": "สรุปสั้นๆ 1-2 ประโยค",
@@ -41,10 +41,16 @@ ${transcript}
   })
 
   try {
-    return JSON.parse(response.content[0].text)
+    return JSON.parse(extractJson(response.content[0].text))
   } catch {
     return { outcome: 'completed', summary: response.content[0].text, key_points: '', next_action: '' }
   }
+}
+
+// Claude มักห่อ JSON ด้วย ```json ... ``` แม้สั่งห้ามแล้ว — ดึงเฉพาะเนื้อใน code fence ถ้ามี ก่อน parse
+function extractJson(text) {
+  const match = text.match(/```(?:json)?\s*([\s\S]*?)```/)
+  return match ? match[1].trim() : text.trim()
 }
 
 function buildSystemPrompt(campaignPrompt, customerName) {
