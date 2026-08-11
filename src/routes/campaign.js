@@ -1,5 +1,6 @@
 const { sheetsService } = require('../services/googleSheets')
 const { callQueue } = require('../utils/callQueue')
+const { isValidPhone } = require('../utils/phone')
 
 module.exports = async function campaignRoutes(fastify) {
 
@@ -40,6 +41,9 @@ module.exports = async function campaignRoutes(fastify) {
     const { phone, name, campaignId } = req.body || {}
     if (!phone || !campaignId) {
       return reply.code(400).send({ error: 'phone and campaignId required' })
+    }
+    if (!isValidPhone(phone)) {
+      return reply.code(400).send({ error: 'Invalid phone number' })
     }
     const campaign = await sheetsService.getCampaign(campaignId)
     if (!campaign) return reply.code(404).send({ error: 'Campaign not found' })

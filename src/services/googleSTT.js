@@ -1,12 +1,9 @@
 const speech = require('@google-cloud/speech')
 const { mulawBufferToPcm16 } = require('../utils/audioConverter')
 const healthMonitor = require('../utils/healthMonitor')
+const { getGoogleClientOptions } = require('../utils/googleCredentials')
 
-const clientOptions = {}
-if (process.env.GOOGLE_CREDENTIALS_JSON) {
-  clientOptions.credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON)
-}
-const client = new speech.SpeechClient(clientOptions)
+const client = new speech.SpeechClient(getGoogleClientOptions())
 
 const STT_CONFIG = {
   encoding: 'LINEAR16',

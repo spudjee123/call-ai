@@ -491,6 +491,8 @@ const CALL_STATUS_LABELS = { completed: 'เชื่อมสายสำเร
 let token = localStorage.getItem('callai_token') || null
 
 function esc(s){ const d=document.createElement('div'); d.textContent = s==null?'':String(s); return d.innerHTML }
+// สำหรับค่าที่ถูกฝังใน onclick="fn('...')" — esc() เพียงอย่างเดียวไม่ escape ' หรือ " จึงหลุดออกจาก string/attribute ได้ถ้าค่ามี apostrophe (เช่น ชื่อลูกค้า "O'Brien")
+function escJsAttr(s){ const jsEscaped = (s==null?'':String(s)).replace(/\\/g,'\\\\').replace(/'/g,"\\'"); return esc(jsEscaped).replace(/"/g,'&quot;') }
 function fmtDur(sec){ sec=Number(sec)||0; const m=Math.floor(sec/60), s=Math.floor(sec%60); return `${m}:${String(s).padStart(2,'0')}` }
 function fmtDate(iso){ if(!iso) return ''; const d=new Date(iso); if(isNaN(d)) return iso; return new Intl.DateTimeFormat('sv-SE',{timeZone:'Asia/Bangkok',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}).format(d) }
 
@@ -853,8 +855,8 @@ function renderCampaignTable(){
       <td class="num" style="color:var(--text-2); font-size:12px">${esc(c.voice_id)}</td>
       <td>
         <div class="row" style="gap:2px; flex-wrap:nowrap">
-          <button class="btn btn-ghost btn-sm" onclick="openCampaignEdit('${esc(c.id)}')">${icon('edit')} แก้ไข</button>
-          <button class="btn btn-icon btn-sm" title="${c.status==='active'?'หยุด':'เริ่ม'}" onclick="${c.status==='active' ? `confirmStop('${esc(c.id)}')` : `confirmStart('${esc(c.id)}')`}">${icon(c.status==='active'?'pause':'play')}</button>
+          <button class="btn btn-ghost btn-sm" onclick="openCampaignEdit('${escJsAttr(c.id)}')">${icon('edit')} แก้ไข</button>
+          <button class="btn btn-icon btn-sm" title="${c.status==='active'?'หยุด':'เริ่ม'}" onclick="${c.status==='active' ? `confirmStop('${escJsAttr(c.id)}')` : `confirmStart('${escJsAttr(c.id)}')`}">${icon(c.status==='active'?'pause':'play')}</button>
         </div>
       </td>
     </tr>`).join('')
@@ -1076,7 +1078,7 @@ async function refreshActiveGlobal(updateHero){
             <p>${calls.map(c=>esc(c.name)).join(' · ')}</p>
           </div>
           <div class="row">
-            <button class="btn" onclick="openLiveModal('${esc(calls[0].callSid)}','${esc(calls[0].phone)}','${esc(calls[0].name)}')">${icon('chat')} ดูบทสนทนาสด</button>
+            <button class="btn" onclick="openLiveModal('${escJsAttr(calls[0].callSid)}','${escJsAttr(calls[0].phone)}','${escJsAttr(calls[0].name)}')">${icon('chat')} ดูบทสนทนาสด</button>
           </div>
         </div>
       </div>` : `
@@ -1089,7 +1091,7 @@ async function refreshActiveGlobal(updateHero){
   const recentEl = document.getElementById('recentCalls')
   if (recentEl) {
     recentEl.innerHTML = calls.length ? calls.slice(0,4).map(c => `
-      <div class="qa-row" onclick="openLiveModal('${esc(c.callSid)}','${esc(c.phone)}','${esc(c.name)}')">
+      <div class="qa-row" onclick="openLiveModal('${escJsAttr(c.callSid)}','${escJsAttr(c.phone)}','${escJsAttr(c.name)}')">
         <div class="badge" style="background:var(--success-soft); color:var(--success)">${icon('waveform')}</div>
         <div class="label">${esc(c.name)} <span style="font-weight:400; color:var(--text-2)" class="num">· ${esc(c.phone)}</span></div>
         <span class="pill active">กำลังคุย</span>
@@ -1133,8 +1135,8 @@ function filterContacts(q){
           ? `<span class="pill retry_pending">รอโทรซ้ำ (${esc(c.retry_count||0)}/3)</span>`
           : `<span class="pill ${esc(c.status)}">${esc(c.status)}</span>`}</td>
       <td>
-        <button class="btn btn-icon btn-ghost" title="ห้ามโทรอีก" onclick="confirmBlockContact('${esc(c.phone)}')">${icon('block')}</button>
-        <button class="btn btn-icon btn-ghost danger" title="ลบ" onclick="confirmDeleteContact('${esc(c.phone)}')">${icon('trash')}</button>
+        <button class="btn btn-icon btn-ghost" title="ห้ามโทรอีก" onclick="confirmBlockContact('${escJsAttr(c.phone)}')">${icon('block')}</button>
+        <button class="btn btn-icon btn-ghost danger" title="ลบ" onclick="confirmDeleteContact('${escJsAttr(c.phone)}')">${icon('trash')}</button>
       </td>
     </tr>`).join('')
 }

@@ -4,6 +4,8 @@ const { askClaude, askClaudeStream } = require('../services/claude')
 const { synthesizeSpeechStream } = require('../services/tts')
 const healthMonitor = require('../utils/healthMonitor')
 
+const MAX_CALL_DURATION_MS = (parseInt(process.env.MAX_CALL_DURATION_SECONDS) || 300) * 1000
+
 function shouldBlockEndCall(session, aiResponse) {
   const userMessages = session.messages.filter(m => m.role === 'user')
   const lastUserMsg = userMessages.at(-1)?.content ?? ''
@@ -32,6 +34,7 @@ function registerWebSocket(fastify) {
     let bargeInCooldown = false   // cooldown หลัง barge-in ป้องกัน echo false-trigger
     let silenceTimer = null
     let silencePromptCount = 0
+    let durationTimer = null
     let lastMarkTime = 0
     let pendingEndCall = false
     let activePipelineId = 0
@@ -49,6 +52,52 @@ function registerWebSocket(fastify) {
       clearSilenceTimer()
       if (!callActive || isSpeaking || sttProcessing) return
       silenceTimer = setTimeout(handleSilence, 8000)
+    }
+
+    function clearDurationTimer() {
+      if (durationTimer) { clearTimeout(durationTimer); durationTimer = null }
+    }
+
+    // ตัดจบสายอัตโนมัติเมื่อคุยนานเกิน MAX_CALL_DURATION_SECONDS กันสายค้าง/ค่าใช้จ่ายบานปลาย
+    async function handleMaxDuration() {
+      durationTimer = null
+      if (!callActive || pendingEndCall) return
+      console.log(`[MaxDuration] Call exceeded ${MAX_CALL_DURATION_MS / 1000}s — closing`)
+
+      const currentSession = callSessions.get(callSid)
+      pendingEndCall = true
+      if (currentSession) currentSession.hangupReason = 'max_duration'
+
+      clearSilenceTimer()
+      clearPrewarm()
+      if (greetingAbortController) { greetingAbortController.abort(); greetingAbortController = null }
+      if (ttsAbortController) { ttsAbortController.abort(); ttsAbortController = null }
+
+      if (!currentSession || socket.readyState !== socket.OPEN) {
+        if (socket.readyState === socket.OPEN) socket.close()
+        return
+      }
+
+      isSpeaking = true
+      sttProcessing = true
+      const closeAbort = new AbortController()
+      let sent = 0
+      try {
+        const closingText = 'ขอบคุณมากนะคะที่สละเวลาคุยกับหนู หนูขอตัวก่อนนะคะ'
+        for await (const chunk of synthesizeSpeechStream(closingText, currentSession.campaign.voice_id, closeAbort.signal)) {
+          if (socket.readyState !== socket.OPEN) break
+          socket.send(JSON.stringify({ event: 'media', streamSid, media: { payload: chunk.toString('base64') } }))
+          sent++
+        }
+      } catch (err) {
+        console.error('[MaxDuration TTS error]', err.message)
+        healthMonitor.reportError('tts', err.message)
+      } finally {
+        sttProcessing = false
+      }
+
+      const closeDelay = sent * 20 + 4000
+      setTimeout(() => { if (socket.readyState === socket.OPEN) socket.close() }, closeDelay)
     }
 
     function isPrewarmUsable(interimText, finalText) {
@@ -215,6 +264,8 @@ function registerWebSocket(fastify) {
         if (!session) return
 
         console.log(`[WS] Stream started: ${streamSid}`)
+
+        durationTimer = setTimeout(handleMaxDuration, MAX_CALL_DURATION_MS)
 
         // เริ่ม STT stream
         sttStream = transcribeStream(async (transcript) => {
@@ -457,6 +508,7 @@ function registerWebSocket(fastify) {
         console.log(`[WS] Stream stopped: ${callSid}`)
         callActive = false
         clearSilenceTimer()
+        clearDurationTimer()
         if (sttStream) { sttStream.end(); sttStream = null }
       }
     })
@@ -465,6 +517,7 @@ function registerWebSocket(fastify) {
       console.log(`[WS] Disconnected: ${callSid}`)
       callActive = false
       clearSilenceTimer()
+      clearDurationTimer()
       if (sttStream) { sttStream.end(); sttStream = null }
       // ถ้ายังไม่มีเหตุผลปิดสายถูก tag ไว้เลย (ไม่ใช่ AI ปิดปกติ/หมดเวลาเงียบ) แปลว่าอีกฝั่งวางสายเอง
       const endedSession = callSessions.get(callSid)

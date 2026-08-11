@@ -12,7 +12,7 @@ module.exports = async function webhookRoutes(fastify) {
     const session = callSessions.get(callSid)
     const customerName = session?.name || 'คุณลูกค้า'
 
-    const wsUrl = `${process.env.BASE_URL.replace('https', 'wss')}/stream?callSid=${callSid}`
+    const wsUrl = `${process.env.BASE_URL.replace(/^http/, 'ws')}/stream?callSid=${callSid}`
 
     const twiml = new twilio.twiml.VoiceResponse()
     const connect = twiml.connect()
@@ -35,12 +35,11 @@ module.exports = async function webhookRoutes(fastify) {
       name: 'ลูกค้า',
       campaign,
       messages: [],
-      offTopicCount: 0,
       direction: 'inbound',
       startTime: Date.now()
     })
 
-    const wsUrl = `${process.env.BASE_URL.replace('https', 'wss')}/stream?callSid=${callSid}`
+    const wsUrl = `${process.env.BASE_URL.replace(/^http/, 'ws')}/stream?callSid=${callSid}`
 
     const twiml = new twilio.twiml.VoiceResponse()
     const connect = twiml.connect()

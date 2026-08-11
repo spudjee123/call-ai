@@ -1,4 +1,5 @@
 const { sheetsService } = require('../services/googleSheets')
+const { isValidPhone } = require('../utils/phone')
 
 module.exports = async function contactsRoutes(fastify) {
 
@@ -15,6 +16,9 @@ module.exports = async function contactsRoutes(fastify) {
     if (!phone || !campaign) {
       return reply.code(400).send({ error: 'phone and campaign required' })
     }
+    if (!isValidPhone(phone)) {
+      return reply.code(400).send({ error: 'Invalid phone number' })
+    }
     await sheetsService.addContact({ phone, name: name || '', campaign, status: status || 'pending' })
     return reply.send({ message: 'Contact added' })
   })
@@ -26,7 +30,7 @@ module.exports = async function contactsRoutes(fastify) {
       return reply.code(400).send({ error: 'contacts[] and campaign required' })
     }
     const rows = contacts
-      .filter(c => c.phone)
+      .filter(c => isValidPhone(c.phone))
       .map(c => ({ phone: c.phone, name: c.name || '', campaign, status: 'pending' }))
     if (!rows.length) return reply.code(400).send({ error: 'No valid rows' })
 

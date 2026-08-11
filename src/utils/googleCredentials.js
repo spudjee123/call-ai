@@ -1,0 +1,17 @@
+// รวม logic โหลด Google credentials ให้ Sheets/STT/TTS ใช้ตัวเดียวกัน
+// เดิมแต่ละไฟล์เช็คคนละแบบ (Sheets มี fallback keyFile เฉพาะของตัวเอง, STT/TTS ไม่มี)
+// ทำให้ deploy บาง env auth service นึงผ่านแต่อีก service ไม่ผ่านแบบเงียบๆ
+const FALLBACK_KEY_FILE = '/etc/secrets/google-credentials.json'
+
+// ใช้ได้ทั้ง googleapis GoogleAuth และ @google-cloud/* client libraries (ทั้งคู่รับ keyFilename)
+function getGoogleClientOptions() {
+  if (process.env.GOOGLE_CREDENTIALS_JSON) {
+    return { credentials: JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON) }
+  }
+  if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+    return {} // ปล่อยให้ client library อ่าน path จาก env ตัวนี้เอง (มาตรฐาน ADC)
+  }
+  return { keyFilename: FALLBACK_KEY_FILE }
+}
+
+module.exports = { getGoogleClientOptions }

@@ -1,4 +1,16 @@
+const crypto = require('crypto')
 const { generateToken, revokeToken, isRateLimited, recordLoginAttempt } = require('../utils/auth')
+
+// เทียบรหัสผ่านแบบ constant-time กัน timing attack เดารหัสผ่านทีละตัวอักษรจากเวลาตอบสนอง
+function passwordMatches(input, expected) {
+  const a = Buffer.from(String(input))
+  const b = Buffer.from(String(expected))
+  if (a.length !== b.length) {
+    crypto.timingSafeEqual(a, a) // ทำงานเวลาคงที่แม้ความยาวไม่ตรง กันสังเกตความยาวรหัสผ่านจากเวลา
+    return false
+  }
+  return crypto.timingSafeEqual(a, b)
+}
 
 module.exports = async function authRoutes(fastify) {
 
@@ -9,7 +21,7 @@ module.exports = async function authRoutes(fastify) {
     }
 
     const { password } = req.body || {}
-    if (!password || password !== process.env.ADMIN_PASSWORD) {
+    if (!password || !passwordMatches(password, process.env.ADMIN_PASSWORD || '')) {
       recordLoginAttempt(ip)
       return reply.code(401).send({ error: 'Invalid password' })
     }

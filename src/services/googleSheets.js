@@ -1,4 +1,5 @@
 const { google } = require('googleapis')
+const { getGoogleClientOptions } = require('../utils/googleCredentials')
 
 const SPREADSHEET_ID = process.env.GOOGLE_SHEETS_ID
 
@@ -13,15 +14,23 @@ const SHEETS = {
 
 let sheets = null
 
+// Serialize read-modify-write ต่อชีต — Sheets API ไม่มี optimistic lock ให้
+// ถ้าหลายสายจบพร้อมกันแล้ว updateRowByKey เข้ามาพร้อมกัน อาจอ่าน row เก่าคนละรอบแล้วเขียนทับกันเอง (lost update)
+const sheetLocks = new Map()
+
+function withSheetLock(sheetName, fn) {
+  const prev = sheetLocks.get(sheetName) || Promise.resolve()
+  const run = prev.then(fn, fn)
+  sheetLocks.set(sheetName, run.catch(() => {}))
+  return run
+}
+
 async function getClient() {
   if (sheets) return sheets
-  const authOptions = { scopes: ['https://www.googleapis.com/auth/spreadsheets'] }
-  if (process.env.GOOGLE_CREDENTIALS_JSON) {
-    authOptions.credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON)
-  } else {
-    authOptions.keyFile = '/etc/secrets/google-credentials.json'
-  }
-  const auth = new google.auth.GoogleAuth(authOptions)
+  const auth = new google.auth.GoogleAuth({
+    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+    ...getGoogleClientOptions(),
+  })
   sheets = google.sheets({ version: 'v4', auth })
   return sheets
 }
@@ -49,30 +58,33 @@ async function getRows(sheetName) {
 }
 
 // หา row ด้วย key column แล้วอัปเดตหลาย field พร้อมกันในครั้งเดียว (เขียนทับทั้งแถว)
+// ล็อกต่อชีต กัน read-modify-write ชนกันเมื่อหลายสายจบพร้อมกัน
 async function updateRowByKey(sheetName, keyField, keyValue, updates) {
-  const { headers, rows } = await getSheetData(sheetName)
-  const keyIdx = headers.indexOf(keyField)
-  if (keyIdx === -1) throw new Error(`Column '${keyField}' not found in ${sheetName}`)
+  return withSheetLock(sheetName, async () => {
+    const { headers, rows } = await getSheetData(sheetName)
+    const keyIdx = headers.indexOf(keyField)
+    if (keyIdx === -1) throw new Error(`Column '${keyField}' not found in ${sheetName}`)
 
-  const rowIdx = rows.findIndex(r => r[keyIdx] === keyValue)
-  if (rowIdx === -1) return false
+    const rowIdx = rows.findIndex(r => r[keyIdx] === keyValue)
+    if (rowIdx === -1) return false
 
-  const row = [...rows[rowIdx]]
-  while (row.length < headers.length) row.push('')
-  Object.entries(updates).forEach(([field, value]) => {
-    const colIdx = headers.indexOf(field.toLowerCase().trim().replace(/\s+/g, '_'))
-    if (colIdx !== -1) row[colIdx] = value
+    const row = [...rows[rowIdx]]
+    while (row.length < headers.length) row.push('')
+    Object.entries(updates).forEach(([field, value]) => {
+      const colIdx = headers.indexOf(field.toLowerCase().trim().replace(/\s+/g, '_'))
+      if (colIdx !== -1) row[colIdx] = value
+    })
+
+    const client = await getClient()
+    const lastCol = String.fromCharCode(65 + headers.length - 1)
+    await client.spreadsheets.values.update({
+      spreadsheetId: SPREADSHEET_ID,
+      range: `${sheetName}!A${rowIdx + 2}:${lastCol}${rowIdx + 2}`,
+      valueInputOption: 'RAW',
+      requestBody: { values: [row] },
+    })
+    return true
   })
-
-  const client = await getClient()
-  const lastCol = String.fromCharCode(65 + headers.length - 1)
-  await client.spreadsheets.values.update({
-    spreadsheetId: SPREADSHEET_ID,
-    range: `${sheetName}!A${rowIdx + 2}:${lastCol}${rowIdx + 2}`,
-    valueInputOption: 'RAW',
-    requestBody: { values: [row] },
-  })
-  return true
 }
 
 async function appendRow(sheetName, values) {

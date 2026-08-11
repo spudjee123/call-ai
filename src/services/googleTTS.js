@@ -1,10 +1,7 @@
 const textToSpeech = require('@google-cloud/text-to-speech')
+const { getGoogleClientOptions } = require('../utils/googleCredentials')
 
-const clientOptions = {}
-if (process.env.GOOGLE_CREDENTIALS_JSON) {
-  clientOptions.credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON)
-}
-const client = new textToSpeech.TextToSpeechClient(clientOptions)
+const client = new textToSpeech.TextToSpeechClient(getGoogleClientOptions())
 
 // Thai Neural2 voices — สูงสุดในตระกูล Google TTS
 // th-TH-Neural2-C = หญิง, th-TH-Neural2-D = ชาย
