@@ -1,7 +1,21 @@
 {
   "permissions": {
     "allow": [
-      "Bash(git push *)"
+      "Bash(git push *)",
+      "Bash(node -e \"require\\('./src/index.js'\\)\")",
+      "Bash(curl -s -o /dev/null -w \"GET /admin: %{http_code}\\\\n\" http://localhost:3000/admin)",
+      "Bash(curl -s -o /dev/null -w \"GET /health: %{http_code}\\\\n\" http://localhost:3000/health)",
+      "Bash(curl -s -o /dev/null -w \"GET /api/stats \\(no auth\\): %{http_code}\\\\n\" http://localhost:3000/api/stats)",
+      "Bash(curl -s -w \"\\\\nlogin wrong pw: %{http_code}\\\\n\" -X POST http://localhost:3000/api/auth/login -H \"Content-Type: application/json\" -d '{\"password\":\"wrong\"}')",
+      "Bash(curl -s -o /dev/null -w \"status: %{http_code}\\\\n\" -X POST http://localhost:3000/webhook/status -d \"CallSid=test&CallStatus=completed\")",
+      "Bash(curl -s -o /dev/null -w \"%{http_code} \" -X POST http://localhost:3000/api/auth/login -H \"Content-Type: application/json\" -d '{\"password\":\"bad\"}')",
+      "Bash(kill %1)",
+      "Bash(node -e ' *)",
+      "Bash(node --check .tmp_admin_check.js)",
+      "Bash(rm -f .tmp_admin_check.js)",
+      "Bash(rm -f el_test_output.bin)",
+      "Bash(node -e \"require\\('dotenv'\\).config\\(\\); console.log\\('RENDER_API_KEY set:', !!process.env.RENDER_API_KEY, 'SERVICE_ID set:', !!process.env.RENDER_SERVICE_ID, 'OWNER_ID set:', !!process.env.RENDER_OWNER_ID\\)\")",
+      "Bash(node -e \"JSON.parse\\(require\\('fs'\\).readFileSync\\('.claude/settings.local.json','utf8'\\)\\); console.log\\('valid JSON'\\)\")"
     ]
   }
 }
