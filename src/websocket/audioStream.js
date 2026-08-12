@@ -41,6 +41,7 @@ function registerWebSocket(fastify) {
     let prewarmPromise = null    // pre-warmed Claude response Promise<string|null>
     let prewarmStartText = null  // interim text that triggered prewarm
     let prewarmAbort = null      // AbortController for prewarm call
+    let prewarmRetriggerAt = 0   // เวลาต่ำสุดที่อนุญาตเดาใหม่รอบถัดไป (throttle กันยิง Claude ถี่เกิน)
 
     console.log(`[WS] Connected callSid=${callSid}`)
 
@@ -108,8 +109,24 @@ function registerWebSocket(fastify) {
       return n >= 2 && a.substring(0, n) === b.substring(0, n)
     }
 
+    // Adaptive re-trigger: ถ้าลูกค้าพูดยาวกว่าที่เดาไว้พอสมควร ยกเลิกคำเดาเก่าแล้วเดาใหม่จากข้อความล่าสุด
+    // เดาแค่ครั้งเดียวตอนแรกมักพลาดเวลาลูกค้าพูดยาวกว่านั้น (isPrewarmUsable ปฏิเสธ ต้องเริ่มนับ latency ใหม่ทั้งหมด)
+    function shouldRetriggerPrewarm(oldText, newText) {
+      const oldLen = (oldText || '').trim().length
+      const newLen = (newText || '').trim().length
+      if (newLen - oldLen < 4) return false // เพิ่มขึ้นน้อยไป ไม่คุ้มยิงใหม่ (แค่ STT ขยับคำเล็กน้อย)
+      if (Date.now() < prewarmRetriggerAt) return false // กันยิง Claude รัวๆ ระหว่างลูกค้าพูดยาว
+      return true
+    }
+
     function startPrewarm(session, interimText) {
-      if (prewarmPromise || isSpeaking || sttProcessing) return
+      if (isSpeaking || sttProcessing) return
+      if (prewarmPromise) {
+        if (!shouldRetriggerPrewarm(prewarmStartText, interimText)) return
+        console.log(`[Prewarm] Re-trigger — interim grew: "${prewarmStartText}" → "${interimText}"`)
+        clearPrewarm()
+      }
+      prewarmRetriggerAt = Date.now() + 700
       prewarmStartText = interimText
       prewarmAbort = new AbortController()
       const signal = prewarmAbort.signal
