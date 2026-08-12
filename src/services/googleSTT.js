@@ -35,7 +35,9 @@ function transcribeStream(onTranscript, onInterim) {
   let interimText = ''
   let interimTimer = null
   let utteranceClosed = false  // true after timer delivers transcript — blocks trailing interims and isFinal duplicate
-  const INTERIM_FINALIZE_MS = 1500
+  // เดิม 1500ms — วัดจาก log จริงพบว่า Google isFinal แทบไม่เคยมาทัน ต้องพึ่ง timer นี้ตัดสินใจแทบทุกครั้ง
+  // ทำให้ลูกค้าต้องรอเงียบเต็ม 1.5 วิทุกรอบก่อน AI จะเริ่มคิดคำตอบด้วยซ้ำ ลดลงมาก่อนเป็นค่าที่ยังกันลูกค้าหยุดคิดกลางประโยคได้
+  const INTERIM_FINALIZE_MS = 900
 
   function resetUtteranceState() {
     clearTimeout(interimTimer)
@@ -114,7 +116,7 @@ function transcribeStream(onTranscript, onInterim) {
         clearTimeout(interimTimer)
         interimTimer = setTimeout(() => {
           if (interimText && !destroyed) {
-            console.log(`[STT] Interim→Final (1.5s silence): "${interimText}"`)
+            console.log(`[STT] Interim→Final (${INTERIM_FINALIZE_MS}ms silence): "${interimText}"`)
             onTranscript(interimText)
             interimText = ''
             utteranceClosed = true
