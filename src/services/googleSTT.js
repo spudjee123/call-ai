@@ -39,6 +39,12 @@ function transcribeStream(onTranscript, onInterim) {
   // ทำให้ลูกค้าต้องรอเงียบเต็ม 1.5 วิทุกรอบก่อน AI จะเริ่มคิดคำตอบด้วยซ้ำ ลดลงมาก่อนเป็นค่าที่ยังกันลูกค้าหยุดคิดกลางประโยคได้
   const INTERIM_FINALIZE_MS = 900
 
+  // จากสายจริงหลายสาย เจอคำหลอน ("สงคราม", "โทรศัพท์", "โลตัส") ที่ไม่เกี่ยวกับที่ลูกค้าพูดเลย
+  // เกิดเป็นคำแรกทันทีหลัง "Creating new stream" ทุกครั้ง — คาดว่าเป็นเสียงสะท้อน/สัญญาณตกค้างตรงรอยต่อสาย
+  // ทิ้งเสียงช่วงสั้นๆ แรกของ stream ใหม่ ก่อนเริ่มส่งให้ Google ฟังจริง
+  const STREAM_MUTE_MS = 200
+  let coldStreamMuteUntil = 0
+
   function resetUtteranceState() {
     clearTimeout(interimTimer)
     interimTimer = null
@@ -50,6 +56,7 @@ function transcribeStream(onTranscript, onInterim) {
     resetUtteranceState()
     currentStream = nextStream
     nextStream = null
+    coldStreamMuteUntil = 0 // stream ที่ prewarm ไว้ฟังมาสักพักแล้ว ไม่ใช่ cold start ไม่ต้อง mute
   }
 
   function createStream(isPrewarm = false) {
@@ -164,6 +171,7 @@ function transcribeStream(onTranscript, onInterim) {
       nextStream = stream
     } else {
       currentStream = stream
+      coldStreamMuteUntil = Date.now() + STREAM_MUTE_MS
     }
   }
 
@@ -175,6 +183,7 @@ function transcribeStream(onTranscript, onInterim) {
         if (!destroyed) console.log('[STT] write skipped — no stream')
         return
       }
+      if (Date.now() < coldStreamMuteUntil) return // ทิ้งเสียงช่วงรอยต่อสั้นๆ กันคำหลอนจากสัญญาณตกค้าง
       try {
         const pcm = mulawBufferToPcm16(mulawBuffer)
         currentStream.write(pcm)
