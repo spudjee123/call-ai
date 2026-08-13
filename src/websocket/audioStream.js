@@ -290,7 +290,10 @@ function registerWebSocket(fastify) {
           if (pendingEndCall) return
           if (socket.readyState !== socket.OPEN) return
           if (sttProcessing) {
-            console.log(`[STT] Transcript dropped (busy): "${transcript.substring(0, 40)}"`)
+            // log เต็มข้อความ + จำนวนคำ ไว้เช็คความถี่/เนื้อหาจริงที่หายไป ก่อนตัดสินใจว่าคุ้มแก้เป็น queue ไหม (ยังไม่เปลี่ยนพฤติกรรม แค่วัดผล)
+            const trimmed = transcript.trim()
+            const wc = trimmed ? trimmed.split(/\s+/).length : 0
+            console.log(`[STT] Transcript dropped (busy, ${wc} words): "${transcript}"`)
             return
           }
           if (bargeInCooldown) {

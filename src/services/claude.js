@@ -98,6 +98,11 @@ async function* askClaudeStream(session, isGreeting = false, signal = null) {
   const response = await client.messages.create({
     model: 'claude-sonnet-4-6',
     max_tokens: 200,
+    // Sonnet 4.6 default effort เป็น high ถ้าไม่ตั้งไว้ — งานนี้แค่ตอบ 1-2 ประโยคสั้นๆ
+    // ลดเป็น low ตามคำแนะนำของ Anthropic สำหรับงานแชท/บทสนทนาสั้นๆ เพื่อลดเวลาคิดต่อ turn
+    // ระบุ thinking: disabled ตรงๆ (ไม่พึ่ง default ที่ omit แล้วได้ off เฉยๆ) กัน default เปลี่ยนในอนาคตแล้วเผลอเปิด thinking โดยไม่ตั้งใจ
+    thinking: { type: 'disabled' },
+    output_config: { effort: 'low' },
     // แคช system prompt ไว้ — เหมือนกันทุก turn ในสายเดียวกัน (ต่างแค่ชื่อลูกค้าข้ามสาย)
     // ทำให้ turn ถัดไปในสายเดียวกันไม่ต้องประมวลผล system prompt ซ้ำทั้งก้อน
     system: [
