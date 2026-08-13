@@ -34,9 +34,9 @@ async function synthesizeSpeech(text, voiceId) {
       text,
       model_id: 'eleven_v3',
       voice_settings: {
-        stability: 0.85,        // สูง = เสียงสม่ำเสมอ ไม่สั่น เหมาะกับ cloned voice
+        stability: 0.5,         // ลดจาก 0.85 — เดิมนิ่งเกินจนเสียงราบเรียบไม่มีอารมณ์
         similarity_boost: 0.90, // สูง = ใกล้เสียงต้นฉบับที่ clone มา
-        style: 0.0,
+        style: 0.25,             // เพิ่มจาก 0 — ดึงอารมณ์/บุคลิกจากเสียงต้นฉบับออกมาให้ฟังเป็นธรรมชาติขึ้น
         use_speaker_boost: true
       },
     },
@@ -79,9 +79,9 @@ async function* synthesizeSpeechStream(text, voiceId, signal) {
       text,
       model_id: 'eleven_v3',
       voice_settings: {
-        stability: 0.85,
+        stability: 0.5,   // ลดจาก 0.85 — เดิมนิ่งเกินจนเสียงราบเรียบไม่มีอารมณ์
         similarity_boost: 0.90,
-        style: 0.0,
+        style: 0.25,       // เพิ่มจาก 0 — ดึงอารมณ์/บุคลิกจากเสียงต้นฉบับออกมาให้ฟังเป็นธรรมชาติขึ้น
         use_speaker_boost: true
       },
     },
