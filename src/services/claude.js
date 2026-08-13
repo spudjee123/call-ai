@@ -4,6 +4,15 @@ const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
 
 const MAX_HISTORY = 20
 
+// คำสั่งทักทายต่างกันตามทิศทางสาย — outbound คือ AI โทรออกไปหาลูกค้า (ต้องถามว่าสะดวกคุยไหม)
+// inbound คือลูกค้าโทรเข้ามาเอง (ไม่ต้องถามว่าสะดวกไหม เพราะลูกค้าเลือกโทรมาเองอยู่แล้ว — ควรถามว่ามีอะไรให้ช่วย)
+const OUTBOUND_GREETING_INSTRUCTION = 'ทักทายและแนะนำตัวสั้นๆ แล้วถามว่าสะดวกคุยสักครู่ไหม รวม 1-2 ประโยคเท่านั้น'
+const INBOUND_GREETING_INSTRUCTION = 'รับสายลูกค้าที่โทรเข้ามาเอง ทักทายสั้นๆ แนะนำตัวว่าเป็นใคร แล้วถามว่ามีอะไรให้ช่วยไหมคะ รวม 1-2 ประโยคเท่านั้น'
+
+function greetingInstruction(session) {
+  return session.direction === 'inbound' ? INBOUND_GREETING_INSTRUCTION : OUTBOUND_GREETING_INSTRUCTION
+}
+
 // ใช้สำหรับ greeting เท่านั้น — Haiku เพราะต้องการ latency ต่ำ
 async function askClaude(session) {
   const { name, campaign } = session
@@ -12,7 +21,7 @@ async function askClaude(session) {
     model: 'claude-haiku-4-5-20251001',
     max_tokens: 60,
     system: systemPrompt,
-    messages: [{ role: 'user', content: 'ทักทายและแนะนำตัวสั้นๆ แล้วถามว่าสะดวกคุยสักครู่ไหม รวม 1-2 ประโยคเท่านั้น' }],
+    messages: [{ role: 'user', content: greetingInstruction(session) }],
   })
   return response.content[0].text.trim()
 }
@@ -81,7 +90,7 @@ async function* askClaudeStream(session, isGreeting = false, signal = null) {
   const systemPrompt = buildSystemPrompt(campaign.script || campaign.system_prompt, name)
   const history = messages.slice(-MAX_HISTORY)
   const msgs = isGreeting
-    ? [{ role: 'user', content: 'ทักทายและแนะนำตัวสั้นๆ แล้วถามว่าสะดวกคุยสักครู่ไหม รวม 1-2 ประโยคเท่านั้น' }]
+    ? [{ role: 'user', content: greetingInstruction(session) }]
     : history
 
   if (!msgs.length) { yield 'สวัสดีค่ะ'; return }
