@@ -79,7 +79,12 @@
       "Bash(rm -f /c/Users/PC/AppData/Local/Temp/claude/e----------Call-Ai/8e7b48a4-2349-4f7d-b713-7906ad8d117c/scratchpad/mock_check6.js)",
       "Bash(node --check /c/Users/PC/AppData/Local/Temp/claude/e----------Call-Ai/8e7b48a4-2349-4f7d-b713-7906ad8d117c/scratchpad/mock_check7.js)",
       "Bash(rm -f /c/Users/PC/AppData/Local/Temp/claude/e----------Call-Ai/8e7b48a4-2349-4f7d-b713-7906ad8d117c/scratchpad/mock_check7.js)",
-      "Bash(node -e \"try{require.resolve\\('jsdom'\\);console.log\\('jsdom available'\\)}catch\\(e\\){console.log\\('jsdom NOT available'\\)}\")"
+      "Bash(node -e \"try{require.resolve\\('jsdom'\\);console.log\\('jsdom available'\\)}catch\\(e\\){console.log\\('jsdom NOT available'\\)}\")",
+      "Bash(node --check src/websocket/audioStream.js)",
+      "Bash(node --check /c/Users/PC/AppData/Local/Temp/claude/e----------Call-Ai/8e7b48a4-2349-4f7d-b713-7906ad8d117c/scratchpad/mock_check8.js)",
+      "Bash(rm -f /c/Users/PC/AppData/Local/Temp/claude/e----------Call-Ai/8e7b48a4-2349-4f7d-b713-7906ad8d117c/scratchpad/mock_check8.js)",
+      "Bash(node --check /c/Users/PC/AppData/Local/Temp/claude/e----------Call-Ai/8e7b48a4-2349-4f7d-b713-7906ad8d117c/scratchpad/mock_check9.js)",
+      "Bash(rm -f /c/Users/PC/AppData/Local/Temp/claude/e----------Call-Ai/8e7b48a4-2349-4f7d-b713-7906ad8d117c/scratchpad/mock_check9.js)"
     ],
     "additionalDirectories": [
       "C:\\Users\\PC\\AppData\\Local\\Temp\\claude\\e----------Call-Ai\\8e7b48a4-2349-4f7d-b713-7906ad8d117c\\scratchpad"

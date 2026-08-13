@@ -464,6 +464,18 @@
   </div>
 </div>
 
+<div class="overlay" id="contactEditOverlay">
+  <div class="modal" style="max-width:520px">
+    <div class="modal-head">
+      <div><h3>แก้ไขเบอร์ติดต่อ</h3></div>
+      <button class="modal-close" onclick="closeContactEditModal()">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </div>
+    <div style="padding:20px 22px" id="contactEditModalBody"></div>
+  </div>
+</div>
+
 <div class="overlay" id="confirmOverlay"></div>
 <div class="toast-stack" id="toastStack"></div>
 
@@ -1364,11 +1376,51 @@ function filterContacts(q){
       <td style="color:var(--text-2)">${esc((campaignsCache.find(x=>x.id===c.campaign)||{}).name || c.campaign)}</td>
       <td>${statusCell}</td>
       <td>
+        <button class="btn btn-icon btn-ghost" title="แก้ไข" onclick="openContactEdit('${escJsAttr(c.phone)}')">${icon('edit')}</button>
         ${blockBtn}
         <button class="btn btn-icon btn-ghost danger" title="ลบ" onclick="confirmDeleteContact('${escJsAttr(c.phone)}')">${icon('trash')}</button>
       </td>
     </tr>`
   }).join('')
+}
+function contactEditPanelHtml(c){
+  return `
+    <input type="hidden" id="ce_original_phone" value="${escAttr(c.phone)}">
+    <div class="field" style="margin-bottom:14px"><label>เบอร์โทร</label><input type="tel" id="ce_phone" value="${escAttr(c.phone||'')}"></div>
+    <div class="field" style="margin-bottom:14px"><label>ชื่อ</label><input type="text" id="ce_name" value="${escAttr(c.name||'')}"></div>
+    <div class="field" style="margin-bottom:18px"><label>Campaign</label><select id="ce_campaign" class="campaign-select"><option value="">-- เลือก Campaign --</option></select></div>
+    <div class="row">
+      <button class="btn btn-accent" onclick="saveContactEdit()">บันทึก</button>
+      <button class="btn" onclick="closeContactEditModal()">ยกเลิก</button>
+      <span class="msg" id="contactEditMsg" style="font-size:13px; color:var(--text-2)"></span>
+    </div>`
+}
+function openContactEdit(phone){
+  const c = contactsCache.find(x => x.phone === phone)
+  if (!c) return
+  document.getElementById('contactEditModalBody').innerHTML = contactEditPanelHtml(c)
+  populateCampaignSelects()
+  document.getElementById('ce_campaign').value = c.campaign
+  document.getElementById('contactEditOverlay').classList.add('open')
+}
+function closeContactEditModal(){
+  document.getElementById('contactEditOverlay').classList.remove('open')
+}
+async function saveContactEdit(){
+  const originalPhone = document.getElementById('ce_original_phone').value
+  const phone = document.getElementById('ce_phone').value.trim()
+  const name = document.getElementById('ce_name').value.trim()
+  const campaign = document.getElementById('ce_campaign').value
+  const msgEl = document.getElementById('contactEditMsg')
+  if (!phone || !campaign) { msgEl.textContent = 'กรอกเบอร์และเลือก campaign ก่อน'; return }
+  try {
+    const res = await apiFetch(`/api/contacts/${encodeURIComponent(originalPhone)}`, { method: 'PATCH', body: { phone, name, campaign } })
+    const data = await res.json()
+    if (!res.ok) { msgEl.textContent = data.error || 'บันทึกไม่สำเร็จ'; return }
+    toast('บันทึกแล้ว')
+    closeContactEditModal()
+    loadContacts()
+  } catch (e) {}
 }
 async function addContact(){
   const phone = document.getElementById('contactPhone').value.trim()

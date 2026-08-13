@@ -88,9 +88,19 @@ module.exports = async function contactsRoutes(fastify) {
     return reply.send({ message: 'Unblocked' })
   })
 
-  // แก้ไข contact (เช่น เปลี่ยน status, ชื่อ, campaign)
+  // แก้ไข contact (เช่น เปลี่ยน status, ชื่อ, campaign, หรือแก้เบอร์เอง)
   fastify.patch('/api/contacts/:phone', async (req, reply) => {
-    const updated = await sheetsService.updateContact(normalizePhone(req.params.phone), req.body || {})
+    const originalPhone = normalizePhone(req.params.phone)
+    const body = { ...(req.body || {}) }
+    if (body.phone) {
+      body.phone = normalizePhone(body.phone)
+      if (!isValidPhone(body.phone)) return reply.code(400).send({ error: 'Invalid phone number' })
+      if (body.phone !== originalPhone) {
+        const existing = await sheetsService.getContact(body.phone)
+        if (existing) return reply.code(409).send({ error: 'มีเบอร์นี้อยู่ในระบบแล้ว' })
+      }
+    }
+    const updated = await sheetsService.updateContact(originalPhone, body)
     if (!updated) return reply.code(404).send({ error: 'Contact not found' })
     return reply.send({ message: 'Contact updated' })
   })
