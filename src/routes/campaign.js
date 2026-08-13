@@ -36,6 +36,14 @@ module.exports = async function campaignRoutes(fastify) {
     return reply.send({ message: 'Campaign updated' })
   })
 
+  // ลบ campaign ทิ้งจริง (hard delete) — ไม่กระทบ contact/ประวัติการโทรเก่าที่อ้างอิง id นี้อยู่
+  // (แค่จะแสดงเป็น id ดิบแทนชื่อ campaign แทน — ดู campaignName() ใน admin.html)
+  fastify.delete('/api/campaigns/:id', async (req, reply) => {
+    const deleted = await sheetsService.deleteCampaign(req.params.id)
+    if (!deleted) return reply.code(404).send({ error: 'Campaign not found' })
+    return reply.send({ message: 'Campaign deleted' })
+  })
+
   // ยิงโทรทดสอบเบอร์เดียว — ใช้ pipeline เดียวกับ campaign จริง แต่ไม่แตะ Contacts sheet
   fastify.post('/api/calls/test', async (req, reply) => {
     const { name, campaignId } = req.body || {}

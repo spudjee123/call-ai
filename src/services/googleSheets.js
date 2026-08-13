@@ -189,6 +189,10 @@ const sheetsService = {
     return updateRowByKey(SHEETS.CAMPAIGNS, 'id', id, updates)
   },
 
+  async deleteCampaign(id) {
+    return deleteRowByKey(SHEETS.CAMPAIGNS, 'id', id)
+  },
+
   async getPendingContacts(campaignId) {
     const rows = await getRows(SHEETS.CONTACTS)
     return rows.filter(r => r.campaign === campaignId && r.status === 'pending')

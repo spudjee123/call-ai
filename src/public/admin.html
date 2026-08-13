@@ -979,6 +979,7 @@ function renderCampaignTable(){
           <button class="btn btn-ghost btn-sm" onclick="openCampaignEdit('${escJsAttr(c.id)}')">${icon('edit')} แก้ไข</button>
           <button class="btn btn-ghost btn-sm" title="คัดลอกเป็น Campaign ใหม่" onclick="duplicateCampaign('${escJsAttr(c.id)}')">${icon('copy')} คัดลอก</button>
           <button class="btn btn-icon btn-sm" title="${c.status==='active'?'หยุด':'เริ่ม'}" onclick="${c.status==='active' ? `confirmStop('${escJsAttr(c.id)}')` : `confirmStart('${escJsAttr(c.id)}')`}">${icon(c.status==='active'?'pause':'play')}</button>
+          <button class="btn btn-icon btn-ghost btn-sm danger" title="ลบ Campaign" onclick="confirmDeleteCampaign('${escJsAttr(c.id)}')">${icon('trash')}</button>
         </div>
       </td>
     </tr>`
@@ -1098,6 +1099,20 @@ function confirmStop(id){
     onConfirm: async () => {
       await apiFetch('/api/campaign/stop', { method: 'POST', body: { campaignId: id } })
       toast('หยุด campaign แล้ว', 'danger')
+      loadCampaigns()
+    }
+  })
+}
+function confirmDeleteCampaign(id){
+  const c = campaignsCache.find(x => x.id === id)
+  openConfirm({
+    title: 'ลบ Campaign นี้?',
+    message: `"${c ? c.name : id}" จะถูกลบถาวร — เบอร์และประวัติการโทรเก่าที่เคยผูกกับ campaign นี้จะยังอยู่ แต่จะแสดงเป็นรหัส campaign แทนชื่อ`,
+    confirmLabel: 'ลบถาวร',
+    onConfirm: async () => {
+      const res = await apiFetch(`/api/campaigns/${encodeURIComponent(id)}`, { method: 'DELETE' })
+      if (!res.ok) { const data = await res.json().catch(()=>({})); toast(data.error || 'ลบไม่สำเร็จ', 'danger'); return }
+      toast('ลบ campaign แล้ว', 'danger')
       loadCampaigns()
     }
   })
