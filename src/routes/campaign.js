@@ -12,13 +12,14 @@ module.exports = async function campaignRoutes(fastify) {
 
   // สร้าง campaign ใหม่
   fastify.post('/api/campaigns', async (req, reply) => {
-    const { id, name, type, voice_id, script, status } = req.body || {}
+    // ห้าม destructure เฉพาะบางฟิลด์ — เคยพลาดตัดฟิลด์ sms_<outcome> ทิ้งไปตอน create ทั้งที่ PATCH (updateCampaign) ส่ง body ทั้งก้อนอยู่แล้ว ทำให้เลือก SMS template ตอนสร้างใหม่แล้วหายเงียบๆ
+    const { id, name } = req.body || {}
     if (!id || !name) return reply.code(400).send({ error: 'id and name required' })
 
     const existing = await sheetsService.getCampaign(id)
     if (existing) return reply.code(409).send({ error: 'Campaign id already exists' })
 
-    await sheetsService.addCampaign({ id, name, type, voice_id, script, status })
+    await sheetsService.addCampaign(req.body)
     return reply.send({ message: 'Campaign created' })
   })
 
@@ -31,7 +32,9 @@ module.exports = async function campaignRoutes(fastify) {
 
   // แก้ไข campaign เช่น prompt, voice_id, sms flags
   fastify.patch('/api/campaigns/:id', async (req, reply) => {
-    const updated = await sheetsService.updateCampaign(req.params.id, req.body || {})
+    // ตัด id ออกจาก body เสมอ — กันแก้ primary key ผ่าน PATCH โดยไม่เช็ค unique (ต่างจาก POST ที่เช็คซ้ำก่อนสร้าง)
+    const { id, ...updates } = req.body || {}
+    const updated = await sheetsService.updateCampaign(req.params.id, updates)
     if (!updated) return reply.code(404).send({ error: 'Campaign not found' })
     return reply.send({ message: 'Campaign updated' })
   })

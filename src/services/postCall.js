@@ -86,21 +86,25 @@ async function scheduleRetry(phone) {
 async function handleSmsFollowup(session, outcome) {
   const { campaign, phone, name } = session
 
-  // เช็ค campaign-level setting
-  const campaignAllows = campaign[`sms_${outcome}`] === 'TRUE' || campaign[`sms_${outcome}`] === true
-  if (!campaignAllows) return
+  // campaign.sms_<outcome> เก็บ template id ที่เลือกไว้สำหรับ outcome นี้ — ว่าง = ไม่ส่ง
+  const templateId = campaign[`sms_${outcome}`]
+  if (!templateId) return
 
   // เช็ค contact-level opt-in (ดูจาก session ว่ามี sms_opt ไหม)
   if (session.sms_opt === 'FALSE' || session.sms_opt === false) return
 
-  // ดึง template จาก Sheet
-  const template = await sheetsService.getSmsTemplate(outcome)
-  if (!template) return
+  // เผื่อ template ถูกลบไปแล้วแต่ campaign ยังอ้างอิง id เดิมอยู่ (หรือ campaign เก่าจากก่อนเปลี่ยนมาใช้ template — ค่าเดิมเป็น 'TRUE'/'FALSE' ไม่ใช่ id จริง)
+  // ไม่ส่งอะไรแทนที่จะ error แต่ log ไว้เตือน จะได้ไม่งงว่าทำไม SMS ไม่ออก
+  const template = await sheetsService.getSmsTemplateById(templateId)
+  if (!template) {
+    console.warn(`[SMS] Skipped — campaign.sms_${outcome}="${templateId}" ไม่ตรงกับ template ใดเลย (ลบไปแล้ว หรือเป็นค่าเก่าจากก่อนเปลี่ยนมาใช้ template)`)
+    return
+  }
 
-  const body = template.replace('{name}', name)
+  const body = template.template_text.replace('{name}', name)
 
   await sendSms(phone, body)
-  console.log(`[SMS] Sent to ${phone} (${outcome})`)
+  console.log(`[SMS] Sent to ${phone} (${outcome}, template=${templateId})`)
 }
 
 module.exports = { postCallHandler }

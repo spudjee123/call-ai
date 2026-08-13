@@ -255,10 +255,26 @@ const sheetsService = {
     return updateRowByKey(SHEETS.RESULTS, 'call_sid', callSid, { recording_url: recordingUrl })
   },
 
-  async getSmsTemplate(outcome) {
+  // เทมเพลตเป็น library แยกอิสระ ไม่ผูกกับ outcome โดยตรง — campaign แต่ละอันเลือกเองว่า outcome ไหนจะใช้เทมเพลตไหน (เก็บ template id ไว้ที่ campaign.sms_<outcome>)
+  async getSmsTemplateById(id) {
     const rows = await getRows(SHEETS.TEMPLATES)
-    const tmpl = rows.find(r => r.outcome === outcome)
-    return tmpl ? tmpl.template_text : null
+    return rows.find(r => r.id === id) || null
+  },
+
+  async getSmsTemplates() {
+    return getRows(SHEETS.TEMPLATES)
+  },
+
+  async addSmsTemplate({ id, name, template_text }) {
+    await appendRowByFields(SHEETS.TEMPLATES, { id, name, template_text })
+  },
+
+  async updateSmsTemplate(id, updates) {
+    return updateRowByKey(SHEETS.TEMPLATES, 'id', id, updates)
+  },
+
+  async deleteSmsTemplate(id) {
+    return deleteRowByKey(SHEETS.TEMPLATES, 'id', id)
   },
 
   async getCallResults({ limit = 50, campaignId, phone } = {}) {
