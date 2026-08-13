@@ -86,11 +86,24 @@ async function* askClaudeStream(session, isGreeting = false, signal = null) {
 
   if (!msgs.length) { yield 'สวัสดีค่ะ'; return }
 
+  // แคช prefix ของบทสนทนาด้วย — ทำเครื่องหมายที่ข้อความล่าสุดของ request นี้
+  // เทิร์นถัดไปจะมี history ชุดเดิม + ข้อความใหม่ต่อท้าย จึงอ่าน prefix เดิมจาก cache ได้
+  // (ข้าม greeting เพราะเรียกแค่ครั้งเดียวต่อสาย ไม่มีการใช้ซ้ำให้คุ้มค่าเขียน cache)
+  const cachedMsgs = isGreeting ? msgs : msgs.map((m, i) =>
+    i === msgs.length - 1
+      ? { role: m.role, content: [{ type: 'text', text: m.content, cache_control: { type: 'ephemeral' } }] }
+      : m
+  )
+
   const response = await client.messages.create({
     model: 'claude-sonnet-4-6',
     max_tokens: 200,
-    system: systemPrompt,
-    messages: msgs,
+    // แคช system prompt ไว้ — เหมือนกันทุก turn ในสายเดียวกัน (ต่างแค่ชื่อลูกค้าข้ามสาย)
+    // ทำให้ turn ถัดไปในสายเดียวกันไม่ต้องประมวลผล system prompt ซ้ำทั้งก้อน
+    system: [
+      { type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } }
+    ],
+    messages: cachedMsgs,
   }, { signal })
 
   if (signal?.aborted) return
