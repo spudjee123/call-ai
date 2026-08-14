@@ -118,7 +118,7 @@
   .sidebar-header .sub { color: var(--sidebar-text); font-size: 12px; margin-top: 3px; padding-left: 19px; }
   .nav { flex: 1; padding: 8px 12px; display: flex; flex-direction: column; gap: 2px; }
   .nav button {
-    all: unset; cursor: pointer; color: var(--sidebar-text); font-size: 13.5px; font-weight: 500;
+    all: unset; box-sizing: border-box; cursor: pointer; color: var(--sidebar-text); font-size: 13.5px; font-weight: 500;
     padding: 9px 12px; border-radius: 12px; display: flex; align-items: center; gap: 11px;
     transition: background .15s ease, color .15s ease;
   }
@@ -128,7 +128,7 @@
   .nav button.active svg { opacity: 1; }
   .sidebar-footer { padding: 14px; border-top: 1px solid var(--glass-border); }
   .sidebar-footer button {
-    all: unset; cursor: pointer; width: 100%; color: var(--sidebar-text); font-size: 13px;
+    all: unset; box-sizing: border-box; cursor: pointer; width: 100%; color: var(--sidebar-text); font-size: 13px;
     padding: 9px 12px; border-radius: 12px; display: flex; align-items: center; gap: 10px;
   }
   .sidebar-footer button:hover { background: rgba(255,255,255,.08); color: #fff; }
@@ -160,7 +160,7 @@
   .card-body.pad-top { padding-top: 24px; }
 
   .segmented { display: inline-flex; gap: 3px; background: var(--surface-2); padding: 3px; border-radius: 999px; border: 1px solid var(--glass-border); }
-  .segmented button { all: unset; cursor: pointer; font-size: 12.5px; font-weight: 600; padding: 7px 14px; border-radius: 999px; color: var(--text-2); }
+  .segmented button { all: unset; box-sizing: border-box; cursor: pointer; font-size: 12.5px; font-weight: 600; padding: 7px 14px; border-radius: 999px; color: var(--text-2); }
   .segmented button.active { background: var(--glass-bg-strong); color: var(--text); box-shadow: 0 1px 3px rgba(0,0,0,.08); }
 
   .btn {
@@ -326,7 +326,7 @@
   .import-preview td { padding: 8px 10px; }
   .row-invalid td { opacity: .45; text-decoration: line-through; }
   .tab-toggle { display: flex; gap: 4px; background: var(--surface-2); padding: 3px; border-radius: 10px; border: 1px solid var(--glass-border); margin-bottom: 14px; width: fit-content; }
-  .tab-toggle button { all: unset; cursor: pointer; font-size: 12.5px; font-weight: 600; padding: 7px 14px; border-radius: 8px; color: var(--text-2); }
+  .tab-toggle button { all: unset; box-sizing: border-box; cursor: pointer; font-size: 12.5px; font-weight: 600; padding: 7px 14px; border-radius: 8px; color: var(--text-2); }
   .tab-toggle button.active { background: var(--glass-bg-strong); color: var(--text); box-shadow: 0 1px 3px rgba(0,0,0,.08); }
   .tab-panel { display: none; } .tab-panel.active { display: block; }
 
@@ -338,7 +338,7 @@
   .modal-head { padding: 18px 22px; border-bottom: 1px solid var(--glass-border); display: flex; justify-content: space-between; align-items: flex-start; }
   .modal-head h3 { font-size: 16px; }
   .modal-head .sub { font-size: 12.5px; color: var(--text-2); margin-top: 3px; }
-  .modal-close { all: unset; cursor: pointer; color: var(--text-3); padding: 4px; border-radius: 8px; }
+  .modal-close { all: unset; box-sizing: border-box; cursor: pointer; color: var(--text-3); padding: 4px; border-radius: 8px; }
   .modal-close:hover { background: var(--surface-2); color: var(--text); }
   .modal-meta { padding: 14px 22px; background: var(--surface-2); border-bottom: 1px solid var(--glass-border); display: grid; grid-template-columns: repeat(auto-fit, minmax(150px,1fr)); gap: 10px; }
   .modal-meta .k { font-size: 11px; color: var(--text-3); text-transform: uppercase; letter-spacing: .03em; margin-bottom: 3px; }
