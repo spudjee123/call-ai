@@ -90,9 +90,6 @@ async function handleSmsFollowup(session, outcome) {
   const templateId = campaign[`sms_${outcome}`]
   if (!templateId) return
 
-  // เช็ค contact-level opt-in (ดูจาก session ว่ามี sms_opt ไหม)
-  if (session.sms_opt === 'FALSE' || session.sms_opt === false) return
-
   // เผื่อ template ถูกลบไปแล้วแต่ campaign ยังอ้างอิง id เดิมอยู่ (หรือ campaign เก่าจากก่อนเปลี่ยนมาใช้ template — ค่าเดิมเป็น 'TRUE'/'FALSE' ไม่ใช่ id จริง)
   // ไม่ส่งอะไรแทนที่จะ error แต่ log ไว้เตือน จะได้ไม่งงว่าทำไม SMS ไม่ออก
   const template = await sheetsService.getSmsTemplateById(templateId)
@@ -132,4 +129,4 @@ async function handleSmsFollowup(session, outcome) {
   }
 }
 
-module.exports = { postCallHandler }
+module.exports = { postCallHandler, handleSmsFollowup }

@@ -39,10 +39,37 @@ module.exports = async function campaignRoutes(fastify) {
     return reply.send({ message: 'Campaign updated' })
   })
 
-  // ลบ campaign ทิ้งจริง (hard delete) — ไม่กระทบ contact/ประวัติการโทรเก่าที่อ้างอิง id นี้อยู่
+  // ลบ campaign ทิ้งจริง (hard delete) — ไม่กระทบประวัติการโทรเก่าที่อ้างอิง id นี้อยู่
   // (แค่จะแสดงเป็น id ดิบแทนชื่อ campaign แทน — ดู campaignName() ใน admin.html)
+  // ถ้ายังมีเบอร์ที่ยังไม่ได้โทร (pending) หรือรอโทรซ้ำ (retry_pending) ผูกอยู่ ต้องระบุวิธีจัดการก่อนถึงจะลบได้ — กันเบอร์ค้างแบบไม่มีใครรู้ตัวหลังลบ
+  // ใช้ getContacts ธรรมดาแล้ว filter เอง (ไม่ใช้ getPendingContacts ที่เช็คแค่ pending) เพราะ retry_pending ก็ต้องกันด้วย —
+  // retryScheduler.js เจอ campaign ที่ถูกลบไปแล้วจะข้ามเงียบๆ (if (!campaign) continue) ทำให้เบอร์เหล่านี้ค้างสถานะ retry_pending ตลอดไปถ้าไม่กันตรงนี้
   fastify.delete('/api/campaigns/:id', async (req, reply) => {
-    const deleted = await sheetsService.deleteCampaign(req.params.id)
+    const id = req.params.id
+    const contactsInCampaign = await sheetsService.getContacts({ campaignId: id })
+    const pending = contactsInCampaign.filter(c => c.status === 'pending' || c.status === 'retry_pending')
+
+    if (pending.length) {
+      const { resolution, targetCampaignId } = req.body || {}
+      if (resolution === 'move') {
+        if (!targetCampaignId || targetCampaignId === id) {
+          return reply.code(400).send({ error: 'ต้องเลือก Campaign ปลายทางอื่นจากที่จะลบ' })
+        }
+        const target = await sheetsService.getCampaign(targetCampaignId)
+        if (!target) return reply.code(400).send({ error: 'ไม่พบ Campaign ปลายทาง' })
+        await Promise.all(pending.map(c => sheetsService.updateContact(c.phone, { campaign: targetCampaignId })))
+      } else if (resolution === 'cancel') {
+        await Promise.all(pending.map(c => sheetsService.updateContact(c.phone, { status: 'deleted' })))
+      } else {
+        return reply.code(409).send({
+          error: `มีเบอร์ที่ยังไม่เสร็จสิ้น (รอโทร/รอโทรซ้ำ) ${pending.length} เบอร์ผูกกับ Campaign นี้อยู่ ต้องเลือกวิธีจัดการก่อนลบ`,
+          pendingCount: pending.length,
+          needsResolution: true,
+        })
+      }
+    }
+
+    const deleted = await sheetsService.deleteCampaign(id)
     if (!deleted) return reply.code(404).send({ error: 'Campaign not found' })
     return reply.send({ message: 'Campaign deleted' })
   })

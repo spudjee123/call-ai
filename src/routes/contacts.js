@@ -11,9 +11,9 @@ module.exports = async function contactsRoutes(fastify) {
     return reply.send(contacts)
   })
 
-  // ลงชื่อเบอร์ใหม่
+  // ลงชื่อเบอร์ใหม่ — status ไม่รับจาก client เสมอเป็น pending (แก้ผ่าน PATCH/DELETE แทน)
   fastify.post('/api/contacts', async (req, reply) => {
-    const { name, campaign, status } = req.body || {}
+    const { name, campaign } = req.body || {}
     const phone = normalizePhone(req.body?.phone)
     if (!phone || !campaign) {
       return reply.code(400).send({ error: 'phone and campaign required' })
@@ -21,7 +21,9 @@ module.exports = async function contactsRoutes(fastify) {
     if (!isValidPhone(phone)) {
       return reply.code(400).send({ error: 'Invalid phone number' })
     }
-    await sheetsService.addContact({ phone, name: name || '', campaign, status: status || 'pending' })
+    const campaignExists = await sheetsService.getCampaign(campaign)
+    if (!campaignExists) return reply.code(400).send({ error: 'ไม่พบ Campaign นี้ในระบบ' })
+    await sheetsService.addContact({ phone, name: name || '', campaign, status: 'pending' })
     return reply.send({ message: 'Contact added' })
   })
 
@@ -31,6 +33,8 @@ module.exports = async function contactsRoutes(fastify) {
     if (!Array.isArray(contacts) || !contacts.length || !campaign) {
       return reply.code(400).send({ error: 'contacts[] and campaign required' })
     }
+    const campaignExists = await sheetsService.getCampaign(campaign)
+    if (!campaignExists) return reply.code(400).send({ error: 'ไม่พบ Campaign นี้ในระบบ' })
     const rows = contacts
       .map(c => ({ phone: normalizePhone(c.phone), name: c.name || '' }))
       .filter(c => isValidPhone(c.phone))

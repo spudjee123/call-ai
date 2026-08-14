@@ -614,13 +614,14 @@ function toast(msg, type='success'){
   stack.appendChild(el)
   setTimeout(() => { el.style.transition='opacity .2s'; el.style.opacity='0'; setTimeout(()=>el.remove(), 200) }, 2600)
 }
-function openConfirm({title, message, confirmLabel='ยืนยัน', danger=true, onConfirm}){
+function openConfirm({title, message, confirmLabel='ยืนยัน', danger=true, extraHtml='', onConfirm}){
   const ov = document.getElementById('confirmOverlay')
   ov.innerHTML = `
     <div class="confirm-box">
       <div class="confirm-icon ${danger?'danger':'safe'}">${icon(danger?'warn':'check')}</div>
       <h3>${esc(title)}</h3>
       <p>${esc(message)}</p>
+      ${extraHtml}
       <div class="confirm-actions">
         <button class="btn" onclick="document.getElementById('confirmOverlay').classList.remove('open')">ยกเลิก</button>
         <button class="btn ${danger?'btn-danger':'btn-accent'}" id="confirmYes">${esc(confirmLabel)}</button>
@@ -1229,14 +1230,50 @@ function confirmStop(id){
     }
   })
 }
-function confirmDeleteCampaign(id){
+// ดึงเบอร์สดจาก server เสมอ (ไม่ใช้ contactsCache) — contactsCache ว่างเปล่าถ้ายังไม่เคยเปิดหน้าเบอร์ติดต่อในเซสชันนี้เลย
+// ซึ่งจะทำให้เข้าใจผิดว่าไม่มีเบอร์ค้าง ทั้งที่มีจริง (backend ยังกันไว้อยู่ แต่ UI จะไม่โชว์ตัวเลือกจัดการให้)
+// นับทั้ง pending และ retry_pending (เบอร์รอโทรซ้ำ) — ให้ตรงกับที่ backend เช็คก่อนลบ ไม่งั้น UI กับ backend จะไม่ตรงกัน
+async function confirmDeleteCampaign(id){
   const c = campaignsCache.find(x => x.id === id)
+  const contactsRes = await apiFetch(`/api/contacts?campaignId=${encodeURIComponent(id)}`)
+  const contactsInCampaign = contactsRes.ok ? await contactsRes.json() : []
+  const pending = contactsInCampaign.filter(x => x.status === 'pending' || x.status === 'retry_pending')
+  const otherCampaigns = campaignsCache.filter(x => x.id !== id)
+
+  let extraHtml = ''
+  if (pending.length) {
+    extraHtml = `
+      <div class="field" style="text-align:left; margin-top:6px">
+        <label style="display:flex; align-items:center; gap:8px; margin-bottom:8px">
+          <input type="radio" name="delCampaignResolution" value="move" ${otherCampaigns.length ? 'checked' : 'disabled'}>
+          ย้ายเบอร์เหล่านี้ไป Campaign อื่น
+        </label>
+        <select id="delCampaignTarget" style="width:100%; margin:0 0 12px 26px; max-width:calc(100% - 26px)" ${otherCampaigns.length ? '' : 'disabled'}>
+          ${otherCampaigns.length
+            ? otherCampaigns.map(x => `<option value="${esc(x.id)}">${esc(x.name || x.id)}</option>`).join('')
+            : '<option value="">— ไม่มี Campaign อื่น —</option>'}
+        </select>
+        <label style="display:flex; align-items:center; gap:8px">
+          <input type="radio" name="delCampaignResolution" value="cancel" ${otherCampaigns.length ? '' : 'checked'}>
+          ปิดเบอร์เหล่านี้ (ยกเลิก ไม่โทรอีก)
+        </label>
+      </div>`
+  }
+
   openConfirm({
     title: 'ลบ Campaign นี้?',
-    message: `"${c ? c.name : id}" จะถูกลบถาวร — เบอร์และประวัติการโทรเก่าที่เคยผูกกับ campaign นี้จะยังอยู่ แต่จะแสดงเป็นรหัส campaign แทนชื่อ`,
+    message: pending.length
+      ? `"${c ? c.name : id}" มีเบอร์ที่ยังไม่เสร็จสิ้น (รอโทร/รอโทรซ้ำ) ${pending.length} เบอร์ผูกอยู่ — เลือกวิธีจัดการก่อนลบ`
+      : `"${c ? c.name : id}" จะถูกลบถาวร — เบอร์และประวัติการโทรเก่าที่เคยผูกกับ campaign นี้จะยังอยู่ แต่จะแสดงเป็นรหัส campaign แทนชื่อ`,
     confirmLabel: 'ลบถาวร',
+    extraHtml,
     onConfirm: async () => {
-      const res = await apiFetch(`/api/campaigns/${encodeURIComponent(id)}`, { method: 'DELETE' })
+      const body = {}
+      if (pending.length) {
+        body.resolution = document.querySelector('input[name="delCampaignResolution"]:checked')?.value
+        if (body.resolution === 'move') body.targetCampaignId = document.getElementById('delCampaignTarget')?.value
+      }
+      const res = await apiFetch(`/api/campaigns/${encodeURIComponent(id)}`, { method: 'DELETE', body })
       if (!res.ok) { const data = await res.json().catch(()=>({})); toast(data.error || 'ลบไม่สำเร็จ', 'danger'); return }
       toast('ลบ campaign แล้ว', 'danger')
       loadCampaigns()
@@ -2235,7 +2272,16 @@ function exportHistoryCsv(){
   const rows = getFilteredHistory()
   if (!rows.length) { toast('ไม่มีข้อมูลให้ออกรายงาน', 'danger'); return }
   const cols = ['phone','name','campaign_id','call_status','outcome','summary','key_points','next_action','duration','timestamp']
-  const escCsv = v => `"${String(v==null?'':v).replace(/"/g,'""')}"`
+  // เติม ' นำหน้าถ้าค่าขึ้นต้นด้วยอักขระที่ Excel/Sheets ตีความเป็นสูตร (มาตรฐาน OWASP CSV injection) — ใช้กับทุกคอลัมน์รวมถึง phone ด้วย
+  // เคยลองยกเว้นคอลัมน์ phone (เพราะขึ้นต้นด้วย + เสมอจาก normalizePhone ไม่ใช่ข้อความอิสระ) แต่ทดสอบเปิดจริงด้วย Excel (COM automation) แล้วพบว่า
+  // ถ้าไม่มี ' นำหน้า Excel จะตีความ "+66812345678" เป็นตัวเลขแล้วโชว์เป็น "6.68E+10" (เลขหาย/อ่านไม่ออกเลย) แย่กว่าการมี ' ค้างให้เห็นมาก
+  // ' นำหน้าเลยจำเป็นสำหรับ phone ด้วยเหตุผลด้าน Excel ล้วนๆ ไม่ใช่แค่ความปลอดภัย — และยังกันเบอร์ที่หลุด normalizePhone มา
+  // (เช่น "=1234567890" ผ่าน validation ได้จริงเพราะเช็คแค่จำนวนหลัก ไม่เช็คอักขระนำหน้า) ไม่ให้กลายเป็นสูตรตอนเปิดไฟล์ด้วย
+  const escCsv = v => {
+    let s = String(v==null?'':v)
+    if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`
+    return `"${s.replace(/"/g,'""')}"`
+  }
   const lines = [cols.join(',')].concat(rows.map(c => cols.map(k => escCsv(c[k])).join(',')))
   const blob = new Blob(['﻿' + lines.join('\n')], { type: 'text/csv;charset=utf-8' })
   const url = URL.createObjectURL(blob)
