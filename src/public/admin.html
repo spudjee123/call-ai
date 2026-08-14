@@ -14,6 +14,7 @@
     --glass-bg-strong: rgba(255,255,255,.78);
     --glass-border: rgba(255,255,255,.65);
     --surface-2: rgba(255,255,255,.62);
+    --surface-solid: #ffffff;
     --text: #1a1a1f;
     --text-2: #63636d;
     --text-3: #8b8b94;
@@ -44,6 +45,7 @@
       --glass-bg-strong: rgba(30,28,42,.78);
       --glass-border: rgba(255,255,255,.10);
       --surface-2: rgba(255,255,255,.07);
+      --surface-solid: #17161f;
       --text: #f3f2fa;
       --text-2: #a4a3b3;
       --text-3: #78778a;
@@ -65,7 +67,7 @@
     color-scheme: dark;
     --bg: #06060a; --mesh-1: #4d3fc7; --mesh-2: #1478a8; --mesh-3: #a83a72; --dot: rgba(255,255,255,.055);
     --glass-bg: rgba(30,28,42,.55); --glass-bg-strong: rgba(30,28,42,.78); --glass-border: rgba(255,255,255,.10);
-    --surface-2: rgba(255,255,255,.07); --text: #f3f2fa; --text-2: #a4a3b3; --text-3: #78778a;
+    --surface-2: rgba(255,255,255,.07); --surface-solid: #17161f; --text: #f3f2fa; --text-2: #a4a3b3; --text-3: #78778a;
     --accent: #8b7bff; --accent-2: #34d3f0; --accent-hover: #a396ff; --accent-soft: rgba(139,123,255,.2);
     --success: #35d573; --success-soft: rgba(53,213,115,.16); --danger: #ff5468; --danger-soft: rgba(255,84,104,.18);
     --warning: #ffab3a; --warning-soft: rgba(255,171,58,.18); --sidebar-bg: rgba(10,9,16,.75);
@@ -183,6 +185,11 @@
     font-family: inherit; font-size: 14px; padding: 10px 13px; border-radius: var(--radius-sm);
     border: 1px solid var(--glass-border); background: var(--surface-2); color: var(--text); width: 100%;
   }
+  /* ตัว <select> ปิดอยู่ใช้ --surface-2 (โปร่งแสง) ได้เพราะวางทับพื้นหลังของหน้าเว็บเองอยู่แล้ว
+     แต่รายการตัวเลือกที่กางออกมาเป็น popup ระดับ OS แยกจากพื้นหลังของหน้าเว็บ สีโปร่งแสงเลยจาง/มองไม่ออก
+     ต้องใช้สีทึบ (--surface-solid) แทน ถึงจะอ่านออกชัดเจนไม่ว่าเบราว์เซอร์ไหน */
+  select option { background: var(--surface-solid); color: var(--text); }
+  select option:disabled { color: var(--text-3); }
   input::placeholder, textarea::placeholder { color: var(--text-3); }
   input:focus, select:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: 0; border-color: transparent; }
   textarea { min-height: 140px; resize: vertical; line-height: 1.55; }
