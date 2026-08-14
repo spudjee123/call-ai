@@ -440,7 +440,7 @@
       <div class="topbar">
         <h1 id="pageTitle">Dashboard</h1>
         <div class="row" style="gap:8px">
-          <button class="live-badge clickable" id="healthPill"><span class="pulse"></span> กำลังตรวจสอบ...</button>
+          <button class="live-badge clickable" id="healthPill" onclick="openHealthModal()"><span class="pulse"></span> กำลังตรวจสอบ...</button>
           <span class="live-badge" id="activeBadge"><span class="pulse"></span> <span id="activeCount">0</span> สายที่กำลังคุยอยู่</span>
         </div>
       </div>
@@ -508,6 +508,13 @@ const ICONS = {
 const icon = (name, cls) => `<span class="${cls||''}" style="display:inline-flex">${ICONS[name]||''}</span>`
 const HANGUP_LABELS = { ai_ended: 'AI ปิดสายปกติ', customer_hangup: 'ลูกค้าวางสายเอง', silence_timeout: 'หมดเวลาเงียบ ไม่ตอบสนอง', manual_hangup: 'เจ้าหน้าที่ตัดสาย (ปุ่มฉุกเฉิน)', max_duration: 'ครบเวลาสูงสุดของสาย' }
 const CALL_STATUS_LABELS = { completed: 'เชื่อมสายสำเร็จ', 'no-answer': 'ไม่รับสาย', busy: 'สายไม่ว่าง', failed: 'โทรไม่ติด', canceled: 'ยกเลิกก่อนโทร' }
+// sent/failed มาจาก postCall.js ตอนส่งจริง — ค่าอื่นๆ (เช่น delivery) มาจาก DR ที่ ThaiBulkSMS ยิงกลับมาทีหลัง
+// ยังไม่รู้ค่าที่เป็นไปได้ทั้งหมดจากเอกสาร ThaiBulkSMS เลย fallback โชว์ค่าดิบตรงๆ ถ้าไม่ตรงกับที่ map ไว้
+const SMS_STATUS_LABELS = { sent: 'ส่งแล้ว (รอผลส่งถึง)', delivery: 'ถึงมือลูกค้าแล้ว', failed: 'ส่งไม่สำเร็จ' }
+function smsStatusBadge(status){
+  const cls = status === 'failed' ? 'danger' : (status === 'delivery' ? 'success' : 'warning')
+  return `<span class="pill" style="background:var(--${cls}-soft); color:var(--${cls})">${esc(SMS_STATUS_LABELS[status] || status)}</span>`
+}
 // ผลของบทสนทนา (ต่างจาก call_status ที่บอกแค่ว่าเชื่อมสายได้ไหม) — บางค่าซ้ำกับ call_status ได้
 // เพราะสายที่เชื่อมไม่ติด (busy/failed/no-answer/canceled) จะถูกเก็บเป็น outcome ตรงๆ ด้วยเช่นกัน
 const OUTCOME_LABELS = {
@@ -643,7 +650,8 @@ function openHistoryModal(i){
     <div><div class="k">การเชื่อมต่อ</div><div class="v"><span class="pill ${esc(c.call_status)}">${esc(CALL_STATUS_LABELS[c.call_status] || c.call_status)}</span></div></div>
     <div><div class="k">ผล</div><div class="v">${c.outcome && c.outcome!=='-' ? `<span class="pill ${esc(c.outcome)}">${esc(outcomeLabel(c.outcome))}</span>` : '—'}</div></div>
     <div><div class="k">วางสายโดย</div><div class="v">${c.hangup_reason ? esc(HANGUP_LABELS[c.hangup_reason]||c.hangup_reason) : '—'}</div></div>
-    <div><div class="k">เวลาคุย</div><div class="v num">${fmtDur(c.duration)}</div></div>`
+    <div><div class="k">เวลาคุย</div><div class="v num">${fmtDur(c.duration)}</div></div>
+    ${c.sms_status ? `<div><div class="k">SMS follow-up</div><div class="v">${smsStatusBadge(c.sms_status)}</div></div>` : ''}`
   const notes = [
     ['สรุป', c.summary],
     ['ประเด็นสำคัญ', c.key_points],
@@ -1778,6 +1786,33 @@ async function pollHealth(){
 }
 setInterval(() => { if (token) pollHealth() }, 30000)
 
+const HEALTH_TYPE_LABELS = { tts: 'เสียงพูด (TTS)', stt: 'แปลงเสียงเป็นข้อความ (STT)', ai_tts: 'AI + เสียงพูด' }
+// รายละเอียด error ที่ปุ่มสถานะระบบมุมขวาบนมีอยู่แล้วจาก /api/health/status แต่เดิมไม่เคยเอามาโชว์ (โชว์แค่ตัวเลขรวม)
+async function openHealthModal(){
+  stopLivePolling()
+  document.getElementById('modalTitle').textContent = 'สถานะระบบ'
+  document.getElementById('modalSubtitle').textContent = 'ข้อผิดพลาด TTS / STT / AI ในช่วง 10 นาทีที่ผ่านมา'
+  document.getElementById('modalMeta').innerHTML = ''
+  document.getElementById('modalNotes').innerHTML = ''
+  document.getElementById('modalMessages').innerHTML = '<div class="empty">กำลังโหลด...</div>'
+  document.getElementById('modalOverlay').classList.add('open')
+  try {
+    const res = await apiFetch('/api/health/status')
+    const data = await res.json()
+    if (!data.events?.length) {
+      document.getElementById('modalMessages').innerHTML = `<div class="empty">${icon('check')} ไม่พบข้อผิดพลาดในช่วง 10 นาทีที่ผ่านมา</div>`
+      return
+    }
+    document.getElementById('modalMessages').innerHTML = data.events.slice().reverse().map(e => `
+      <div style="padding:10px 12px; margin-bottom:8px; background:var(--surface-2); border:1px solid var(--glass-border); border-radius:var(--radius-sm)">
+        <div style="font-size:12px; color:var(--text-2); font-weight:600; margin-bottom:4px">${esc(HEALTH_TYPE_LABELS[e.type] || e.type)} · ${esc(fmtDate(e.time))}</div>
+        <div style="font-size:13.5px; word-break:break-word">${esc(e.message)}</div>
+      </div>`).join('')
+  } catch (e) {
+    document.getElementById('modalMessages').innerHTML = '<div class="empty">โหลดไม่สำเร็จ</div>'
+  }
+}
+
 /* ==================== contacts ==================== */
 let blocklistCache = new Set()
 async function loadContacts(){
@@ -2177,6 +2212,7 @@ function renderHistoryRows(){
       <td>
         ${c.outcome && c.outcome !== '-' ? `<span class="pill ${esc(c.outcome)}">${esc(outcomeLabel(c.outcome))}</span>` : '<span style="color:var(--text-3)">—</span>'}
         ${needsFollowup ? `<span title="${escAttr('ต้องติดตามต่อ: ' + c.next_action)}" style="margin-left:5px">📌</span>` : ''}
+        ${c.sms_status ? `<span title="${escAttr('SMS: ' + (SMS_STATUS_LABELS[c.sms_status] || c.sms_status))}" style="margin-left:5px">${c.sms_status === 'failed' ? '📵' : '📩'}</span>` : ''}
       </td>
       <td style="color:var(--text-2)">${esc((c.summary||'').substring(0,40))}</td>
       <td class="num">${fmtDur(c.duration)}</td>

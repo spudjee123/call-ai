@@ -261,6 +261,16 @@ const sheetsService = {
     return updateRowByKey(SHEETS.RESULTS, 'call_sid', callSid, { recording_url: recordingUrl })
   },
 
+  // บันทึก message_id ตอนส่ง SMS follow-up เสร็จ (ผูกกับแถวผลการโทรผ่าน call_sid) — ต้องมีคอลัมน์ sms_message_id, sms_status ในชีต Call Results
+  async updateCallResultSmsStatus(callSid, { messageId, status }) {
+    return updateRowByKey(SHEETS.RESULTS, 'call_sid', callSid, { sms_message_id: messageId || '', sms_status: status || '' })
+  },
+
+  // /webhook/sms-dr เรียกตอน ThaiBulkSMS แจ้งผลส่งจริง — หาแถวด้วย message_id ที่บันทึกไว้ตอนส่ง แล้วอัปเดตสถานะทับ
+  async updateSmsDeliveryStatus(messageId, status) {
+    return updateRowByKey(SHEETS.RESULTS, 'sms_message_id', messageId, { sms_status: status })
+  },
+
   // เทมเพลตเป็น library แยกอิสระ ไม่ผูกกับ outcome โดยตรง — campaign แต่ละอันเลือกเองว่า outcome ไหนจะใช้เทมเพลตไหน (เก็บ template id ไว้ที่ campaign.sms_<outcome>)
   async getSmsTemplateById(id) {
     const rows = await getRows(SHEETS.TEMPLATES)

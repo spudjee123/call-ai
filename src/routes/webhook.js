@@ -134,6 +134,16 @@ module.exports = async function webhookRoutes(fastify) {
   fastify.get('/webhook/sms-dr', async (req, reply) => {
     const { Transaction, Status, Time } = req.query
     console.log(`[SMS DR] Transaction=${Transaction} Status=${Status} Time=${Time}`)
+    // ผูกกลับเข้าแถวผลการโทรที่มี sms_message_id ตรงกัน (บันทึกไว้ตอนส่ง SMS ใน postCall.js)
+    // ไม่มีแถวไหนตรง (เช่น column ยังไม่ถูกสร้าง หรือ template.sender ผิด) แค่ log เตือน ไม่ทำให้ webhook นี้ error
+    if (Transaction && Status) {
+      try {
+        const updated = await sheetsService.updateSmsDeliveryStatus(Transaction, Status)
+        if (!updated) console.warn(`[SMS DR] ไม่พบแถวที่มี sms_message_id=${Transaction}`)
+      } catch (err) {
+        console.error('[SMS DR] Update error:', err.message)
+      }
+    }
     return reply.send({ ok: true })
   })
 }
