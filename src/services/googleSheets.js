@@ -9,7 +9,8 @@ const SHEETS = {
   CAMPAIGNS: 'Campaigns',
   RESULTS: 'Call Results',
   TEMPLATES: 'SMS Templates',
-  BLOCKLIST: 'Blocklist'
+  BLOCKLIST: 'Blocklist',
+  SENDER_NAMES: 'Sender Names'
 }
 
 let sheets = null
@@ -265,8 +266,8 @@ const sheetsService = {
     return getRows(SHEETS.TEMPLATES)
   },
 
-  async addSmsTemplate({ id, name, template_text }) {
-    await appendRowByFields(SHEETS.TEMPLATES, { id, name, template_text })
+  async addSmsTemplate({ id, name, template_text, sender }) {
+    await appendRowByFields(SHEETS.TEMPLATES, { id, name, template_text, sender: sender || '' })
   },
 
   async updateSmsTemplate(id, updates) {
@@ -275,6 +276,29 @@ const sheetsService = {
 
   async deleteSmsTemplate(id) {
     return deleteRowByKey(SHEETS.TEMPLATES, 'id', id)
+  },
+
+  // ชื่อผู้ส่ง SMS ที่ลงทะเบียนไว้กับ ThaiBulkSMS แล้ว — template.sender เก็บ id นี้ไว้ (ไม่ใช่ตัวชื่อตรงๆ)
+  // เพื่อให้แก้ไข/ลบชื่อได้โดยไม่ต้องไล่แก้ทุก template ที่อ้างอิงอยู่
+  async getSenderNameById(id) {
+    const rows = await getRows(SHEETS.SENDER_NAMES)
+    return rows.find(r => r.id === id) || null
+  },
+
+  async getSenderNames() {
+    return getRows(SHEETS.SENDER_NAMES)
+  },
+
+  async addSenderName({ id, name }) {
+    await appendRowByFields(SHEETS.SENDER_NAMES, { id, name })
+  },
+
+  async updateSenderName(id, updates) {
+    return updateRowByKey(SHEETS.SENDER_NAMES, 'id', id, updates)
+  },
+
+  async deleteSenderName(id) {
+    return deleteRowByKey(SHEETS.SENDER_NAMES, 'id', id)
   },
 
   async getCallResults({ limit = 50, campaignId, phone } = {}) {

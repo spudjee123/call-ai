@@ -1,7 +1,7 @@
 const { v4: uuidv4 } = require('uuid')
 const { summarizeCall } = require('./claude')
 const { sheetsService } = require('./googleSheets')
-const { sendSms } = require('./twilio')
+const { sendSms } = require('./thaiBulkSms')
 const { callQueue } = require('../utils/callQueue')
 
 const MAX_RETRIES = 3
@@ -103,7 +103,15 @@ async function handleSmsFollowup(session, outcome) {
 
   const body = template.template_text.replace('{name}', name)
 
-  await sendSms(phone, body)
+  // แต่ละ template เลือกชื่อผู้ส่ง (sender) ของตัวเองได้ — template.sender เก็บ id ของ Sender Name ไว้ ต้อง resolve เป็นชื่อจริงก่อนส่ง
+  // ชื่อถูกลบไปแล้ว หรือยังไม่ได้เลือกไว้เลย → ส่ง undefined ให้ thaiBulkSms.js ไป fallback ใช้ค่า default ใน .env เอง
+  let senderName
+  if (template.sender) {
+    const senderRow = await sheetsService.getSenderNameById(template.sender)
+    if (!senderRow) console.warn(`[SMS] template.sender="${template.sender}" ไม่ตรงกับ Sender Name ใดเลย (ลบไปแล้ว) — ใช้ค่า default แทน`)
+    senderName = senderRow?.name
+  }
+  await sendSms(phone, body, senderName)
   console.log(`[SMS] Sent to ${phone} (${outcome}, template=${templateId})`)
 }
 

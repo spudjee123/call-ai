@@ -18,6 +18,7 @@ fastify.register(async function protectedApi(f) {
   f.register(require('./routes/dashboard'))
   f.register(require('./routes/contacts'))
   f.register(require('./routes/smsTemplates'))
+  f.register(require('./routes/senderNames'))
 })
 
 // WebSocket plugin + route must be registered together so the plugin

@@ -61,17 +61,9 @@ async function makeOutboundCall(contact, campaign, onCallCreated) {
   return call
 }
 
-async function sendSms(to, body) {
-  return client.messages.create({
-    to,
-    from: process.env.TWILIO_PHONE_NUMBER,
-    body,
-  })
-}
-
 // วางสายทันที — ใช้กับปุ่มฉุกเฉินใน /admin
 async function hangupCall(callSid) {
   return client.calls(callSid).update({ status: 'completed' })
 }
 
-module.exports = { makeOutboundCall, sendSms, hangupCall }
+module.exports = { makeOutboundCall, hangupCall }

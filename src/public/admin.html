@@ -698,9 +698,9 @@ function openLiveModal(callSid, phone, name){
 }
 
 /* ==================== router ==================== */
-const PAGES = ['dashboard','campaigns','contacts','test','history','lookup','sms']
-const TITLES = { dashboard:'Dashboard', campaigns:'Campaigns', contacts:'เบอร์ติดต่อ', test:'ทดสอบโทร', history:'ประวัติการโทร', lookup:'ค้นหาเบอร์', sms:'SMS Templates' }
-const NAV_ICON = { dashboard:'dashboard', campaigns:'campaigns', contacts:'contacts', test:'test', history:'history', lookup:'search', sms:'chat' }
+const PAGES = ['dashboard','campaigns','contacts','test','history','lookup','sms','senders']
+const TITLES = { dashboard:'Dashboard', campaigns:'Campaigns', contacts:'เบอร์ติดต่อ', test:'ทดสอบ', history:'ประวัติการโทร', lookup:'ค้นหาเบอร์', sms:'SMS Templates', senders:'Sender Names' }
+const NAV_ICON = { dashboard:'dashboard', campaigns:'campaigns', contacts:'contacts', test:'test', history:'history', lookup:'search', sms:'chat', senders:'sheet' }
 
 function buildNav(){
   document.getElementById('nav').innerHTML = PAGES.map(p =>
@@ -842,16 +842,35 @@ const TEMPLATES = {
 
   test: () => `
     <div class="card">
-      <div class="card-head"><h2>${icon('test')} ยิงโทรทดสอบ</h2></div>
+      <div class="card-head"><h2>${icon('test')} ทดสอบ</h2></div>
       <div class="card-body pad-top">
-        <p style="font-size:13px; color:var(--text-2); margin-bottom:18px">ใช้ pipeline เดียวกับแคมเปญจริง เสียค่าโทร/AI จริง ไม่บันทึกลง Contacts</p>
-        <div class="row">
-          <div class="field" style="flex:1; min-width:180px"><input type="tel" id="testPhone" placeholder="+66812345678"></div>
-          <div class="field" style="flex:1; min-width:160px"><input type="text" id="testName" placeholder="ชื่อ (ไม่บังคับ)"></div>
-          <div class="field" style="min-width:200px"><select id="testCampaign" class="campaign-select"><option value="">-- เลือก Campaign --</option></select></div>
-          <button class="btn btn-accent" onclick="testCall()">${icon('test')} โทรทดสอบ</button>
+        <div class="tab-toggle" id="testTabs">
+          <button data-t="call" class="active">${icon('test')} โทรทดสอบ</button>
+          <button data-t="sms">${icon('chat')} ส่ง SMS ทดสอบ</button>
         </div>
-        <div class="msg" id="testCallMsg" style="font-size:13px; color:var(--text-2); min-height:18px; margin-top:6px"></div>
+
+        <div class="tab-panel active" id="testtab-call">
+          <p style="font-size:13px; color:var(--text-2); margin-bottom:18px">ใช้ pipeline เดียวกับแคมเปญจริง เสียค่าโทร/AI จริง ไม่บันทึกลง Contacts</p>
+          <div class="row">
+            <div class="field" style="flex:1; min-width:180px"><input type="tel" id="testPhone" placeholder="+66812345678"></div>
+            <div class="field" style="flex:1; min-width:160px"><input type="text" id="testName" placeholder="ชื่อ (ไม่บังคับ)"></div>
+            <div class="field" style="min-width:200px"><select id="testCampaign" class="campaign-select"><option value="">-- เลือก Campaign --</option></select></div>
+            <button class="btn btn-accent" onclick="testCall()">${icon('test')} โทรทดสอบ</button>
+          </div>
+          <div class="msg" id="testCallMsg" style="font-size:13px; color:var(--text-2); min-height:18px; margin-top:6px"></div>
+        </div>
+
+        <div class="tab-panel" id="testtab-sms">
+          <p style="font-size:13px; color:var(--text-2); margin-bottom:18px">ส่ง SMS จริงตาม Template ที่เลือก เสียเครดิต ThaiBulkSMS จริง ไม่บันทึกลง Call Results</p>
+          <div class="row">
+            <div class="field" style="flex:1; min-width:180px"><input type="tel" id="testSmsPhone" placeholder="+66812345678"></div>
+            <div class="field" style="flex:1; min-width:160px"><input type="text" id="testSmsName" oninput="updateTestSmsPreview()" placeholder="ชื่อ (ไม่บังคับ แทน {name})"></div>
+            <div class="field" style="min-width:220px"><select id="testSmsTemplate" onchange="updateTestSmsPreview()"><option value="">-- เลือก Template --</option></select></div>
+            <button class="btn btn-accent" onclick="testSendSms()">${icon('test')} ส่ง SMS ทดสอบ</button>
+          </div>
+          <div id="testSmsPreview" style="margin-top:10px; padding:10px 12px; background:var(--surface-2); border:1px solid var(--glass-border); border-radius:var(--radius-sm); font-size:13.5px; line-height:1.6; white-space:pre-wrap; word-break:break-word; min-height:20px; color:var(--text-2); display:none"></div>
+          <div class="msg" id="testSmsMsg" style="font-size:13px; color:var(--text-2); min-height:18px; margin-top:6px"></div>
+        </div>
       </div>
     </div>`,
 
@@ -921,6 +940,24 @@ const TEMPLATES = {
         <div id="smsTemplatePanel"></div>
       </div>
     </div>`,
+
+  senders: () => `
+    <div class="card">
+      <div class="card-head">
+        <h2>Sender Names</h2>
+        <button class="btn btn-accent btn-sm" onclick="openSenderNameCreate()">${icon('plus')} Sender ใหม่</button>
+      </div>
+      <div class="card-body pad-top">
+        <p style="font-size:13px; color:var(--text-2); margin-bottom:14px">ชื่อผู้ส่ง SMS ที่ลงทะเบียนไว้กับ ThaiBulkSMS แล้ว — ต้องพิมพ์ตรงตัวเป๊ะกับที่ลงทะเบียนไว้ เพิ่ม/แก้ไข/ลบที่นี่เมื่อไปลงทะเบียนเพิ่มหรือเลิกใช้ชื่อเดิม แต่ละ SMS Template จะเลือกใช้ชื่อไหนก็ได้จากรายการนี้</p>
+        <div class="card-body table-scroll" style="padding:0">
+          <table>
+            <thead><tr><th>ชื่อ</th><th></th></tr></thead>
+            <tbody id="senderNameTable"><tr><td colspan="2" class="empty">กำลังโหลด...</td></tr></tbody>
+          </table>
+        </div>
+        <div id="senderNamePanel"></div>
+      </div>
+    </div>`,
 }
 
 const INIT = {
@@ -947,18 +984,29 @@ const INIT = {
     await loadCampaigns()
     await loadContacts()
   },
-  test: async () => { await loadCampaigns() },
+  test: async () => {
+    document.getElementById('testTabs').addEventListener('click', e => {
+      const btn = e.target.closest('button'); if (!btn) return
+      document.querySelectorAll('#testTabs button').forEach(b => b.classList.remove('active'))
+      btn.classList.add('active')
+      document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'))
+      document.getElementById('testtab-' + btn.dataset.t).classList.add('active')
+    })
+    await Promise.all([loadCampaigns(), loadSmsTemplates()])
+    populateTestSmsTemplateSelect()
+  },
   history: async () => {
     await loadCampaigns()
     await loadLogs()
   },
   lookup: async () => { await loadCampaigns() },
   sms: async () => {
-    // loadSmsTemplates() render ตัวเองทันทีที่ตอบกลับ โดยใช้ campaignsCache ประกอบ (เช็คว่า template ไหนถูกใช้บ้าง)
-    // ถ้า loadCampaigns() ยังโหลดไม่เสร็จตอนนั้น จะเห็นรายการ "ยังไม่มี campaign ไหนใช้" ผิดๆ ชั่วคราว — render ซ้ำอีกทีหลังทั้งคู่เสร็จให้ชัวร์
-    await Promise.all([loadSmsTemplates(), loadCampaigns()])
+    // loadSmsTemplates() render ตัวเองทันทีที่ตอบกลับ โดยใช้ campaignsCache/senderNamesCache ประกอบ (เช็คว่า template ไหนถูกใช้บ้าง / sender ชื่ออะไร)
+    // ถ้า loadCampaigns() หรือ loadSenderNames() ยังโหลดไม่เสร็จตอนนั้น จะเห็นข้อมูลผิดๆ ชั่วคราว — render ซ้ำอีกทีหลังทั้งหมดเสร็จให้ชัวร์
+    await Promise.all([loadSmsTemplates(), loadCampaigns(), loadSenderNames()])
     renderSmsTemplateTable()
   },
+  senders: async () => { await Promise.all([loadSenderNames(), loadSmsTemplates()]); renderSenderNameTable() },
 }
 
 /* ==================== campaigns ==================== */
@@ -1021,7 +1069,7 @@ function campaignEditPanelHtml(c, isNew){
         <div class="field"><label>ประเภท</label><select id="cf_type"><option value="outbound" ${c.type==='inbound'?'':'selected'}>outbound</option><option value="inbound" ${c.type==='inbound'?'selected':''}>inbound</option></select></div>
       </div>
       <div class="field" style="margin-bottom:16px"><label>Prompt / Script</label><textarea id="cf_script" placeholder="System prompt ที่ AI ใช้พูดกับลูกค้า">${esc(c.script || c.system_prompt || '')}</textarea></div>
-      <label style="font-size:12px; color:var(--text-2); font-weight:600">ส่ง SMS follow-up เมื่อผลเป็น — เลือก template ที่จะใช้ต่อผลลัพธ์</label>
+      <label style="font-size:12px; color:var(--text-2); font-weight:600">ส่ง SMS follow-up เมื่อผลเป็น — เลือก template ที่จะใช้ต่อผลลัพธ์ (แต่ละ template มี Sendername ของตัวเองอยู่แล้ว)</label>
       <div style="margin:6px 0 18px">
         ${SMS_OUTCOME_KEYS.map(k => {
           const selected = c['sms_'+k] || ''
@@ -1178,7 +1226,7 @@ function renderSmsTemplateTable(){
       : `<div style="margin-top:5px; font-size:11.5px; color:var(--text-3)">ยังไม่มี campaign ไหนใช้</div>`
     return `
     <tr>
-      <td><div style="font-weight:600">${esc(t.name)}</div><div class="num" style="font-size:11.5px;color:var(--text-3)">${esc(t.id)}</div></td>
+      <td><div style="font-weight:600">${esc(t.name)}</div><div class="num" style="font-size:11.5px;color:var(--text-3)">${esc(t.id)}</div>${t.sender ? `<div style="font-size:11.5px;color:var(--text-3)">ส่งจาก: ${esc(senderName(t.sender))}</div>` : ''}</td>
       <td style="color:var(--text-2); max-width:420px">
         ${esc((t.template_text||'').substring(0,80))}${(t.template_text||'').length>80?'…':''}
         ${usageHtml}
@@ -1208,6 +1256,13 @@ function smsTemplateEditPanelHtml(t, isNew){
       <div class="grid-2" style="margin-bottom:16px">
         ${isNew ? `<div class="field"><label>Template ID (รันอัตโนมัติ แก้ไขเองได้)</label><input type="text" id="st_id" placeholder="เช่น tmpl03" value="${esc(t.suggestedId || '')}"></div>` : `<input type="hidden" id="st_id" value="${esc(t.id)}">`}
         <div class="field"><label>ชื่อ Template</label><input type="text" id="st_name" value="${esc(t.name||'')}" placeholder="เช่น ขอบคุณลูกค้าสนใจ"></div>
+      </div>
+      <div class="field" style="margin-bottom:16px; max-width:260px">
+        <label>Sendername</label>
+        <select id="st_sender">
+          <option value="">เลือก Sendername</option>
+          ${senderNamesCache.map(s => `<option value="${escAttr(s.id)}" ${t.sender===s.id?'selected':''}>${esc(s.name)}</option>`).join('')}
+        </select>
       </div>
       <div class="field" style="margin-bottom:6px">
         <label>ข้อความ SMS (ใช้ {name} แทนชื่อลูกค้าได้)</label>
@@ -1267,9 +1322,10 @@ async function createSmsTemplate(){
   if (!id) { msgEl.textContent = 'กรอก Template ID ก่อน'; return }
   const name = document.getElementById('st_name').value.trim()
   const template_text = document.getElementById('st_text').value.trim()
+  const sender = document.getElementById('st_sender').value
   if (!name || !template_text) { msgEl.textContent = 'กรอกชื่อและข้อความก่อน'; return }
   try {
-    const res = await apiFetch('/api/sms-templates', { method: 'POST', body: { id, name, template_text } })
+    const res = await apiFetch('/api/sms-templates', { method: 'POST', body: { id, name, template_text, sender } })
     const data = await res.json()
     if (!res.ok) { msgEl.textContent = data.error || 'สร้างไม่สำเร็จ'; return }
     toast('สร้าง template แล้ว')
@@ -1282,9 +1338,10 @@ async function saveSmsTemplate(){
   const msgEl = document.getElementById('smsTemplateEditMsg')
   const name = document.getElementById('st_name').value.trim()
   const template_text = document.getElementById('st_text').value.trim()
+  const sender = document.getElementById('st_sender').value
   if (!name || !template_text) { msgEl.textContent = 'กรอกชื่อและข้อความก่อน'; return }
   try {
-    const res = await apiFetch(`/api/sms-templates/${encodeURIComponent(id)}`, { method: 'PATCH', body: { name, template_text } })
+    const res = await apiFetch(`/api/sms-templates/${encodeURIComponent(id)}`, { method: 'PATCH', body: { name, template_text, sender } })
     const data = await res.json()
     if (!res.ok) { msgEl.textContent = data.error || 'บันทึกไม่สำเร็จ'; return }
     toast('บันทึกแล้ว')
@@ -1308,6 +1365,126 @@ function confirmDeleteSmsTemplate(id){
       toast('ลบ template แล้ว', 'danger')
       document.getElementById('smsTemplatePanel').innerHTML = ''
       loadSmsTemplates()
+    }
+  })
+}
+
+/* ==================== sender names ==================== */
+// ชื่อผู้ส่ง SMS ที่ลงทะเบียนไว้กับ ThaiBulkSMS แล้ว — SMS Template แต่ละอันเลือกใช้ id ของรายการนี้ (ไม่ใช่ชื่อตรงๆ)
+// เพื่อให้แก้ไข/ลบชื่อได้จากที่เดียว โดยไม่ต้องไล่แก้ทุก template ที่อ้างอิงอยู่
+let senderNamesCache = []
+async function loadSenderNames(){
+  const res = await apiFetch('/api/sender-names')
+  senderNamesCache = await res.json()
+  renderSenderNameTable()
+}
+function senderName(id){
+  const s = senderNamesCache.find(x => x.id === id)
+  return s ? s.name : id
+}
+// หา template ที่เลือกใช้ sender นี้อยู่ — ไว้โชว์ก่อนลบกันลบชื่อที่ยังใช้งานอยู่แบบไม่รู้ตัว
+function senderUsage(senderId){
+  return smsTemplatesCache.filter(t => t.sender === senderId)
+}
+function renderSenderNameTable(){
+  const tbody = document.getElementById('senderNameTable')
+  if (!tbody) return
+  if (!senderNamesCache.length) { tbody.innerHTML = '<tr><td colspan="2" class="empty">ยังไม่มี sender name — กด "Sender ใหม่" เพื่อเริ่มสร้าง</td></tr>'; return }
+  tbody.innerHTML = senderNamesCache.map(s => {
+    const usage = senderUsage(s.id)
+    const usageHtml = usage.length
+      ? `<div style="margin-top:5px; font-size:11.5px; color:var(--text-3)">ใช้ใน template: ${usage.map(t => esc(t.name)).join(', ')}</div>`
+      : `<div style="margin-top:5px; font-size:11.5px; color:var(--text-3)">ยังไม่มี template ไหนใช้</div>`
+    return `
+    <tr>
+      <td><div style="font-weight:600">${esc(s.name)}</div><div class="num" style="font-size:11.5px;color:var(--text-3)">${esc(s.id)}</div>${usageHtml}</td>
+      <td>
+        <div class="row" style="gap:2px; flex-wrap:nowrap">
+          <button class="btn btn-ghost btn-sm" onclick="openSenderNameEdit('${escJsAttr(s.id)}')">${icon('edit')} แก้ไข</button>
+          <button class="btn btn-icon btn-ghost btn-sm danger" title="ลบ" onclick="confirmDeleteSenderName('${escJsAttr(s.id)}')">${icon('trash')}</button>
+        </div>
+      </td>
+    </tr>`
+  }).join('')
+}
+// หา id ถัดไปที่ยังไม่ถูกใช้ จากรูปแบบ sndNN ที่มีอยู่ — แค่คำแนะนำเริ่มต้น ผู้ใช้แก้เองได้เสมอ
+function nextSenderNameId(){
+  const nums = senderNamesCache
+    .map(s => (s.id || '').match(/^snd(\d+)$/))
+    .filter(Boolean)
+    .map(m => parseInt(m[1], 10))
+  const next = (nums.length ? Math.max(...nums) : 0) + 1
+  return 'snd' + String(next).padStart(2, '0')
+}
+function senderNameEditPanelHtml(s, isNew){
+  return `
+    <div style="margin-top:20px; border-top:1px solid var(--glass-border); padding-top:20px">
+      <h3 style="font-size:14.5px; margin-bottom:16px">${isNew ? 'สร้าง Sender ใหม่' : 'แก้ไข: ' + esc(s.name)}</h3>
+      <div class="grid-2" style="margin-bottom:16px">
+        ${isNew ? `<div class="field"><label>Sender ID (รันอัตโนมัติ แก้ไขเองได้)</label><input type="text" id="sn_id" placeholder="เช่น snd06" value="${esc(s.suggestedId || '')}"></div>` : `<input type="hidden" id="sn_id" value="${esc(s.id)}">`}
+        <div class="field"><label>ชื่อผู้ส่ง (Sendername) — ต้องตรงกับที่ลงทะเบียนไว้กับ ThaiBulkSMS เป๊ะๆ</label><input type="text" id="sn_name" value="${esc(s.name||'')}" placeholder="เช่น PDDOG"></div>
+      </div>
+      <div class="row">
+        <button class="btn btn-accent" onclick="${isNew ? 'createSenderName()' : 'saveSenderName()'}">${isNew ? 'สร้าง Sender' : 'บันทึก'}</button>
+        <button class="btn" onclick="document.getElementById('senderNamePanel').innerHTML=''">ยกเลิก</button>
+        <span class="msg" id="senderNameEditMsg" style="font-size:13px; color:var(--text-2)"></span>
+      </div>
+    </div>`
+}
+function openSenderNameCreate(){
+  document.getElementById('senderNamePanel').innerHTML = senderNameEditPanelHtml({ suggestedId: nextSenderNameId() }, true)
+  document.getElementById('senderNamePanel').scrollIntoView({ behavior: 'smooth', block: 'start' })
+}
+function openSenderNameEdit(id){
+  const s = senderNamesCache.find(x => x.id === id)
+  if (!s) return
+  document.getElementById('senderNamePanel').innerHTML = senderNameEditPanelHtml(s, false)
+}
+async function createSenderName(){
+  const id = document.getElementById('sn_id').value.trim()
+  const msgEl = document.getElementById('senderNameEditMsg')
+  if (!id) { msgEl.textContent = 'กรอก Sender ID ก่อน'; return }
+  const name = document.getElementById('sn_name').value.trim()
+  if (!name) { msgEl.textContent = 'กรอกชื่อผู้ส่งก่อน'; return }
+  try {
+    const res = await apiFetch('/api/sender-names', { method: 'POST', body: { id, name } })
+    const data = await res.json()
+    if (!res.ok) { msgEl.textContent = data.error || 'สร้างไม่สำเร็จ'; return }
+    toast('สร้าง sender แล้ว')
+    document.getElementById('senderNamePanel').innerHTML = ''
+    loadSenderNames()
+  } catch (e) {}
+}
+async function saveSenderName(){
+  const id = document.getElementById('sn_id').value
+  const msgEl = document.getElementById('senderNameEditMsg')
+  const name = document.getElementById('sn_name').value.trim()
+  if (!name) { msgEl.textContent = 'กรอกชื่อผู้ส่งก่อน'; return }
+  try {
+    const res = await apiFetch(`/api/sender-names/${encodeURIComponent(id)}`, { method: 'PATCH', body: { name } })
+    const data = await res.json()
+    if (!res.ok) { msgEl.textContent = data.error || 'บันทึกไม่สำเร็จ'; return }
+    toast('บันทึกแล้ว')
+    document.getElementById('senderNamePanel').innerHTML = ''
+    loadSenderNames()
+  } catch (e) {}
+}
+function confirmDeleteSenderName(id){
+  const s = senderNamesCache.find(x => x.id === id)
+  const usage = senderUsage(id)
+  const usageWarning = usage.length
+    ? ` กำลังถูกใช้อยู่ใน template: ${usage.map(t => t.name).join(', ')} — template เหล่านี้จะส่ง SMS โดยใช้ชื่อ default ใน .env แทนทันที`
+    : ' ยังไม่มี template ไหนใช้ sender นี้อยู่'
+  openConfirm({
+    title: 'ลบ Sender นี้?',
+    message: `"${s ? s.name : id}" จะถูกลบถาวร —${usageWarning}`,
+    confirmLabel: 'ลบถาวร',
+    onConfirm: async () => {
+      const res = await apiFetch(`/api/sender-names/${encodeURIComponent(id)}`, { method: 'DELETE' })
+      if (!res.ok) { const data = await res.json().catch(()=>({})); toast(data.error || 'ลบไม่สำเร็จ', 'danger'); return }
+      toast('ลบ sender แล้ว', 'danger')
+      document.getElementById('senderNamePanel').innerHTML = ''
+      loadSenderNames()
     }
   })
 }
@@ -1776,6 +1953,41 @@ async function testCall(){
     msgEl.textContent = ''
     toast(`กำลังโทรไป ${phone}`)
     setTimeout(() => refreshActiveGlobal(false), 3000)
+  } catch (e) {}
+}
+
+/* ==================== test sms ==================== */
+function populateTestSmsTemplateSelect(){
+  const sel = document.getElementById('testSmsTemplate')
+  if (!sel) return
+  const current = sel.value
+  sel.innerHTML = '<option value="">-- เลือก Template --</option>' + smsTemplatesCache.map(t => `<option value="${escAttr(t.id)}">${esc(t.name)}</option>`).join('')
+  sel.value = current
+  updateTestSmsPreview()
+}
+function updateTestSmsPreview(){
+  const previewEl = document.getElementById('testSmsPreview')
+  if (!previewEl) return
+  const t = smsTemplatesCache.find(x => x.id === document.getElementById('testSmsTemplate').value)
+  if (!t) { previewEl.style.display = 'none'; return }
+  const name = document.getElementById('testSmsName').value.trim() || 'ทดสอบ'
+  const senderLine = t.sender ? `ส่งจาก: ${senderName(t.sender)}` : 'ยังไม่ได้เลือก Sendername ใน template นี้ — จะ fallback ไปใช้ default ใน .env'
+  previewEl.style.display = ''
+  previewEl.textContent = `${t.template_text.replace(/\{name\}/g, name)}\n\n${senderLine}`
+}
+async function testSendSms(){
+  const phone = document.getElementById('testSmsPhone').value.trim()
+  const name = document.getElementById('testSmsName').value.trim()
+  const templateId = document.getElementById('testSmsTemplate').value
+  const msgEl = document.getElementById('testSmsMsg')
+  if (!phone || !templateId) { msgEl.textContent = 'กรอกเบอร์และเลือก template ก่อน'; return }
+  msgEl.textContent = 'กำลังส่ง...'
+  try {
+    const res = await apiFetch(`/api/sms-templates/${encodeURIComponent(templateId)}/test-send`, { method: 'POST', body: { phone, name } })
+    const data = await res.json()
+    if (!res.ok) { msgEl.textContent = data.error || 'ส่งไม่สำเร็จ'; return }
+    msgEl.textContent = ''
+    toast(`ส่ง SMS ทดสอบไป ${phone} แล้ว`)
   } catch (e) {}
 }
 
