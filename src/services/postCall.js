@@ -101,7 +101,7 @@ async function handleSmsFollowup(session, outcome) {
     return
   }
 
-  const body = template.template_text.replace('{name}', name)
+  const body = template.template_text.replace(/\{name\}/g, name)
 
   // แต่ละ template เลือกชื่อผู้ส่ง (sender) ของตัวเองได้ — template.sender เก็บ id ของ Sender Name ไว้ ต้อง resolve เป็นชื่อจริงก่อนส่ง
   // ชื่อถูกลบไปแล้ว หรือยังไม่ได้เลือกไว้เลย → ส่ง undefined ให้ thaiBulkSms.js ไป fallback ใช้ค่า default ใน .env เอง

@@ -46,7 +46,7 @@ module.exports = async function smsTemplateRoutes(fastify) {
       const senderRow = await sheetsService.getSenderNameById(template.sender)
       senderName = senderRow?.name
     }
-    const body = template.template_text.replace('{name}', name || 'ทดสอบ')
+    const body = template.template_text.replace(/\{name\}/g, name || 'ทดสอบ')
 
     try {
       const result = await sendSms(phone, body, senderName)

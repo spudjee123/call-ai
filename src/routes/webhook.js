@@ -91,4 +91,13 @@ module.exports = async function webhookRoutes(fastify) {
 
     return reply.send({ ok: true })
   })
+
+  // ThaiBulkSMS Delivery Report — ยิงมาแบบ GET เท่านั้น (ช่องทาง SMS รองรับแค่ Method GET)
+  // query: Transaction (=message_id จากตอนส่ง), Status, Time — ต้องตั้ง Webhook URL นี้ไว้ที่หน้า API Key ของ ThaiBulkSMS เอง
+  // (ใช้งานได้เฉพาะเครดิตประเภท Corporate เท่านั้น ถ้าส่งด้วยเครดิต standard จะไม่มี DR ยิงเข้ามา)
+  fastify.get('/webhook/sms-dr', async (req, reply) => {
+    const { Transaction, Status, Time } = req.query
+    console.log(`[SMS DR] Transaction=${Transaction} Status=${Status} Time=${Time}`)
+    return reply.send({ ok: true })
+  })
 }

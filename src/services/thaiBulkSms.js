@@ -10,9 +10,17 @@ const DEFAULT_SENDER = process.env.THAIBULKSMS_SENDER
 // sender ระบุได้ต่อครั้ง (แต่ละ campaign เลือกชื่อผู้ส่งของตัวเองได้) — ไม่ระบุจะ fallback ไปใช้ค่า default ใน .env
 async function sendSms(to, body, sender) {
   try {
+    // /sms ต้องการ body แบบ application/x-www-form-urlencoded (ตามเอกสาร ThaiBulkSMS) ไม่ใช่ JSON —
+    // ส่ง plain object เข้า axios.post ตรงๆ จะกลาย เป็น Content-Type: application/json ผิดรูปแบบเงียบๆ
+    const params = new URLSearchParams()
+    params.append('msisdn', to)
+    params.append('message', body)
+    const senderValue = sender || DEFAULT_SENDER
+    if (senderValue) params.append('sender', senderValue)
+
     const response = await axios.post(
       API_URL,
-      { msisdn: to, message: body, sender: sender || DEFAULT_SENDER },
+      params,
       { auth: { username: API_KEY, password: API_SECRET } }
     )
     const data = response.data
