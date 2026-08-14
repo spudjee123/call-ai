@@ -25,8 +25,11 @@ async function scanRetries() {
 }
 
 function startRetryScheduler() {
+  // สแกนทันทีตอน start ด้วย — ไม่งั้นทุกครั้งที่แอป restart/redeploy เบอร์ที่ถึงคิวโทรซ้ำแล้วต้องรอ
+  // รอบ setInterval แรกอีกสูงสุด 15 นาทีถัดไป ทั้งที่จริงๆ ถึงเวลาโทรซ้ำไปแล้วตั้งแต่ก่อน restart
+  scanRetries()
   setInterval(scanRetries, SCAN_INTERVAL_MS)
-  console.log('[Retry] Scheduler started (ทุก 15 นาที)')
+  console.log('[Retry] Scheduler started (สแกนทันที แล้วทุก 15 นาทีถัดจากนี้)')
 }
 
 module.exports = { startRetryScheduler }

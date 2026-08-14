@@ -175,7 +175,12 @@ const sheetsService = {
 
   async getDefaultInboundCampaign() {
     const rows = await getRows(SHEETS.CAMPAIGNS)
-    return rows.find(r => r.status === 'active' && r.type === 'inbound') || rows[0] || {}
+    // เดิม fallback ไป rows[0] แบบไม่กรอง type — ถ้า campaign แรกสุดในชีตเป็น outbound
+    // สายเข้าจะได้ script/prompt ของ outbound ไปใช้แบบผิดๆ เงียบๆ ตอนนี้ fallback แค่ในกลุ่ม inbound เท่านั้น
+    // ไม่มี inbound campaign เลยจริงๆ → คืน null ให้ webhook.js ตัดสินใจปฏิเสธสายแทนที่จะเดาเอา campaign อื่นมาใช้
+    return rows.find(r => r.status === 'active' && r.type === 'inbound')
+      || rows.find(r => r.type === 'inbound')
+      || null
   },
 
   async getCampaigns() {

@@ -2,6 +2,7 @@ const twilio = require('twilio')
 const { v4: uuidv4 } = require('uuid')
 const { sheetsService } = require('../services/googleSheets')
 const callSessions = require('../utils/callSessions')
+const { synthesizeSpeechWavThai } = require('../services/googleTTS')
 
 // เริ่มบันทึกเสียงทั้งสาย (สองแชนแนลแยก AI/ลูกค้า) แบบขนานกับ media stream — ไม่บล็อก TwiML ที่เหลือ
 function addRecording(twiml) {
@@ -11,6 +12,15 @@ function addRecording(twiml) {
     recordingStatusCallbackMethod: 'POST',
     trim: 'do-not-trim',
   })
+}
+
+// ข้อความไทยเมื่อสายเข้ามาแต่ไม่มี campaign type=inbound ในระบบเลย — cache ไว้หลัง gen ครั้งแรก
+// ไม่ยิง Google TTS ใหม่ทุกครั้งที่มีสายเข้ามาช่วงระบบยังไม่พร้อม (เคสนี้ควรเกิดไม่บ่อยอยู่แล้ว)
+const INBOUND_FALLBACK_TEXT = 'ขออภัยค่ะ ขณะนี้ระบบยังไม่พร้อมรับสาย กรุณาติดต่อใหม่อีกครั้ง'
+let inboundFallbackWavPromise = null
+function getInboundFallbackWav() {
+  if (!inboundFallbackWavPromise) inboundFallbackWavPromise = synthesizeSpeechWavThai(INBOUND_FALLBACK_TEXT)
+  return inboundFallbackWavPromise
 }
 
 module.exports = async function webhookRoutes(fastify) {
@@ -37,9 +47,23 @@ module.exports = async function webhookRoutes(fastify) {
   fastify.post('/webhook/inbound', async (req, reply) => {
     const callSid = req.body.CallSid
     const from = req.body.From
+    reply.header('Content-Type', 'text/xml')
 
     // หา campaign สำหรับ inbound
     const campaign = await sheetsService.getDefaultInboundCampaign()
+
+    // ไม่มี campaign type=inbound ในระบบเลย — ปฏิเสธสายอย่างสุภาพ แทนที่จะเดาเอา campaign อื่น (เช่น outbound) มาใช้แบบผิดบริบทเงียบๆ
+    // ใช้ <Play> เล่นไฟล์เสียงไทยที่ gen เองผ่าน Google TTS แทน <Say> ของ Twilio ตรงๆ
+    // เพราะเช็คเอกสาร Twilio แล้วไม่ยืนยันว่า th-TH อยู่ในภาษาที่ <Say> รองรับ — Google TTS ของเรา
+    // เป็นตัวเดียวกับที่ใช้พูดจริงทุกสายอยู่แล้ว มั่นใจได้ว่าออกเสียงไทยถูกต้องแน่นอน
+    if (!campaign) {
+      console.error('[Inbound] ไม่มี campaign type=inbound เลย — ปฏิเสธสาย')
+      const twiml = new twilio.twiml.VoiceResponse()
+      twiml.play(`${process.env.BASE_URL}/webhook/inbound-fallback.wav`)
+      twiml.hangup()
+      return reply.send(twiml.toString())
+    }
+
     callSessions.set(callSid, {
       callSid,
       phone: from,
@@ -57,7 +81,6 @@ module.exports = async function webhookRoutes(fastify) {
     const connect = twiml.connect()
     connect.stream({ url: wsUrl })
 
-    reply.header('Content-Type', 'text/xml')
     return reply.send(twiml.toString())
   })
 
@@ -90,6 +113,19 @@ module.exports = async function webhookRoutes(fastify) {
     }
 
     return reply.send({ ok: true })
+  })
+
+  // ไฟล์เสียงไทยที่ /webhook/inbound เรียกด้วย <Play> ตอนไม่มี campaign inbound ให้ใช้ — gen ครั้งแรกแล้ว cache ไว้
+  fastify.get('/webhook/inbound-fallback.wav', async (req, reply) => {
+    try {
+      const wav = await getInboundFallbackWav()
+      reply.header('Content-Type', 'audio/wav')
+      return reply.send(wav)
+    } catch (err) {
+      inboundFallbackWavPromise = null // reset cache กัน error ค้างตลอดไป ให้ครั้งถัดไป retry ใหม่ได้
+      console.error('[Inbound fallback audio] Gen error:', err.message)
+      return reply.code(502).send()
+    }
   })
 
   // ThaiBulkSMS Delivery Report — ยิงมาแบบ GET เท่านั้น (ช่องทาง SMS รองรับแค่ Method GET)

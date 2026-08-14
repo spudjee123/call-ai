@@ -343,8 +343,10 @@ function registerWebSocket(fastify) {
           let totalSent = 0
 
           // Safety: ถ้า Claude/TTS ค้างนานผิดปกติ ให้ unlock อัตโนมัติ
+          // เช็ค pipelineId ด้วย — ถ้า pipeline นี้ถูก barge-in ทิ้งไปแล้วและมี pipeline ใหม่เริ่มทำงานอยู่
+          // timer เก่านี้ต้องไม่ไปตัด isSpeaking/sttProcessing ของ pipeline ใหม่ที่กำลังทำงานปกติอยู่
           const processingGuard = setTimeout(() => {
-            if (sttProcessing) {
+            if (activePipelineId === pipelineId && sttProcessing) {
               console.error('[AI] sttProcessing stuck >30s — force reset')
               sttProcessing = false
               isSpeaking = false
@@ -416,8 +418,12 @@ function registerWebSocket(fastify) {
           } finally {
             clearTimeout(processingGuard)
             if (prewarmPromise === myPrewarm) clearPrewarm()
-            ttsAbortController = null
-            if (activePipelineId === pipelineId) sttProcessing = false
+            // เช็ค pipelineId ก่อน null ทิ้ง — ไม่งั้น pipeline เก่าที่เพิ่งโดน barge-in อาจไป null ทับ
+            // ttsAbortController ของ pipeline ใหม่ที่เพิ่งสร้างขึ้นมา ทำให้ barge-in ครั้งถัดไปตัดเสียง AI ไม่ขาด
+            if (activePipelineId === pipelineId) {
+              ttsAbortController = null
+              sttProcessing = false
+            }
           }
 
           if (fullText) {

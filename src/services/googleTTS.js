@@ -43,4 +43,17 @@ function isGoogleVoice(voiceId) {
   return /^[a-z]{2}-[A-Z]{2}-(Neural2|Wavenet|Standard)-[A-Z]$/.test(voiceId || '')
 }
 
-module.exports = { synthesizeSpeechThai, isGoogleVoice, DEFAULT_VOICE }
+// สร้างไฟล์ WAV เล่นได้จริงจาก URL (ใช้กับ TwiML <Play>) — ต่างจาก synthesizeSpeechThai ที่ทำ mulaw chunks สำหรับสตรีมสด
+// Google TTS แนบ WAV header มาให้เองอยู่แล้วตอนขอ LINEAR16 (เอกสาร Google ยืนยันชัดเจน) — ไม่ต้องห่อ header ซ้ำเอง
+// (เคยเขียน pcm16ToWav ห่อซ้ำไปรอบนึง ทำให้ได้ไฟล์เสีย เพราะข้างในกลายเป็น WAV header ซ้อน WAV header)
+async function synthesizeSpeechWavThai(text, voiceName) {
+  const voice = voiceName || DEFAULT_VOICE
+  const [response] = await client.synthesizeSpeech({
+    input: { text },
+    voice: { languageCode: 'th-TH', name: voice },
+    audioConfig: { audioEncoding: 'LINEAR16', sampleRateHertz: 8000 },
+  })
+  return Buffer.from(response.audioContent)
+}
+
+module.exports = { synthesizeSpeechThai, synthesizeSpeechWavThai, isGoogleVoice, DEFAULT_VOICE }
