@@ -42,9 +42,15 @@ module.exports = async function dashboardRoutes(fastify) {
     })
   })
 
-  // สถิติ summary — ?days=7|30|90 หรือ ?days=all (ยอดสะสมทั้งหมด ไม่ผูกกับช่วงวัน)
+  // สถิติ summary — ?days=7|30|90 หรือ ?days=all (ยอดสะสมทั้งหมด ไม่ผูกกับช่วงวัน) หรือ ?dateFrom=YYYY-MM-DD&dateTo=YYYY-MM-DD (เลือกวันที่เอง)
   fastify.get('/api/stats', async (req, reply) => {
-    const raw = req.query.days
+    const { dateFrom, dateTo, days: raw } = req.query
+    const isValidDate = d => /^\d{4}-\d{2}-\d{2}$/.test(d || '')
+    if (dateFrom && dateTo) {
+      if (!isValidDate(dateFrom) || !isValidDate(dateTo)) return reply.code(400).send({ error: 'Invalid date format, expected YYYY-MM-DD' })
+      if (dateFrom > dateTo) return reply.code(400).send({ error: 'dateFrom must not be after dateTo' })
+      return reply.send(await sheetsService.getStats({ dateFrom, dateTo }))
+    }
     const stats = raw === 'all'
       ? await sheetsService.getStats({ allTime: true })
       : await sheetsService.getStats({ days: Number(raw) || 7 })

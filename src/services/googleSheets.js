@@ -315,12 +315,44 @@ const sheetsService = {
   },
 
   // allTime: true ใช้ตอนต้องการยอดสะสมทั้งหมดไม่ผูกกับตัวกรองวัน (เช่นสถิติต่อ campaign ในหน้า Campaigns)
-  async getStats({ days = 7, allTime = false } = {}) {
+  // dateFrom/dateTo: ช่วงวันที่กำหนดเองแบบ absolute (YYYY-MM-DD) — ใช้แทน days ถ้าระบุมาทั้งคู่ (เลือกวันที่จากปฏิทินในหน้า Dashboard)
+  async getStats({ days = 7, allTime = false, dateFrom, dateTo } = {}) {
     const rows = await getRows(SHEETS.RESULTS)
     const today = new Date().toISOString().slice(0, 10)
-    const cutoff = new Date(Date.now() - (days - 1) * 86400000).toISOString().slice(0, 10)
-    // total/outcomes/byCampaign/avgDuration/conversionRate ผูกกับช่วงวันที่เลือกจริง (เดิมไม่ผูก ทำให้ตัวเลขไม่ตรงกับกราฟที่กรองอยู่)
-    const filteredRows = allTime ? rows : rows.filter(r => (r.timestamp || '').slice(0, 10) >= cutoff)
+
+    let filteredRows, dayBuckets
+
+    if (dateFrom && dateTo) {
+      // จำกัดสูงสุด 366 วัน กันเผลอเลือกช่วงกว้างเกินไป (เช่นพิมพ์ปีผิด) แล้ว bucket เยอะจนกราฟช้า/พัง
+      // ครอบทั้ง filteredRows และ dayBuckets ด้วยขอบเขตเดียวกันเป๊ะๆ — เดิมจำกัดแค่ dayBuckets ทำให้ total/outcomes
+      // (นับจาก filteredRows ที่ไม่ถูกตัด) รวมแถวเกิน 366 วันเข้าไปด้วย ตัวเลขสรุปเลยไม่ตรงกับผลรวมของกราฟรายวัน
+      // ต้องต่อท้ายด้วย Z (UTC) เสมอ — ถ้าไม่ใส่ new Date() จะ parse เป็นเวลาท้องถิ่นของเครื่อง แล้ว toISOString()
+      // แปลงกลับเป็น UTC จะได้วันที่เลื่อนไป 1 วันถ้าเครื่องรันอยู่ใน timezone ที่ไม่ใช่ UTC (เช่น Asia/Bangkok = UTC+7)
+      const maxEnd = new Date(dateFrom + 'T00:00:00Z')
+      maxEnd.setUTCDate(maxEnd.getUTCDate() + 365)
+      const cappedDateTo = new Date(dateTo + 'T00:00:00Z') > maxEnd ? maxEnd.toISOString().slice(0, 10) : dateTo
+
+      filteredRows = rows.filter(r => {
+        const day = (r.timestamp || '').slice(0, 10)
+        return day >= dateFrom && day <= cappedDateTo
+      })
+      dayBuckets = []
+      const cursor = new Date(dateFrom + 'T00:00:00Z')
+      const end = new Date(cappedDateTo + 'T00:00:00Z')
+      while (cursor <= end) {
+        dayBuckets.push({ key: cursor.toISOString().slice(0, 10), calls: 0, interested: 0 })
+        cursor.setUTCDate(cursor.getUTCDate() + 1)
+      }
+    } else {
+      const cutoff = new Date(Date.now() - (days - 1) * 86400000).toISOString().slice(0, 10)
+      // total/outcomes/byCampaign/avgDuration/conversionRate ผูกกับช่วงวันที่เลือกจริง (เดิมไม่ผูก ทำให้ตัวเลขไม่ตรงกับกราฟที่กรองอยู่)
+      filteredRows = allTime ? rows : rows.filter(r => (r.timestamp || '').slice(0, 10) >= cutoff)
+      dayBuckets = []
+      for (let i = days - 1; i >= 0; i--) {
+        const key = new Date(Date.now() - i * 86400000).toISOString().slice(0, 10)
+        dayBuckets.push({ key, calls: 0, interested: 0 })
+      }
+    }
 
     const total = filteredRows.length
     const outcomes = {}
@@ -330,11 +362,6 @@ const sheetsService = {
     let durationCount = 0
     let callsToday = 0
 
-    const dayBuckets = []
-    for (let i = days - 1; i >= 0; i--) {
-      const key = new Date(Date.now() - i * 86400000).toISOString().slice(0, 10)
-      dayBuckets.push({ key, calls: 0, interested: 0 })
-    }
     const bucketMap = new Map(dayBuckets.map(b => [b.key, b]))
 
     filteredRows.forEach(r => {

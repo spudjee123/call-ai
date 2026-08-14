@@ -724,16 +724,36 @@ let campaignsCache = []
 let contactsCache = []
 let historyCache = []
 let statsCache = null
-let historyDays = 7
+// วันที่ format YYYY-MM-DD ตาม local timezone ของเบราว์เซอร์ — ห้ามใช้ .toISOString() เฉยๆ เพราะแปลงเป็น UTC เสมอ
+// ถ้าเครื่องอยู่ timezone ที่ไม่ใช่ UTC (เช่น Asia/Bangkok) จะได้วันที่เพี้ยนไป 1 วันตอนดึกๆ/เช้ามืด
+function localDateStr(d){
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`
+}
 
 /* ==================== templates ==================== */
 const TEMPLATES = {
   dashboard: () => `
-    <div class="row" style="justify-content:space-between; margin-bottom:16px">
-      <div class="segmented" id="rangeSeg">
-        <button class="active" data-r="7">7 วัน</button>
-        <button data-r="30">30 วัน</button>
-        <button data-r="90">ไตรมาส</button>
+    <div class="row" style="justify-content:space-between; margin-bottom:16px; flex-wrap:wrap; gap:12px">
+      <div class="row" style="gap:10px; flex-wrap:wrap; align-items:flex-end">
+        <div class="field" style="width:auto">
+          <label>จากวันที่</label>
+          <input type="date" id="dashDateFrom" style="width:auto">
+        </div>
+        <div class="field" style="width:auto">
+          <label>ถึงวันที่</label>
+          <input type="date" id="dashDateTo" style="width:auto">
+        </div>
+        <select id="dashTimePreset" style="width:auto; min-width:140px" onchange="applyDashboardTimePreset(this.value)">
+          <option value="today">เวลา วันนี้</option>
+          <option value="yesterday">เมื่อวาน</option>
+          <option value="7d">7 วันที่ผ่านมา</option>
+          <option value="30d">30 วันที่ผ่านมา</option>
+          <option value="quarter">ไตรมาสนี้</option>
+        </select>
+        <select id="dashMonthPicker" style="width:auto; min-width:140px" onchange="applyDashboardMonth(this.value)">
+          <option value="">เลือกเดือน</option>
+        </select>
+        <button class="btn btn-accent btn-sm" onclick="applyDashboardDateRange()">${icon('search')} ค้นหา</button>
       </div>
       <div class="row" style="gap:14px">
         <span style="font-size:11.5px; color:var(--text-3)">${icon('history')} อัปเดตล่าสุด <span class="num" id="lastUpdated">-</span></span>
@@ -876,11 +896,11 @@ const TEMPLATES = {
 
   history: () => `
     <div class="card">
-      <div class="card-head">
+      <div class="card-head" style="flex-direction:column; align-items:stretch; gap:14px">
         <h2>ประวัติการโทร</h2>
-        <div class="row">
-          <select id="logCampaignFilter" class="campaign-select"><option value="">ทุก Campaign</option></select>
-          <select id="historyOutcomeFilter" onchange="historyFilterChanged()">
+        <div class="row" style="gap:8px; flex-wrap:wrap">
+          <select id="logCampaignFilter" class="campaign-select" onchange="loadLogs()" style="width:auto; min-width:170px"><option value="">ทุก Campaign</option></select>
+          <select id="historyOutcomeFilter" onchange="historyFilterChanged()" style="width:auto; min-width:150px">
             <option value="">ทุกผลลัพธ์</option>
             <option value="interested">สนใจ</option>
             <option value="not_interested">ไม่สนใจ</option>
@@ -893,12 +913,31 @@ const TEMPLATES = {
             <option value="failed">โทรไม่ติด</option>
             <option value="canceled">ยกเลิกก่อนโทร</option>
           </select>
-          <input type="date" id="historyDateFrom" title="ตั้งแต่วันที่" onchange="historyFilterChanged()" style="width:auto">
-          <input type="date" id="historyDateTo" title="ถึงวันที่" onchange="historyFilterChanged()" style="width:auto">
           <div class="search-wrap" style="max-width:220px">${icon('search')}<input id="historySearchInput" type="search" placeholder="ค้นหาเบอร์หรือชื่อ..." oninput="historyFilterChanged()" onkeydown="if(event.key==='Enter') loadLogs()"></div>
-          <button class="btn btn-sm btn-accent" onclick="loadLogs()">${icon('search')} ค้นหา</button>
           <button class="btn btn-sm" onclick="loadLogs()">รีเฟรช</button>
           <button class="btn btn-sm" onclick="exportHistoryCsv()">${icon('download')} ออกรายงาน CSV</button>
+        </div>
+        <div class="row" style="gap:10px; flex-wrap:wrap; align-items:flex-end; padding-top:12px; border-top:1px solid var(--glass-border)">
+          <div class="field" style="width:auto">
+            <label>จากวันที่</label>
+            <input type="date" id="historyDateFrom" style="width:auto">
+          </div>
+          <div class="field" style="width:auto">
+            <label>ถึงวันที่</label>
+            <input type="date" id="historyDateTo" style="width:auto">
+          </div>
+          <select id="historyTimePreset" style="width:auto; min-width:140px" onchange="applyHistoryTimePreset(this.value)">
+            <option value="" selected disabled>เวลา</option>
+            <option value="today">วันนี้</option>
+            <option value="yesterday">เมื่อวาน</option>
+            <option value="7d">7 วันที่ผ่านมา</option>
+            <option value="30d">30 วันที่ผ่านมา</option>
+            <option value="quarter">ไตรมาสนี้</option>
+          </select>
+          <select id="historyMonthPicker" style="width:auto; min-width:140px" onchange="applyHistoryMonth(this.value)">
+            <option value="">เลือกเดือน</option>
+          </select>
+          <button class="btn btn-accent btn-sm" onclick="historyFilterChanged()">${icon('search')} ค้นหา</button>
         </div>
       </div>
       <div class="card-body table-scroll">
@@ -962,13 +1001,7 @@ const TEMPLATES = {
 
 const INIT = {
   dashboard: async () => {
-    document.getElementById('rangeSeg').addEventListener('click', e => {
-      const btn = e.target.closest('button'); if (!btn) return
-      document.querySelectorAll('#rangeSeg button').forEach(b=>b.classList.remove('active'))
-      btn.classList.add('active')
-      historyDays = Number(btn.dataset.r)
-      loadStats()
-    })
+    initDashboardDateRange()
     await loadCampaigns()
     await Promise.all([loadStats(), refreshActiveGlobal(true)])
   },
@@ -1489,9 +1522,85 @@ function confirmDeleteSenderName(id){
   })
 }
 
+/* ==================== ช่วงวันที่แบบ from/to+เวลา+เลือกเดือน — ใช้ร่วมกันทั้ง Dashboard และ ประวัติการโทร ==================== */
+// คำนวณช่วงวันที่จาก preset ด่วน ("today"/"yesterday"/"7d"/"30d"/"quarter")
+function computePresetRange(value){
+  const today = new Date()
+  let from = new Date(today), to = new Date(today)
+  if (value === 'yesterday') { from.setDate(from.getDate() - 1); to = new Date(from) }
+  else if (value === '7d') from.setDate(from.getDate() - 6)
+  else if (value === '30d') from.setDate(from.getDate() - 29)
+  else if (value === 'quarter') from.setDate(from.getDate() - 89)
+  // 'today' ไม่ต้องทำอะไรเพิ่ม — from/to เป็นวันนี้อยู่แล้ว
+  return { from: localDateStr(from), to: localDateStr(to) }
+}
+// คำนวณช่วงวันที่ 1 ถึงวันสุดท้ายของเดือนที่เลือก (ถ้าเป็นเดือนปัจจุบัน ใช้วันนี้แทนวันสุดท้าย กันเลือกวันที่ในอนาคต)
+function computeMonthRange(value){
+  const [y, m] = value.split('-').map(Number)
+  const today = new Date()
+  const first = new Date(y, m - 1, 1)
+  const isCurrentMonth = y === today.getFullYear() && m === today.getMonth() + 1
+  const last = isCurrentMonth ? today : new Date(y, m, 0)
+  return { from: localDateStr(first), to: localDateStr(last) }
+}
+// สร้าง <option> ของ dropdown "เลือกเดือน" ย้อนหลัง 12 เดือนจากปัจจุบัน
+function buildMonthOptions(){
+  const now = new Date()
+  const opts = ['<option value="">เลือกเดือน</option>']
+  for (let i = 0; i < 12; i++) {
+    const d = new Date(now.getFullYear(), now.getMonth() - i, 1)
+    const value = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
+    const label = d.toLocaleDateString('th-TH', { year: 'numeric', month: 'long' })
+    opts.push(`<option value="${escAttr(value)}">${esc(label)}</option>`)
+  }
+  return opts.join('')
+}
+
 /* ==================== dashboard ==================== */
+// ตั้งค่าเริ่มต้นช่องวันที่เป็นวันนี้จริงๆ (ไม่ปล่อยว่าง) + สร้างตัวเลือกใน dropdown "เลือกเดือน"
+function initDashboardDateRange(){
+  const today = localDateStr(new Date())
+  const fromEl = document.getElementById('dashDateFrom')
+  const toEl = document.getElementById('dashDateTo')
+  if (fromEl) fromEl.value = today
+  if (toEl) toEl.value = today
+  const monthSel = document.getElementById('dashMonthPicker')
+  if (monthSel) monthSel.innerHTML = buildMonthOptions()
+}
+// dropdown "เวลา" — ปรับช่องจาก/ถึงวันที่ให้ตรงกับตัวเลือกด่วน แล้วค้นหาให้เลย
+function applyDashboardTimePreset(value){
+  const { from, to } = computePresetRange(value)
+  document.getElementById('dashDateFrom').value = from
+  document.getElementById('dashDateTo').value = to
+  document.getElementById('dashMonthPicker').value = ''
+  loadStats()
+}
+// dropdown "เลือกเดือน"
+function applyDashboardMonth(value){
+  if (!value) return
+  const { from, to } = computeMonthRange(value)
+  document.getElementById('dashDateFrom').value = from
+  document.getElementById('dashDateTo').value = to
+  loadStats()
+}
+// ปุ่ม "ค้นหา" — ใช้ค่าที่กรอก/แก้เองในช่องจาก-ถึงวันที่ตรงๆ
+function applyDashboardDateRange(){
+  const from = document.getElementById('dashDateFrom').value
+  const to = document.getElementById('dashDateTo').value
+  if (!from || !to) { toast('กรอกวันที่ให้ครบทั้งจากและถึง', 'danger'); return }
+  if (from > to) { toast('วันที่เริ่มต้นต้องไม่เกินวันที่สิ้นสุด', 'danger'); return }
+  loadStats()
+}
 async function loadStats(days){
-  const res = await apiFetch('/api/stats?days=' + (days || historyDays))
+  // days='all' (เช่นจากหน้า Campaigns ที่ต้องการยอดสะสมทั้งหมด) ต้องชนะช่องวันที่ของ Dashboard เสมอ
+  // และช่อง dashDateFrom/dashDateTo มีอยู่แค่ตอนอยู่หน้า Dashboard เท่านั้น (หน้าอื่นไม่มี element นี้เลย)
+  const fromEl = days !== 'all' ? document.getElementById('dashDateFrom') : null
+  const toEl = days !== 'all' ? document.getElementById('dashDateTo') : null
+  const url = (fromEl?.value && toEl?.value)
+    ? `/api/stats?dateFrom=${fromEl.value}&dateTo=${toEl.value}`
+    : '/api/stats?days=' + (days === 'all' ? 'all' : (days || 7))
+  const res = await apiFetch(url)
+  if (!res.ok) { toast('โหลดสถิติไม่สำเร็จ', 'danger'); return }
   statsCache = await res.json()
   const setText = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v }
 
@@ -2000,8 +2109,39 @@ async function loadLogs(){
   const url = campaignId ? `/api/calls?campaignId=${encodeURIComponent(campaignId)}&limit=300` : '/api/calls?limit=300'
   const res = await apiFetch(url)
   historyCache = await res.json()
+  initHistoryDateRangeDefaults()
   historyPage = 1
   renderHistoryRows()
+}
+// เติมช่องวันที่ให้เป็นช่วงที่ครอบคลุมข้อมูลที่โหลดมาจริง (ไม่ใช่ mm/dd/yyyy ว่างๆ) โดยไม่กรองอะไรออกไปเพิ่ม
+// ไม่ทับถ้าผู้ใช้ตั้งช่วงวันที่เองไว้แล้ว (เช่นกด "รีเฟรช" ซ้ำหลังปรับวันที่เอง)
+function initHistoryDateRangeDefaults(){
+  const monthSel = document.getElementById('historyMonthPicker')
+  if (monthSel && monthSel.options.length <= 1) monthSel.innerHTML = buildMonthOptions()
+
+  const fromEl = document.getElementById('historyDateFrom')
+  const toEl = document.getElementById('historyDateTo')
+  if (!fromEl || !toEl || fromEl.value || toEl.value) return
+  const days = historyCache.map(c => (c.timestamp || '').slice(0, 10)).filter(Boolean)
+  if (!days.length) return
+  fromEl.value = days.reduce((a, b) => a < b ? a : b)
+  toEl.value = days.reduce((a, b) => a > b ? a : b)
+}
+// dropdown "เวลา" ของหน้าประวัติการโทร — กรองจากข้อมูลที่โหลดมาแล้วในเครื่อง ไม่ต้องยิง server ใหม่
+function applyHistoryTimePreset(value){
+  const { from, to } = computePresetRange(value)
+  document.getElementById('historyDateFrom').value = from
+  document.getElementById('historyDateTo').value = to
+  document.getElementById('historyMonthPicker').value = ''
+  historyFilterChanged()
+}
+// dropdown "เลือกเดือน" ของหน้าประวัติการโทร
+function applyHistoryMonth(value){
+  if (!value) return
+  const { from, to } = computeMonthRange(value)
+  document.getElementById('historyDateFrom').value = from
+  document.getElementById('historyDateTo').value = to
+  historyFilterChanged()
 }
 function historyFilterChanged(){ historyPage = 1; renderHistoryRows() }
 function loadMoreHistory(){ historyPage++; renderHistoryRows() }
