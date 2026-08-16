@@ -515,6 +515,7 @@ const ICONS = {
   sheet: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="3" y1="15" x2="21" y2="15"/><line x1="9" y1="3" x2="9" y2="21"/><line x1="15" y1="3" x2="15" y2="21"/></svg>',
   block: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="4.9" y1="4.9" x2="19.1" y2="19.1"/></svg>',
   copy: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
+  phone: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="2" width="12" height="20" rx="2"/><line x1="10" y1="18" x2="14" y2="18"/></svg>',
 }
 const icon = (name, cls) => `<span class="${cls||''}" style="display:inline-flex">${ICONS[name]||''}</span>`
 const HANGUP_LABELS = { ai_ended: 'AI ปิดสายปกติ', customer_hangup: 'ลูกค้าวางสายเอง', silence_timeout: 'หมดเวลาเงียบ ไม่ตอบสนอง', manual_hangup: 'เจ้าหน้าที่ตัดสาย (ปุ่มฉุกเฉิน)', max_duration: 'ครบเวลาสูงสุดของสาย' }
@@ -752,9 +753,9 @@ function openLiveModal(callSid, phone, name){
 }
 
 /* ==================== router ==================== */
-const PAGES = ['dashboard','campaigns','contacts','test','history','lookup','sms','senders']
-const TITLES = { dashboard:'Dashboard', campaigns:'Campaigns', contacts:'เบอร์ติดต่อ', test:'ทดสอบ', history:'ประวัติการโทร', lookup:'ค้นหาเบอร์', sms:'SMS Templates', senders:'Sender Names' }
-const NAV_ICON = { dashboard:'dashboard', campaigns:'campaigns', contacts:'contacts', test:'test', history:'history', lookup:'search', sms:'chat', senders:'sheet' }
+const PAGES = ['dashboard','campaigns','numbers','contacts','test','history','lookup','sms','senders']
+const TITLES = { dashboard:'Dashboard', campaigns:'Campaigns', numbers:'จัดการเบอร์', contacts:'เบอร์ติดต่อ', test:'ทดสอบ', history:'ประวัติการโทร', lookup:'ค้นหาเบอร์', sms:'SMS Templates', senders:'Sender Names' }
+const NAV_ICON = { dashboard:'dashboard', campaigns:'campaigns', numbers:'phone', contacts:'contacts', test:'test', history:'history', lookup:'search', sms:'chat', senders:'sheet' }
 
 function buildNav(){
   document.getElementById('nav').innerHTML = PAGES.map(p =>
@@ -867,10 +868,28 @@ const TEMPLATES = {
       </div>
       <div class="card-body table-scroll">
         <table>
-          <thead><tr><th>ชื่อ</th><th>สถานะ</th><th>ประเภท</th><th>เบอร์</th><th>Voice</th><th>สถิติ</th><th></th></tr></thead>
-          <tbody id="campaignTable"><tr><td colspan="7" class="empty">กำลังโหลด...</td></tr></tbody>
+          <thead><tr><th>ชื่อ</th><th>สถานะ</th><th>ประเภท</th><th>Voice</th><th>สถิติ</th><th></th></tr></thead>
+          <tbody id="campaignTable"><tr><td colspan="6" class="empty">กำลังโหลด...</td></tr></tbody>
         </table>
         <div id="campaignPanel"></div>
+      </div>
+    </div>`,
+
+  numbers: () => `
+    <div class="card">
+      <div class="card-head">
+        <h2>จัดการเบอร์ Twilio</h2>
+        <button class="btn btn-accent btn-sm" onclick="openNumberCreate()">${icon('plus')} เพิ่มเบอร์</button>
+      </div>
+      <div class="card-body pad-top">
+        <p style="font-size:13px; color:var(--text-2); margin-bottom:14px">ลงทะเบียนเบอร์ที่ซื้อไว้แล้วในบัญชี Twilio เข้าระบบนี้ — เบอร์ที่ลงทะเบียนไว้จะใช้เลือกได้ในหน้า Dashboard, เบอร์ติดต่อ, ทดสอบ และประวัติการโทร เบอร์ที่ผูก Campaign ไว้จะใช้รับสายเข้าของ Campaign นั้นโดยอัตโนมัติ (ลบเบอร์ที่นี่จะเอาออกจากระบบนี้เท่านั้น ไม่กระทบเบอร์ในบัญชี Twilio จริง)</p>
+        <div class="card-body table-scroll" style="padding:0">
+          <table>
+            <thead><tr><th>เบอร์</th><th>Campaign รับสายเข้า</th><th>โน้ต</th><th></th></tr></thead>
+            <tbody id="numbersTable"><tr><td colspan="4" class="empty">กำลังโหลด...</td></tr></tbody>
+          </table>
+        </div>
+        <div id="numberPanel"></div>
       </div>
     </div>`,
 
@@ -1110,7 +1129,8 @@ const INIT = {
     await Promise.all([loadTwilioNumbers(), loadContacts()])
     await Promise.all([loadStats(), refreshActiveGlobal(true)])
   },
-  campaigns: async () => { await Promise.all([loadCampaigns(), loadStats('all'), loadSmsTemplates(), loadTwilioNumbers()]); renderCampaignTable() },
+  campaigns: async () => { await Promise.all([loadCampaigns(), loadStats('all'), loadSmsTemplates()]); renderCampaignTable() },
+  numbers: async () => { await Promise.all([loadCampaigns(), loadTwilioNumbers()]); renderNumbersTable() },
   contacts: async () => {
     document.getElementById('addTabs').addEventListener('click', e => {
       const btn = e.target.closest('button'); if (!btn) return
@@ -1169,19 +1189,28 @@ async function loadCampaigns(){
   populateCampaignSelects()
   renderCampaignTable()
 }
-// เบอร์ Twilio จริงที่ซื้อไว้ในบัญชี — ใช้ร่วมกันหลายหน้า (Campaigns, เบอร์ติดต่อ, ทดสอบ, ประวัติการโทร)
+// เบอร์ที่ลงทะเบียนไว้ในระบบนี้ (หน้า "จัดการเบอร์") — ใช้ร่วมกันหลายหน้า (Dashboard, เบอร์ติดต่อ, ทดสอบ, ประวัติการโทร)
 let twilioNumbersCache = []
 async function loadTwilioNumbers(){
   try {
-    const res = await apiFetch('/api/twilio/numbers')
+    const res = await apiFetch('/api/twilio-numbers')
     twilioNumbersCache = res.ok ? await res.json() : []
   } catch (e) {
     twilioNumbersCache = []
   }
   populateTwilioNumberSelects()
 }
+// เบอร์ดิบทั้งหมดในบัญชี Twilio จริง — ใช้เฉพาะตอนเพิ่มเบอร์ใหม่ในหน้า "จัดการเบอร์" (ให้เลือกจากของจริง กัน typo)
+let twilioAccountNumbersCache = []
+async function loadTwilioAccountNumbers(){
+  try {
+    const res = await apiFetch('/api/twilio/numbers')
+    twilioAccountNumbersCache = res.ok ? await res.json() : []
+  } catch (e) {
+    twilioAccountNumbersCache = []
+  }
+}
 // เติม <select class="twilio-number-select"> ทุกตัวที่มีอยู่ตอนนี้ในหน้า — เหมือน populateCampaignSelects()
-// (ต่างจาก cf_twilio_number ในฟอร์มแก้ไข campaign ที่สร้างสดใหม่ทุกครั้งที่เปิดอยู่แล้ว ไม่ต้องพึ่งฟังก์ชันนี้)
 function populateTwilioNumberSelects(){
   document.querySelectorAll('.twilio-number-select').forEach(sel => {
     const current = sel.value
@@ -1190,23 +1219,23 @@ function populateTwilioNumberSelects(){
     sel.appendChild(keepFirst)
     twilioNumbersCache.forEach(n => {
       const opt = document.createElement('option')
-      opt.value = n.phoneNumber
-      opt.text = `${n.friendlyName} (${n.phoneNumber})`
+      opt.value = n.phone_number
+      opt.text = n.label ? `${n.label} (${n.phone_number})` : n.phone_number
       sel.appendChild(opt)
     })
     sel.value = current
   })
 }
-// โชว์ friendlyName แทนเบอร์ดิบถ้ามี — ใช้ในตาราง/รายละเอียดประวัติการโทร
+// โชว์ label ที่ตั้งไว้แทนเบอร์ดิบถ้ามี — ใช้ในตาราง/รายละเอียดประวัติการโทร
 function twilioNumberLabel(number){
   if (!number) return '—'
-  const n = twilioNumbersCache.find(x => x.phoneNumber === number)
-  return (n && n.friendlyName && n.friendlyName !== number) ? n.friendlyName : number
+  const n = twilioNumbersCache.find(x => x.phone_number === number)
+  return (n && n.label) ? n.label : number
 }
 function renderCampaignTable(){
   const tbody = document.getElementById('campaignTable')
   if (!tbody) return
-  if (!campaignsCache.length) { tbody.innerHTML = '<tr><td colspan="7" class="empty">ยังไม่มี campaign</td></tr>'; return }
+  if (!campaignsCache.length) { tbody.innerHTML = '<tr><td colspan="6" class="empty">ยังไม่มี campaign</td></tr>'; return }
   tbody.innerHTML = campaignsCache.map(c => {
     const calls = (statsCache && statsCache.byCampaign && statsCache.byCampaign[c.id]) || 0
     const interested = (statsCache && statsCache.interestedByCampaign && statsCache.interestedByCampaign[c.id]) || 0
@@ -1216,7 +1245,6 @@ function renderCampaignTable(){
       <td><div style="font-weight:600">${esc(c.name)}</div><div class="num" style="font-size:11.5px;color:var(--text-3)">${esc(c.id)}</div></td>
       <td><span class="pill ${esc(c.status)}">${esc(c.status)}</span></td>
       <td style="color:var(--text-2)">${esc(c.type)}</td>
-      <td class="num" style="color:var(--text-2); font-size:12px">${esc(c.twilio_number || 'เริ่มต้น')}</td>
       <td class="num" style="color:var(--text-2); font-size:12px">${esc(c.voice_id)}</td>
       <td class="num" style="color:var(--text-2); font-size:12.5px">${calls ? `${calls} สาย · ${rate}% สนใจ` : '—'}</td>
       <td>
@@ -1240,15 +1268,8 @@ function campaignEditPanelHtml(c, isNew){
         <div class="field"><label>ชื่อ Campaign</label><input type="text" id="cf_name" value="${esc(c.name||'')}"></div>
         <div class="field"><label>Voice ID</label><input type="text" id="cf_voice" value="${esc(c.voice_id||'')}"></div>
         <div class="field"><label>ประเภท</label><select id="cf_type"><option value="outbound" ${c.type==='inbound'?'':'selected'}>outbound</option><option value="inbound" ${c.type==='inbound'?'selected':''}>inbound</option></select></div>
-        <div class="field">
-          <label>เบอร์ Twilio ที่ใช้ (โทรออก/รับสาย)</label>
-          <select id="cf_twilio_number" class="twilio-number-select">
-            <option value="">— ใช้เบอร์เริ่มต้นของระบบ —</option>
-            ${twilioNumbersCache.map(n => `<option value="${escAttr(n.phoneNumber)}" ${c.twilio_number===n.phoneNumber?'selected':''}>${esc(n.friendlyName)} (${esc(n.phoneNumber)})</option>`).join('')}
-          </select>
-          ${!twilioNumbersCache.length ? `<div style="font-size:11.5px; color:var(--text-3); margin-top:4px">ดึงรายชื่อเบอร์จาก Twilio ไม่สำเร็จ หรือยังไม่มีเบอร์ในบัญชี — ใช้เบอร์เริ่มต้นของระบบไปก่อนได้</div>` : ''}
-        </div>
       </div>
+      <p style="font-size:12px; color:var(--text-3); margin:-10px 0 16px">เบอร์ Twilio ที่ใช้โทรออก/รับสายของ campaign นี้ ตั้งได้จากหน้า <a href="#/numbers" onclick="go('numbers')" style="color:inherit; text-decoration:underline">จัดการเบอร์</a></p>
       <div class="field" style="margin-bottom:16px"><label>Prompt / Script</label><textarea id="cf_script" placeholder="System prompt ที่ AI ใช้พูดกับลูกค้า">${esc(c.script || c.system_prompt || '')}</textarea></div>
       <label style="font-size:12px; color:var(--text-2); font-weight:600">ส่ง SMS follow-up เมื่อผลเป็น — เลือก template ที่จะใช้ต่อผลลัพธ์ (แต่ละ template มี Sendername ของตัวเองอยู่แล้ว)</label>
       <div style="margin:6px 0 18px">
@@ -1302,7 +1323,6 @@ function collectCampaignForm(){
     name: document.getElementById('cf_name').value,
     voice_id: document.getElementById('cf_voice').value,
     type: document.getElementById('cf_type').value,
-    twilio_number: document.getElementById('cf_twilio_number').value,
     [scriptKey]: document.getElementById('cf_script').value,
     sms_interested: document.getElementById('cf_sms_interested').value,
     sms_callback: document.getElementById('cf_sms_callback').value,
@@ -1373,9 +1393,15 @@ async function confirmDeleteCampaign(id){
   const pending = contactsInCampaign.filter(x => x.status === 'pending' || x.status === 'retry_pending')
   const otherCampaigns = campaignsCache.filter(x => x.id !== id)
 
-  let extraHtml = ''
+  // เช็คสดจาก server เสมอเหมือน pending contacts ด้านบน — เบอร์ที่ผูก campaign นี้ไว้ (หน้า "จัดการเบอร์") จะเลิกผูกอัตโนมัติตอนลบ
+  const numbersRes = await apiFetch('/api/twilio-numbers')
+  const boundNumbers = numbersRes.ok ? (await numbersRes.json()).filter(n => n.campaign_id === id) : []
+
+  let extraHtml = boundNumbers.length
+    ? `<p style="text-align:left; font-size:12.5px; color:var(--text-2); margin-top:6px">เบอร์ <b>${boundNumbers.map(n => esc(n.label || n.phone_number)).join(', ')}</b> ผูกกับ Campaign นี้อยู่ (หน้า "จัดการเบอร์") — ลบแล้วจะเลิกผูกอัตโนมัติ เบอร์นั้นจะรับสายเข้า/ใช้เป็นเบอร์เริ่ม campaign นี้อัตโนมัติไม่ได้อีกจนกว่าจะไปผูกใหม่</p>`
+    : ''
   if (pending.length) {
-    extraHtml = `
+    extraHtml += `
       <div class="field" style="text-align:left; margin-top:6px">
         <label style="display:flex; align-items:center; gap:8px; margin-bottom:8px">
           <input type="radio" name="delCampaignResolution" value="move" ${otherCampaigns.length ? 'checked' : 'disabled'}>
@@ -1410,6 +1436,125 @@ async function confirmDeleteCampaign(id){
       if (!res.ok) { const data = await res.json().catch(()=>({})); toast(data.error || 'ลบไม่สำเร็จ', 'danger'); return }
       toast('ลบ campaign แล้ว', 'danger')
       loadCampaigns()
+    }
+  })
+}
+
+/* ==================== twilio numbers (จัดการเบอร์) ==================== */
+function renderNumbersTable(){
+  const tbody = document.getElementById('numbersTable')
+  if (!tbody) return
+  if (!twilioNumbersCache.length) { tbody.innerHTML = '<tr><td colspan="4" class="empty">ยังไม่มีเบอร์ในระบบ — กด "เพิ่มเบอร์" เพื่อลงทะเบียนเบอร์ที่ซื้อไว้แล้วใน Twilio</td></tr>'; return }
+  tbody.innerHTML = twilioNumbersCache.map(n => {
+    const camp = campaignsCache.find(c => c.id === n.campaign_id)
+    return `
+    <tr>
+      <td><div style="font-weight:600">${esc(n.label || n.phone_number)}</div><div class="num" style="font-size:11.5px;color:var(--text-3)">${esc(n.phone_number)}</div></td>
+      <td>${camp ? esc(camp.name || camp.id) : '<span style="color:var(--text-3)">— ไม่ผูก (รับสายเข้าไม่ได้) —</span>'}</td>
+      <td style="color:var(--text-2); font-size:12.5px">${esc(n.notes || '—')}</td>
+      <td>
+        <div class="row" style="gap:2px; flex-wrap:nowrap">
+          <button class="btn btn-ghost btn-sm" onclick="openNumberEdit('${escJsAttr(n.phone_number)}')">${icon('edit')} แก้ไข</button>
+          <button class="btn btn-icon btn-ghost btn-sm danger" title="ลบออกจากระบบ" onclick="confirmDeleteNumber('${escJsAttr(n.phone_number)}')">${icon('trash')}</button>
+        </div>
+      </td>
+    </tr>`
+  }).join('')
+}
+function numberEditPanelHtml(n, isNew){
+  // เพิ่มใหม่ได้เฉพาะเบอร์ที่มีจริงในบัญชี Twilio และยังไม่เคยลงทะเบียนในระบบนี้มาก่อน — กัน typo/เบอร์ที่ไม่ได้เป็นเจ้าของ/ลงทะเบียนซ้ำ
+  const unregistered = twilioAccountNumbersCache.filter(a => !twilioNumbersCache.some(r => r.phone_number === a.phoneNumber))
+  return `
+    <div style="margin-top:20px; border-top:1px solid var(--glass-border); padding-top:20px">
+      <h3 style="font-size:14.5px; margin-bottom:16px">${isNew ? 'เพิ่มเบอร์ใหม่' : 'แก้ไข: ' + esc(n.label || n.phone_number)}</h3>
+      <div class="grid-2" style="margin-bottom:16px">
+        ${isNew ? `
+        <div class="field">
+          <label>เบอร์ (เลือกจากที่มีในบัญชี Twilio)</label>
+          <select id="nf_phone">
+            <option value="">-- เลือกเบอร์ --</option>
+            ${unregistered.map(a => `<option value="${escAttr(a.phoneNumber)}">${esc(a.phoneNumber)}</option>`).join('')}
+          </select>
+          ${!unregistered.length ? `<div style="font-size:11.5px; color:var(--text-3); margin-top:4px">${twilioAccountNumbersCache.length ? 'ทุกเบอร์ในบัญชี Twilio ลงทะเบียนไว้ในระบบนี้หมดแล้ว' : 'ดึงรายชื่อเบอร์จาก Twilio ไม่สำเร็จ หรือยังไม่มีเบอร์ในบัญชี'}</div>` : ''}
+        </div>` : `<input type="hidden" id="nf_phone" value="${esc(n.phone_number)}"><div class="field"><label>เบอร์</label><input type="text" value="${esc(n.phone_number)}" disabled></div>`}
+        <div class="field"><label>ชื่อเรียก (ไม่บังคับ)</label><input type="text" id="nf_label" value="${esc(n.label||'')}" placeholder="เช่น สายโปรโมชั่น"></div>
+        <div class="field">
+          <label>ผูกกับ Campaign (สำหรับรับสายเข้า)</label>
+          <select id="nf_campaign" class="campaign-select">
+            <option value="">-- ไม่ผูก --</option>
+            ${campaignsCache.map(c => `<option value="${escAttr(c.id)}" ${n.campaign_id===c.id?'selected':''}>${esc(c.name||c.id)}</option>`).join('')}
+          </select>
+        </div>
+        <div class="field"><label>โน้ต (ไม่บังคับ)</label><input type="text" id="nf_notes" value="${esc(n.notes||'')}"></div>
+      </div>
+      <div class="row">
+        <button class="btn btn-accent" onclick="${isNew ? 'createNumber()' : 'saveNumber()'}">${isNew ? 'เพิ่มเบอร์' : 'บันทึก'}</button>
+        <button class="btn" onclick="document.getElementById('numberPanel').innerHTML=''">ยกเลิก</button>
+        <span class="msg" id="numberEditMsg" style="font-size:13px; color:var(--text-2)"></span>
+      </div>
+    </div>`
+}
+async function openNumberCreate(){
+  await loadTwilioAccountNumbers()
+  document.getElementById('numberPanel').innerHTML = numberEditPanelHtml({}, true)
+  document.getElementById('numberPanel').scrollIntoView({ behavior: 'smooth', block: 'start' })
+}
+function openNumberEdit(phone){
+  const n = twilioNumbersCache.find(x => x.phone_number === phone)
+  if (!n) return
+  document.getElementById('numberPanel').innerHTML = numberEditPanelHtml(n, false)
+}
+async function createNumber(){
+  const phone_number = document.getElementById('nf_phone').value
+  const msgEl = document.getElementById('numberEditMsg')
+  if (!phone_number) { msgEl.textContent = 'เลือกเบอร์ก่อน'; return }
+  const body = {
+    phone_number,
+    label: document.getElementById('nf_label').value.trim(),
+    campaign_id: document.getElementById('nf_campaign').value,
+    notes: document.getElementById('nf_notes').value.trim(),
+  }
+  try {
+    const res = await apiFetch('/api/twilio-numbers', { method: 'POST', body })
+    const data = await res.json()
+    if (!res.ok) { msgEl.textContent = data.error || 'เพิ่มไม่สำเร็จ'; return }
+    toast('เพิ่มเบอร์แล้ว')
+    document.getElementById('numberPanel').innerHTML = ''
+    await loadTwilioNumbers()
+    renderNumbersTable()
+  } catch (e) {}
+}
+async function saveNumber(){
+  const phone_number = document.getElementById('nf_phone').value
+  const msgEl = document.getElementById('numberEditMsg')
+  const body = {
+    label: document.getElementById('nf_label').value.trim(),
+    campaign_id: document.getElementById('nf_campaign').value,
+    notes: document.getElementById('nf_notes').value.trim(),
+  }
+  try {
+    const res = await apiFetch(`/api/twilio-numbers/${encodeURIComponent(phone_number)}`, { method: 'PATCH', body })
+    const data = await res.json()
+    if (!res.ok) { msgEl.textContent = data.error || 'บันทึกไม่สำเร็จ'; return }
+    toast('บันทึกแล้ว')
+    document.getElementById('numberPanel').innerHTML = ''
+    await loadTwilioNumbers()
+    renderNumbersTable()
+  } catch (e) {}
+}
+function confirmDeleteNumber(phone){
+  const n = twilioNumbersCache.find(x => x.phone_number === phone)
+  openConfirm({
+    title: 'ลบเบอร์นี้ออกจากระบบ?',
+    message: `"${n ? (n.label || n.phone_number) : phone}" จะถูกเอาออกจากระบบนี้เท่านั้น — เบอร์ยังอยู่ในบัญชี Twilio ปกติ ไม่ถูกยกเลิก แต่จะรับสายเข้า/ให้เลือกโทรออกจากในแอปนี้ไม่ได้อีกจนกว่าจะเพิ่มกลับ`,
+    confirmLabel: 'ลบออกจากระบบ',
+    onConfirm: async () => {
+      const res = await apiFetch(`/api/twilio-numbers/${encodeURIComponent(phone)}`, { method: 'DELETE' })
+      if (!res.ok) { const data = await res.json().catch(()=>({})); toast(data.error || 'ลบไม่สำเร็จ', 'danger'); return }
+      toast('ลบเบอร์แล้ว', 'danger')
+      document.getElementById('numberPanel').innerHTML = ''
+      await loadTwilioNumbers()
+      renderNumbersTable()
     }
   })
 }
@@ -1876,10 +2021,10 @@ function renderStatsStrip(){
   const grads = ['g0','g1','g2','g3']
 
   if (dashboardStripMode === 'number') {
-    if (!twilioNumbersCache.length) { el.innerHTML = '<div class="empty">ยังไม่มีเบอร์ Twilio ในระบบ</div>'; return }
+    if (!twilioNumbersCache.length) { el.innerHTML = '<div class="empty">ยังไม่มีเบอร์ในระบบ — ไปเพิ่มที่หน้า "จัดการเบอร์"</div>'; return }
     el.innerHTML = twilioNumbersCache.map((n,i) => {
-      const calls = (statsCache && statsCache.byTwilioNumber && statsCache.byTwilioNumber[n.phoneNumber]) || 0
-      const interested = (statsCache && statsCache.interestedByTwilioNumber && statsCache.interestedByTwilioNumber[n.phoneNumber]) || 0
+      const calls = (statsCache && statsCache.byTwilioNumber && statsCache.byTwilioNumber[n.phone_number]) || 0
+      const interested = (statsCache && statsCache.interestedByTwilioNumber && statsCache.interestedByTwilioNumber[n.phone_number]) || 0
       const pct = calls ? Math.round(interested / calls * 100) : 0
       return `
       <div class="gcard ${grads[i % grads.length]}" onclick="go('history')">
@@ -1888,7 +2033,7 @@ function renderStatsStrip(){
           <span class="pill">${calls} สาย</span>
         </div>
         <div>
-          <div class="name">${esc(n.friendlyName)}</div>
+          <div class="name">${esc(n.label || n.phone_number)}</div>
           <div class="stats">
             <div><div class="n num">${calls}</div><div class="l">โทรทั้งหมด</div></div>
             <div><div class="n num">${interested}</div><div class="l">สนใจ</div></div>

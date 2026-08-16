@@ -7,11 +7,15 @@ process.env.TZ = 'Asia/Bangkok'
 
 // stub googleapis ก่อน require googleSheets.js — กันยิง Sheets API จริงและคุมข้อมูลทดสอบเองได้
 // (pattern เดียวกับที่ใช้พิสูจน์บั๊กจริงมาตลอดทั้งเซสชันตรวจสอบระบบนี้ ผ่าน require.cache injection)
-const state = { data: {}, calls: [] }
+const state = { data: {}, calls: [], throwOnRange: new Set() }
 const fakeClient = {
   spreadsheets: {
     values: {
-      get: async ({ range }) => { state.calls.push({ method: 'get', range }); return { data: { values: state.data[range] || [] } } },
+      get: async ({ range }) => {
+        state.calls.push({ method: 'get', range })
+        if (state.throwOnRange.has(range)) throw new Error(`Unable to parse range: ${range}`) // จำลอง error จริงของ Sheets API เมื่อชีตแท็บนี้ยังไม่ถูกสร้าง
+        return { data: { values: state.data[range] || [] } }
+      },
       update: async (params) => { state.calls.push({ method: 'update', ...params }); return {} },
       append: async (params) => { state.calls.push({ method: 'append', ...params }); return {} },
     },
@@ -27,7 +31,7 @@ require.cache[googleapisPath] = {
 
 const { sheetsService } = require('../src/services/googleSheets')
 
-beforeEach(() => { state.data = {}; state.calls = [] })
+beforeEach(() => { state.data = {}; state.calls = []; state.throwOnRange = new Set() })
 
 function lastCall(method) {
   return [...state.calls].reverse().find(c => c.method === method)
@@ -68,31 +72,42 @@ test('updateRowByKey throw ถ้า key column ไม่มีอยู่ใ�
 })
 
 test('getInboundCampaignForNumber เลือกเฉพาะ campaign type=inbound ไม่ fallback ไปแถวแรกที่เป็น outbound (บั๊กเดิม)', async () => {
-  process.env.TWILIO_PHONE_NUMBER = '+66800000000'
+  state.data['Twilio Numbers'] = [
+    ['Phone Number', 'Label', 'Campaign Id', 'Notes'],
+    ['+66800000000', '', 'in1', ''],
+  ]
   state.data['Campaigns'] = [
-    ['Id', 'Name', 'Status', 'Type', 'Twilio Number'],
-    ['out1', 'Outbound A', 'active', 'outbound', ''],
-    ['in1', 'Inbound A', 'active', 'inbound', ''],
+    ['Id', 'Name', 'Status', 'Type'],
+    ['out1', 'Outbound A', 'active', 'outbound'],
+    ['in1', 'Inbound A', 'active', 'inbound'],
   ]
   const campaign = await sheetsService.getInboundCampaignForNumber('+66800000000')
   assert.equal(campaign.id, 'in1')
 })
 
-test('getInboundCampaignForNumber คืน null ถ้าไม่มี inbound campaign เลย (ไม่เดา campaign อื่นมาใช้แทน)', async () => {
+test('getInboundCampaignForNumber คืน null ถ้าเบอร์ลงทะเบียนไว้แต่ไม่ได้ผูก campaign_id เลย (ไม่เดา campaign อื่นมาใช้แทน)', async () => {
+  state.data['Twilio Numbers'] = [
+    ['Phone Number', 'Label', 'Campaign Id', 'Notes'],
+    ['+66800000000', '', '', ''],
+  ]
   state.data['Campaigns'] = [
-    ['Id', 'Name', 'Status', 'Type', 'Twilio Number'],
-    ['out1', 'Outbound A', 'active', 'outbound', ''],
+    ['Id', 'Name', 'Status', 'Type'],
+    ['out1', 'Outbound A', 'active', 'outbound'],
   ]
   const campaign = await sheetsService.getInboundCampaignForNumber('+66800000000')
   assert.equal(campaign, null)
 })
 
-test('getInboundCampaignForNumber เลือก campaign ที่ตั้งเบอร์ Twilio เฉพาะของตัวเองตรงกับเบอร์ที่โทรเข้ามาจริง (รองรับหลายเบอร์พร้อมกัน)', async () => {
-  process.env.TWILIO_PHONE_NUMBER = '+66800000000'
+test('getInboundCampaignForNumber เลือก campaign ตามเบอร์ที่ผูกไว้ในหน้าจัดการเบอร์ (รองรับหลายเบอร์พร้อมกัน)', async () => {
+  state.data['Twilio Numbers'] = [
+    ['Phone Number', 'Label', 'Campaign Id', 'Notes'],
+    ['+66811111111', 'สาย A', 'in1', ''],
+    ['+66822222222', 'สาย B', 'in2', ''],
+  ]
   state.data['Campaigns'] = [
-    ['Id', 'Name', 'Status', 'Type', 'Twilio Number'],
-    ['in1', 'สาขา A', 'active', 'inbound', '+66811111111'],
-    ['in2', 'สาขา B', 'active', 'inbound', '+66822222222'],
+    ['Id', 'Name', 'Status', 'Type'],
+    ['in1', 'สาขา A', 'active', 'inbound'],
+    ['in2', 'สาขา B', 'active', 'inbound'],
   ]
   const campaignA = await sheetsService.getInboundCampaignForNumber('+66811111111')
   const campaignB = await sheetsService.getInboundCampaignForNumber('+66822222222')
@@ -100,25 +115,66 @@ test('getInboundCampaignForNumber เลือก campaign ที่ตั้ง
   assert.equal(campaignB.id, 'in2')
 })
 
-test('getInboundCampaignForNumber: campaign ที่ไม่ได้ตั้งเบอร์ของตัวเองไว้ ถือว่าอิงเบอร์เริ่มต้นของระบบ (เข้ากันได้กับ campaign เก่า)', async () => {
-  process.env.TWILIO_PHONE_NUMBER = '+66800000000'
-  state.data['Campaigns'] = [
-    ['Id', 'Name', 'Status', 'Type', 'Twilio Number'],
-    ['in1', 'สาขาเฉพาะ', 'active', 'inbound', '+66811111111'],
-    ['in2', 'สาขาเดิม (ไม่ได้ตั้งเบอร์)', 'active', 'inbound', ''],
+test('getInboundCampaignForNumber คืน null ถ้าเบอร์ที่โทรเข้ามาไม่เคยลงทะเบียนในระบบเลย (ไม่เดาเบอร์อื่นมาใช้แทน)', async () => {
+  state.data['Twilio Numbers'] = [
+    ['Phone Number', 'Label', 'Campaign Id', 'Notes'],
+    ['+66811111111', 'สาย A', 'in1', ''],
   ]
-  const campaign = await sheetsService.getInboundCampaignForNumber('+66800000000')
-  assert.equal(campaign.id, 'in2')
-})
-
-test('getInboundCampaignForNumber คืน null ถ้าเบอร์ที่โทรเข้ามาไม่ตรงกับ campaign ไหนเลย (ไม่เดาเบอร์อื่นมาใช้แทน)', async () => {
-  process.env.TWILIO_PHONE_NUMBER = '+66800000000'
   state.data['Campaigns'] = [
-    ['Id', 'Name', 'Status', 'Type', 'Twilio Number'],
-    ['in1', 'สาขา A', 'active', 'inbound', '+66811111111'],
+    ['Id', 'Name', 'Status', 'Type'],
+    ['in1', 'สาขา A', 'active', 'inbound'],
   ]
   const campaign = await sheetsService.getInboundCampaignForNumber('+66899999999')
   assert.equal(campaign, null)
+})
+
+test('getInboundCampaignForNumber คืน null ถ้า campaign ที่ผูกไว้ไม่ active หรือไม่ใช่ inbound แล้ว (กันเบอร์ผูกค้างกับ campaign ที่ปิด/เปลี่ยนประเภทไปแล้ว)', async () => {
+  state.data['Twilio Numbers'] = [
+    ['Phone Number', 'Label', 'Campaign Id', 'Notes'],
+    ['+66800000000', '', 'in1', ''],
+  ]
+  state.data['Campaigns'] = [
+    ['Id', 'Name', 'Status', 'Type'],
+    ['in1', 'สาขา A', 'inactive', 'inbound'],
+  ]
+  const campaign = await sheetsService.getInboundCampaignForNumber('+66800000000')
+  assert.equal(campaign, null)
+})
+
+test('addTwilioNumber/updateTwilioNumber/deleteTwilioNumber: เขียน/แก้/ลบแถวในชีต Twilio Numbers ตาม phone_number', async () => {
+  state.data['Twilio Numbers'] = [['Phone Number', 'Label', 'Campaign Id', 'Notes']]
+  await sheetsService.addTwilioNumber({ phone_number: '+66811111111', label: 'สายหลัก', campaign_id: 'in1', notes: 'ทดสอบ' })
+  assert.deepEqual(lastCall('append').requestBody.values[0], ['+66811111111', 'สายหลัก', 'in1', 'ทดสอบ'])
+
+  state.data['Twilio Numbers'].push(['+66811111111', 'สายหลัก', 'in1', 'ทดสอบ'])
+  const found = await sheetsService.getTwilioNumberByPhone('+66811111111')
+  assert.equal(found.label, 'สายหลัก')
+
+  const updated = await sheetsService.updateTwilioNumber('+66811111111', { label: 'สายใหม่' })
+  assert.equal(updated, true)
+  assert.deepEqual(lastCall('update').requestBody.values[0], ['+66811111111', 'สายใหม่', 'in1', 'ทดสอบ'])
+
+  const missing = await sheetsService.updateTwilioNumber('+66899999999', { label: 'x' })
+  assert.equal(missing, false)
+})
+
+test('getInboundCampaignForNumber ไม่ throw ถ้าชีต "Twilio Numbers" ยังไม่ถูกสร้างเลย (ฟีเจอร์ใหม่ ผู้ใช้อาจยังไม่ได้เพิ่มแท็บนี้) — ไม่งั้น webhook สายเข้าจริงจะล่มทั้งระบบ', async () => {
+  state.throwOnRange.add('Twilio Numbers')
+  state.data['Campaigns'] = [['Id', 'Name', 'Status', 'Type'], ['in1', 'สาขา A', 'active', 'inbound']]
+  const campaign = await sheetsService.getInboundCampaignForNumber('+66800000000')
+  assert.equal(campaign, null)
+})
+
+test('getTwilioNumberForCampaign คืนแถวเบอร์ที่ผูก campaign นี้ไว้ (ใช้เป็นเบอร์โทรออกเริ่มต้นตอนสั่งเริ่ม campaign)', async () => {
+  state.data['Twilio Numbers'] = [
+    ['Phone Number', 'Label', 'Campaign Id', 'Notes'],
+    ['+66811111111', '', 'camp1', ''],
+    ['+66822222222', '', 'camp2', ''],
+  ]
+  const found = await sheetsService.getTwilioNumberForCampaign('camp1')
+  assert.equal(found.phone_number, '+66811111111')
+  const none = await sheetsService.getTwilioNumberForCampaign('camp3')
+  assert.equal(none, null)
 })
 
 test('getStats: ช่วงวันที่กำหนดเองต้องไม่เลื่อนวันตาม timezone ของเครื่อง (บั๊กเดิม: parse ไม่ต่อท้าย Z ทำให้เลื่อน 1 วันใน timezone ที่ไม่ใช่ UTC)', async () => {

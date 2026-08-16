@@ -10,7 +10,8 @@ const SHEETS = {
   RESULTS: 'Call Results',
   TEMPLATES: 'SMS Templates',
   BLOCKLIST: 'Blocklist',
-  SENDER_NAMES: 'Sender Names'
+  SENDER_NAMES: 'Sender Names',
+  TWILIO_NUMBERS: 'Twilio Numbers'
 }
 
 let sheets = null
@@ -167,22 +168,31 @@ async function getBlocklistRows() {
   }
 }
 
+// ชีต "Twilio Numbers" เป็นฟีเจอร์ใหม่ ผู้ใช้อาจยังไม่ได้สร้างแท็บนี้ในชีตจริง — กันพัง getInboundCampaignForNumber
+// (เรียกจาก webhook สายเข้าจริงทุกครั้ง) ล่มทั้งระบบสายเข้าถ้ายังไม่ได้สร้างชีต ให้ถือว่ายังไม่มีเบอร์ไหนลงทะเบียนไว้เลยแทน
+async function getTwilioNumberRows() {
+  try {
+    return await getRows(SHEETS.TWILIO_NUMBERS)
+  } catch (err) {
+    return []
+  }
+}
+
 const sheetsService = {
   async getCampaign(campaignId) {
     const rows = await getRows(SHEETS.CAMPAIGNS)
     return rows.find(r => r.id === campaignId) || null
   },
 
-  // หา inbound campaign ที่ตั้งเบอร์ Twilio ไว้ตรงกับเบอร์ที่ลูกค้าโทรเข้ามาจริง (รองรับหลายเบอร์ หลาย campaign พร้อมกัน)
-  // campaign ที่ไม่ได้ตั้ง twilio_number ไว้เอง ถือว่าอิงเบอร์เริ่มต้นของระบบ (.env) — คงพฤติกรรมเดิมไว้ให้ campaign เก่าที่ยังไม่ได้ตั้งเบอร์ใช้งานต่อได้ปกติ
-  // ไม่มี campaign ไหนตรงกับเบอร์นี้เลย → คืน null ให้ webhook.js ตัดสินใจปฏิเสธสายแทนที่จะเดาเอา campaign อื่นมาใช้
+  // หา inbound campaign ที่เบอร์นี้ถูกผูกไว้ (ผูกจากหน้า "จัดการเบอร์" ไม่ใช่จากหน้า Campaigns อีกต่อไป)
+  // เบอร์ที่ไม่ได้ลงทะเบียนในระบบเลย หรือลงทะเบียนแล้วแต่ไม่ได้ผูก campaign ไว้ → คืน null ให้ webhook.js ปฏิเสธสายแทนที่จะเดาเอา campaign อื่นมาใช้
   async getInboundCampaignForNumber(toNumber) {
-    const rows = await getRows(SHEETS.CAMPAIGNS)
-    const defaultNumber = process.env.TWILIO_PHONE_NUMBER
-    return rows.find(r =>
-      r.status === 'active' && r.type === 'inbound' &&
-      (r.twilio_number || defaultNumber) === toNumber
-    ) || null
+    const numberRows = await getTwilioNumberRows()
+    const numberRow = numberRows.find(r => r.phone_number === toNumber)
+    if (!numberRow || !numberRow.campaign_id) return null
+
+    const campaigns = await getRows(SHEETS.CAMPAIGNS)
+    return campaigns.find(r => r.id === numberRow.campaign_id && r.status === 'active' && r.type === 'inbound') || null
   },
 
   async getCampaigns() {
@@ -316,6 +326,36 @@ const sheetsService = {
 
   async deleteSenderName(id) {
     return deleteRowByKey(SHEETS.SENDER_NAMES, 'id', id)
+  },
+
+  // เบอร์ Twilio ที่ลงทะเบียนไว้ในระบบนี้ (ต่างจาก twilioService.listPhoneNumbers() ที่ดึงลิสต์ดิบทั้งหมดจากบัญชี Twilio จริง)
+  // นี่คือแหล่งข้อมูลเดียวที่หน้า Dashboard/เบอร์ติดต่อ/ทดสอบ/ประวัติการโทรใช้แสดง+เลือกเบอร์ร่วมกัน
+  async getTwilioNumbers() {
+    return getTwilioNumberRows()
+  },
+
+  async getTwilioNumberByPhone(phone) {
+    const rows = await getTwilioNumberRows()
+    return rows.find(r => r.phone_number === phone) || null
+  },
+
+  // เบอร์ที่ผูกไว้กับ campaign นี้ (ถ้ามี) — ใช้เป็นเบอร์โทรออกเริ่มต้นตอนสั่งเริ่ม campaign (/api/campaign/start)
+  async getTwilioNumberForCampaign(campaignId) {
+    const rows = await getTwilioNumberRows()
+    return rows.find(r => r.campaign_id === campaignId) || null
+  },
+
+  async addTwilioNumber({ phone_number, label, campaign_id, notes }) {
+    await appendRowByFields(SHEETS.TWILIO_NUMBERS, { phone_number, label: label || '', campaign_id: campaign_id || '', notes: notes || '' })
+  },
+
+  async updateTwilioNumber(phone_number, updates) {
+    return updateRowByKey(SHEETS.TWILIO_NUMBERS, 'phone_number', phone_number, updates)
+  },
+
+  // เอาออกจากระบบนี้เท่านั้น — ไม่แตะเบอร์จริงในบัญชี Twilio (ไม่ release/ยกเลิกเบอร์)
+  async deleteTwilioNumber(phone_number) {
+    return deleteRowByKey(SHEETS.TWILIO_NUMBERS, 'phone_number', phone_number)
   },
 
   async getCallResults({ limit = 50, campaignId, phone } = {}) {

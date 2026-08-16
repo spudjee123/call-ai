@@ -82,6 +82,12 @@ module.exports = async function campaignRoutes(fastify) {
 
     const deleted = await sheetsService.deleteCampaign(id)
     if (!deleted) return reply.code(404).send({ error: 'Campaign not found' })
+
+    // เลิกผูกเบอร์ที่เคยผูกกับ campaign นี้ไว้ (หน้า "จัดการเบอร์") — กัน campaign_id ค้างชี้ไปหา campaign ที่ไม่มีอยู่แล้ว
+    // ไม่งั้นเบอร์นั้นจะรับสายเข้า/ใช้เป็นเบอร์เริ่ม campaign อัตโนมัติไม่ได้อีกแบบเงียบๆ โดยไม่มีใครรู้ตัว
+    const boundNumbers = (await sheetsService.getTwilioNumbers()).filter(n => n.campaign_id === id)
+    await Promise.all(boundNumbers.map(n => sheetsService.updateTwilioNumber(n.phone_number, { campaign_id: '' })))
+
     return reply.send({ message: 'Campaign deleted' })
   })
 
@@ -114,7 +120,10 @@ module.exports = async function campaignRoutes(fastify) {
     const contacts = await sheetsService.getPendingContacts(campaignId)
     if (!contacts.length) return reply.send({ message: 'No pending contacts', count: 0 })
 
-    contacts.forEach(contact => callQueue.add({ contact, campaign }))
+    // ใช้เบอร์ที่ผูก campaign นี้ไว้จากหน้า "จัดการเบอร์" เป็นเบอร์โทรออกเริ่มต้น (ถ้ามี) — ไม่มีก็ fallback เบอร์เริ่มต้นของระบบตามปกติ
+    const numberRow = await sheetsService.getTwilioNumberForCampaign(campaignId)
+    const effectiveCampaign = numberRow ? { ...campaign, twilio_number: numberRow.phone_number } : campaign
+    contacts.forEach(contact => callQueue.add({ contact, campaign: effectiveCampaign }))
 
     return reply.send({ message: 'Campaign started', count: contacts.length })
   })
