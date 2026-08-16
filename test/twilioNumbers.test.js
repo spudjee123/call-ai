@@ -14,6 +14,7 @@ require.cache[googleSheetsPath] = {
       getTwilioNumberByPhone: async (phone) => state.numbers[phone] || null,
       addTwilioNumber: async (fields) => {
         if (state.sheetMissing) throw new Error('Unable to parse range: Twilio Numbers: Unable to parse range: Twilio Numbers')
+        if (state.headerMismatch) return // จำลอง header ในชีตพิมพ์ไม่ตรง — เขียนแถวว่างเปล่าแบบไม่ throw ไม่มีอะไรถูกเก็บจริง
         state.numbers[fields.phone_number] = { ...fields }
         return true
       },
@@ -56,6 +57,7 @@ beforeEach(() => {
   state.campaigns = { camp1: { id: 'camp1' } }
   state.accountNumbers = [{ phoneNumber: '+66811111111', friendlyName: '+66811111111' }]
   state.sheetMissing = false
+  state.headerMismatch = false
 })
 
 test('POST /api/twilio-numbers: ยังไม่ได้สร้างแท็บชีต "Twilio Numbers" → ต้องได้ข้อความบอกสาเหตุชัดเจน ไม่ใช่ "Bad Request" เฉยๆ (บั๊กจริงที่เจอในโปรดักชัน)', async () => {
@@ -64,6 +66,14 @@ test('POST /api/twilio-numbers: ยังไม่ได้สร้างแท
   const res = await app.inject({ method: 'POST', url: '/api/twilio-numbers', payload: { phone_number: '+66811111111' } })
   assert.equal(res.statusCode, 500)
   assert.match(res.json().error, /สร้างแท็บชีต.*Twilio Numbers/)
+})
+
+test('POST /api/twilio-numbers: หัวคอลัมน์ในชีตพิมพ์ไม่ตรง "Phone Number" เป๊ะๆ → เขียนแถวว่างเปล่าแบบไม่ throw ต้องตรวจจับได้ ไม่ใช่ตอบสำเร็จทั้งที่ข้อมูลหายไป (บั๊กจริงที่เจอในโปรดักชัน)', async () => {
+  state.headerMismatch = true
+  const app = await buildApp()
+  const res = await app.inject({ method: 'POST', url: '/api/twilio-numbers', payload: { phone_number: '+66811111111' } })
+  assert.equal(res.statusCode, 500)
+  assert.match(res.json().error, /หัวคอลัมน์/)
 })
 
 test('POST /api/twilio-numbers: ลงทะเบียนเบอร์ที่มีจริงในบัญชี Twilio สำเร็จ', async () => {

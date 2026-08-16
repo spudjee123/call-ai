@@ -46,6 +46,15 @@ module.exports = async function twilioNumberRoutes(fastify) {
     } catch (err) {
       return reply.code(500).send({ error: friendlySheetError(err) })
     }
+
+    // เขียนไม่ throw ไม่ได้แปลว่าเขียนถูกคอลัมน์จริง — ถ้าหัวคอลัมน์ในชีตพิมพ์ไม่ตรง "Phone Number" เป๊ะๆ
+    // appendRowByFields จะเขียนแถวว่างเปล่าแบบเงียบๆ (ไม่มี error) แล้วอ่านกลับมาหาเบอร์นี้ไม่เจอ ต้องเช็คย้อนกลับให้ชัวร์
+    const saved = await sheetsService.getTwilioNumberByPhone(phone_number)
+    if (!saved) {
+      return reply.code(500).send({
+        error: 'บันทึกไม่สำเร็จ — หัวคอลัมน์ในชีต "Twilio Numbers" น่าจะพิมพ์ไม่ตรงกับที่ระบบต้องการ (Phone Number, Label, Campaign Id, Notes) กรุณาตรวจสอบหัวคอลัมน์ในชีต แล้วลบแถวว่างที่เพิ่งถูกสร้างออกด้วยตนเอง ก่อนลองเพิ่มเบอร์ใหม่อีกครั้ง',
+      })
+    }
     return reply.send({ message: 'เพิ่มเบอร์แล้ว' })
   })
 
