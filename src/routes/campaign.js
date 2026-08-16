@@ -1,6 +1,7 @@
 const { sheetsService } = require('../services/googleSheets')
 const { callQueue } = require('../utils/callQueue')
 const { isValidPhone, normalizePhone } = require('../utils/phone')
+const twilioService = require('../services/twilio')
 
 module.exports = async function campaignRoutes(fastify) {
 
@@ -8,6 +9,16 @@ module.exports = async function campaignRoutes(fastify) {
   fastify.get('/api/campaigns', async (req, reply) => {
     const campaigns = await sheetsService.getCampaigns()
     return reply.send(campaigns)
+  })
+
+  // เบอร์ Twilio ที่ซื้อไว้จริงทั้งหมดในบัญชี — ให้แอดมินเลือกจากของจริงตอนตั้งค่า campaign แทนพิมพ์เอง
+  fastify.get('/api/twilio/numbers', async (req, reply) => {
+    try {
+      const numbers = await twilioService.listPhoneNumbers()
+      return reply.send(numbers)
+    } catch (err) {
+      return reply.code(502).send({ error: 'ดึงรายชื่อเบอร์จาก Twilio ไม่สำเร็จ' })
+    }
   })
 
   // สร้าง campaign ใหม่
@@ -76,7 +87,7 @@ module.exports = async function campaignRoutes(fastify) {
 
   // ยิงโทรทดสอบเบอร์เดียว — ใช้ pipeline เดียวกับ campaign จริง แต่ไม่แตะ Contacts sheet
   fastify.post('/api/calls/test', async (req, reply) => {
-    const { name, campaignId } = req.body || {}
+    const { name, campaignId, twilioNumber } = req.body || {}
     const phone = normalizePhone(req.body?.phone)
     if (!phone || !campaignId) {
       return reply.code(400).send({ error: 'phone and campaignId required' })
@@ -87,7 +98,8 @@ module.exports = async function campaignRoutes(fastify) {
     const campaign = await sheetsService.getCampaign(campaignId)
     if (!campaign) return reply.code(404).send({ error: 'Campaign not found' })
 
-    callQueue.add({ contact: { phone, name: name || 'ทดสอบ' }, campaign })
+    // เบอร์ที่แอดมินเลือกตอนทดสอบ (ถ้ามี) ทับเบอร์ที่ตั้งไว้ระดับ campaign เฉพาะสายทดสอบนี้ — ไม่แก้ campaign จริง
+    callQueue.add({ contact: { phone, name: name || 'ทดสอบ' }, campaign: twilioNumber ? { ...campaign, twilio_number: twilioNumber } : campaign })
     return reply.send({ message: 'Test call queued', phone })
   })
 
@@ -107,18 +119,23 @@ module.exports = async function campaignRoutes(fastify) {
     return reply.send({ message: 'Campaign started', count: contacts.length })
   })
 
-  // หยุด campaign
+  // หยุด campaign หรือหยุดคิวของเบอร์ใดเบอร์หนึ่งเจาะจง (ระบุ twilioNumber แทน campaignId) — ไม่กระทบคิว/สายที่กำลังคุยอยู่ของเบอร์อื่น
   fastify.post('/api/campaign/stop', async (req, reply) => {
-    const { campaignId } = req.body
+    const { campaignId, twilioNumber } = req.body || {}
+    if (twilioNumber) {
+      const removed = callQueue.clearByNumber(twilioNumber)
+      return reply.send({ message: 'Queue stopped', removed })
+    }
     callQueue.clear(campaignId)
     return reply.send({ message: 'Campaign stopped' })
   })
 
-  // สถานะ queue
+  // สถานะ queue — รวมทุกเบอร์ และแยกตามเบอร์ (สำหรับให้เลือกว่าจะหยุดคิวของเบอร์ไหน)
   fastify.get('/api/campaign/status', async (req, reply) => {
     return reply.send({
       queueSize: callQueue.size(),
-      running: callQueue.runningCount()
+      running: callQueue.runningCount(),
+      byNumber: callQueue.statusByNumber(),
     })
   })
 }

@@ -173,14 +173,16 @@ const sheetsService = {
     return rows.find(r => r.id === campaignId) || null
   },
 
-  async getDefaultInboundCampaign() {
+  // หา inbound campaign ที่ตั้งเบอร์ Twilio ไว้ตรงกับเบอร์ที่ลูกค้าโทรเข้ามาจริง (รองรับหลายเบอร์ หลาย campaign พร้อมกัน)
+  // campaign ที่ไม่ได้ตั้ง twilio_number ไว้เอง ถือว่าอิงเบอร์เริ่มต้นของระบบ (.env) — คงพฤติกรรมเดิมไว้ให้ campaign เก่าที่ยังไม่ได้ตั้งเบอร์ใช้งานต่อได้ปกติ
+  // ไม่มี campaign ไหนตรงกับเบอร์นี้เลย → คืน null ให้ webhook.js ตัดสินใจปฏิเสธสายแทนที่จะเดาเอา campaign อื่นมาใช้
+  async getInboundCampaignForNumber(toNumber) {
     const rows = await getRows(SHEETS.CAMPAIGNS)
-    // เดิม fallback ไป rows[0] แบบไม่กรอง type — ถ้า campaign แรกสุดในชีตเป็น outbound
-    // สายเข้าจะได้ script/prompt ของ outbound ไปใช้แบบผิดๆ เงียบๆ ตอนนี้ fallback แค่ในกลุ่ม inbound เท่านั้น
-    // ไม่มี inbound campaign เลยจริงๆ → คืน null ให้ webhook.js ตัดสินใจปฏิเสธสายแทนที่จะเดาเอา campaign อื่นมาใช้
-    return rows.find(r => r.status === 'active' && r.type === 'inbound')
-      || rows.find(r => r.type === 'inbound')
-      || null
+    const defaultNumber = process.env.TWILIO_PHONE_NUMBER
+    return rows.find(r =>
+      r.status === 'active' && r.type === 'inbound' &&
+      (r.twilio_number || defaultNumber) === toNumber
+    ) || null
   },
 
   async getCampaigns() {
@@ -368,9 +370,16 @@ const sheetsService = {
     const outcomes = {}
     const byCampaign = {}
     const interestedByCampaign = {}
+    const byTwilioNumber = {}
+    const interestedByTwilioNumber = {}
     let durationSum = 0
     let durationCount = 0
     let callsToday = 0
+    const smsStats = { sent: 0, delivered: 0, failed: 0 }
+    // แยกตามชั่วโมง/วันในสัปดาห์ตามเวลาไทย (UTC+7) — timestamp เก็บเป็น UTC เสมอ ต้องแปลงก่อนอ่านชั่วโมง/วัน
+    // ไม่งั้นชั่วโมงจะเพี้ยนไป 7 ชม. และวันอาจข้ามคืนผิดวันได้ด้วยถ้าใช้ modulo ตรงๆ แทนการเลื่อน timestamp จริง
+    const byHour = Array.from({ length: 24 }, () => ({ calls: 0, interested: 0 }))
+    const byDayOfWeek = Array.from({ length: 7 }, () => ({ calls: 0, interested: 0 })) // index ตาม Date#getUTCDay(): 0=อาทิตย์
 
     const bucketMap = new Map(dayBuckets.map(b => [b.key, b]))
 
@@ -380,8 +389,29 @@ const sheetsService = {
         byCampaign[r.campaign_id] = (byCampaign[r.campaign_id] || 0) + 1
         if (r.outcome === 'interested') interestedByCampaign[r.campaign_id] = (interestedByCampaign[r.campaign_id] || 0) + 1
       }
+      // แยกสถิติตามเบอร์ Twilio ที่ใช้โทรจริง — สำหรับ Dashboard สลับมุมมองระหว่าง "ต่อ Campaign" / "ต่อเบอร์"
+      if (r.twilio_number) {
+        byTwilioNumber[r.twilio_number] = (byTwilioNumber[r.twilio_number] || 0) + 1
+        if (r.outcome === 'interested') interestedByTwilioNumber[r.twilio_number] = (interestedByTwilioNumber[r.twilio_number] || 0) + 1
+      }
       const duration = Number(r.duration)
       if (!Number.isNaN(duration) && duration > 0) { durationSum += duration; durationCount++ }
+
+      if (r.sms_status === 'sent') smsStats.sent++
+      else if (r.sms_status === 'delivery') smsStats.delivered++
+      else if (r.sms_status === 'failed') smsStats.failed++
+
+      if (r.timestamp) {
+        const d = new Date(r.timestamp)
+        if (!Number.isNaN(d.getTime())) {
+          const thai = new Date(d.getTime() + 7 * 3600000)
+          const hour = thai.getUTCHours()
+          const dow = thai.getUTCDay()
+          byHour[hour].calls++
+          byDayOfWeek[dow].calls++
+          if (r.outcome === 'interested') { byHour[hour].interested++; byDayOfWeek[dow].interested++ }
+        }
+      }
     })
 
     // callsToday และกราฟรายวัน อิงจากข้อมูลทั้งหมดเสมอ ไม่ขึ้นกับตัวกรองช่วงวัน (bucket ของกราฟกรองตัวเองอยู่แล้วผ่าน dayBuckets)
@@ -396,9 +426,13 @@ const sheetsService = {
 
     const avgDuration = durationCount ? Math.round(durationSum / durationCount) : 0
     const conversionRate = total ? Math.round(((outcomes.interested || 0) / total) * 1000) / 10 : 0
+    const smsAttempted = smsStats.sent + smsStats.delivered + smsStats.failed
+    const smsDeliveryRate = smsAttempted ? Math.round((smsStats.delivered / smsAttempted) * 1000) / 10 : 0
 
     return {
-      total, outcomes, byCampaign, interestedByCampaign, avgDuration, callsToday, conversionRate,
+      total, outcomes, byCampaign, interestedByCampaign, byTwilioNumber, interestedByTwilioNumber, avgDuration, callsToday, conversionRate,
+      smsStats: { ...smsStats, attempted: smsAttempted, deliveryRate: smsDeliveryRate },
+      byHour, byDayOfWeek,
       dailyTrend: {
         labels: dayBuckets.map(b => b.key),
         calls: dayBuckets.map(b => b.calls),

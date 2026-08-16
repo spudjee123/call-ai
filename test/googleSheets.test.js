@@ -67,22 +67,57 @@ test('updateRowByKey throw ถ้า key column ไม่มีอยู่ใ�
   await assert.rejects(() => sheetsService.updateCallResultSmsStatus('CA123', { messageId: 'm1', status: 'sent' }))
 })
 
-test('getDefaultInboundCampaign เลือกเฉพาะ campaign type=inbound ไม่ fallback ไปแถวแรกที่เป็น outbound (บั๊กเดิม)', async () => {
+test('getInboundCampaignForNumber เลือกเฉพาะ campaign type=inbound ไม่ fallback ไปแถวแรกที่เป็น outbound (บั๊กเดิม)', async () => {
+  process.env.TWILIO_PHONE_NUMBER = '+66800000000'
   state.data['Campaigns'] = [
-    ['Id', 'Name', 'Status', 'Type'],
-    ['out1', 'Outbound A', 'active', 'outbound'],
-    ['in1', 'Inbound A', 'active', 'inbound'],
+    ['Id', 'Name', 'Status', 'Type', 'Twilio Number'],
+    ['out1', 'Outbound A', 'active', 'outbound', ''],
+    ['in1', 'Inbound A', 'active', 'inbound', ''],
   ]
-  const campaign = await sheetsService.getDefaultInboundCampaign()
+  const campaign = await sheetsService.getInboundCampaignForNumber('+66800000000')
   assert.equal(campaign.id, 'in1')
 })
 
-test('getDefaultInboundCampaign คืน null ถ้าไม่มี inbound campaign เลย (ไม่เดา campaign อื่นมาใช้แทน)', async () => {
+test('getInboundCampaignForNumber คืน null ถ้าไม่มี inbound campaign เลย (ไม่เดา campaign อื่นมาใช้แทน)', async () => {
   state.data['Campaigns'] = [
-    ['Id', 'Name', 'Status', 'Type'],
-    ['out1', 'Outbound A', 'active', 'outbound'],
+    ['Id', 'Name', 'Status', 'Type', 'Twilio Number'],
+    ['out1', 'Outbound A', 'active', 'outbound', ''],
   ]
-  const campaign = await sheetsService.getDefaultInboundCampaign()
+  const campaign = await sheetsService.getInboundCampaignForNumber('+66800000000')
+  assert.equal(campaign, null)
+})
+
+test('getInboundCampaignForNumber เลือก campaign ที่ตั้งเบอร์ Twilio เฉพาะของตัวเองตรงกับเบอร์ที่โทรเข้ามาจริง (รองรับหลายเบอร์พร้อมกัน)', async () => {
+  process.env.TWILIO_PHONE_NUMBER = '+66800000000'
+  state.data['Campaigns'] = [
+    ['Id', 'Name', 'Status', 'Type', 'Twilio Number'],
+    ['in1', 'สาขา A', 'active', 'inbound', '+66811111111'],
+    ['in2', 'สาขา B', 'active', 'inbound', '+66822222222'],
+  ]
+  const campaignA = await sheetsService.getInboundCampaignForNumber('+66811111111')
+  const campaignB = await sheetsService.getInboundCampaignForNumber('+66822222222')
+  assert.equal(campaignA.id, 'in1')
+  assert.equal(campaignB.id, 'in2')
+})
+
+test('getInboundCampaignForNumber: campaign ที่ไม่ได้ตั้งเบอร์ของตัวเองไว้ ถือว่าอิงเบอร์เริ่มต้นของระบบ (เข้ากันได้กับ campaign เก่า)', async () => {
+  process.env.TWILIO_PHONE_NUMBER = '+66800000000'
+  state.data['Campaigns'] = [
+    ['Id', 'Name', 'Status', 'Type', 'Twilio Number'],
+    ['in1', 'สาขาเฉพาะ', 'active', 'inbound', '+66811111111'],
+    ['in2', 'สาขาเดิม (ไม่ได้ตั้งเบอร์)', 'active', 'inbound', ''],
+  ]
+  const campaign = await sheetsService.getInboundCampaignForNumber('+66800000000')
+  assert.equal(campaign.id, 'in2')
+})
+
+test('getInboundCampaignForNumber คืน null ถ้าเบอร์ที่โทรเข้ามาไม่ตรงกับ campaign ไหนเลย (ไม่เดาเบอร์อื่นมาใช้แทน)', async () => {
+  process.env.TWILIO_PHONE_NUMBER = '+66800000000'
+  state.data['Campaigns'] = [
+    ['Id', 'Name', 'Status', 'Type', 'Twilio Number'],
+    ['in1', 'สาขา A', 'active', 'inbound', '+66811111111'],
+  ]
+  const campaign = await sheetsService.getInboundCampaignForNumber('+66899999999')
   assert.equal(campaign, null)
 })
 
@@ -107,4 +142,44 @@ test('getStats: ช่วงวันที่เกิน 365 วัน ต้�
   const sumFromChart = stats.dailyTrend.calls.reduce((a, b) => a + b, 0)
   assert.equal(stats.total, sumFromChart)
   assert.equal(stats.total, 1)
+})
+
+test('getStats: แยกจำนวนสายและจำนวนที่สนใจตามเบอร์ Twilio ที่ใช้โทรจริง (สำหรับ Dashboard มุมมอง "ต่อเบอร์")', async () => {
+  state.data['Call Results'] = [
+    ['Call SID', 'Phone', 'Campaign ID', 'Twilio Number', 'Outcome', 'Duration', 'Timestamp'],
+    ['CA1', '081', 'camp1', '+66811111111', 'interested', '30', '2026-03-01T10:00:00.000Z'],
+    ['CA2', '082', 'camp1', '+66811111111', 'not_interested', '30', '2026-03-01T11:00:00.000Z'],
+    ['CA3', '083', 'camp2', '+66822222222', 'interested', '30', '2026-03-01T12:00:00.000Z'],
+    ['CA4', '084', 'camp2', '', 'interested', '30', '2026-03-01T13:00:00.000Z'], // ไม่มี twilio_number บันทึกไว้ (แถวเก่าก่อนมีฟีเจอร์นี้) — ไม่ควรถูกนับในกลุ่มไหนเลย ไม่ใช่ไปรวมกับเบอร์ว่าง
+  ]
+  const stats = await sheetsService.getStats({ allTime: true })
+  assert.deepEqual(stats.byTwilioNumber, { '+66811111111': 2, '+66822222222': 1 })
+  assert.deepEqual(stats.interestedByTwilioNumber, { '+66811111111': 1, '+66822222222': 1 })
+})
+
+test('getStats: สรุปอัตราส่ง SMS สำเร็จจากสถานะ sms_status ที่บันทึกไว้ต่อแถวอยู่แล้ว', async () => {
+  state.data['Call Results'] = [
+    ['Call SID', 'Phone', 'Campaign ID', 'Outcome', 'Duration', 'Timestamp', 'SMS Status'],
+    ['CA1', '081', 'camp1', 'interested', '30', '2026-03-01T10:00:00.000Z', 'delivery'],
+    ['CA2', '082', 'camp1', 'interested', '30', '2026-03-01T10:00:00.000Z', 'delivery'],
+    ['CA3', '083', 'camp1', 'not_interested', '30', '2026-03-01T10:00:00.000Z', 'failed'],
+    ['CA4', '084', 'camp1', 'callback', '30', '2026-03-01T10:00:00.000Z', 'sent'],
+    ['CA5', '085', 'camp1', 'no_answer', '30', '2026-03-01T10:00:00.000Z', ''], // ไม่มีการส่ง SMS เลย — ไม่ควรถูกนับในตัวส่วนของอัตราสำเร็จ
+  ]
+  const stats = await sheetsService.getStats({ allTime: true })
+  assert.deepEqual(stats.smsStats, { sent: 1, delivered: 2, failed: 1, attempted: 4, deliveryRate: 50 })
+})
+
+test('getStats: แยกจำนวนสายตามชั่วโมง/วันในสัปดาห์ตามเวลาไทย (UTC+7) ต้องข้ามวันถูกต้องถ้าเวลา UTC บวก 7 ชม. แล้วเลยเที่ยงคืน', async () => {
+  process.env.TZ = 'UTC' // กันเครื่องที่รันเทสอยู่คนละ timezone มามีผลกับผลลัพธ์ — โค้ดต้องคำนวณเวลาไทยเองไม่พึ่ง timezone ของเครื่อง
+  state.data['Call Results'] = [
+    // UTC วันอาทิตย์ 18:00 → เวลาไทย (บวก 7) กลายเป็นวันจันทร์ 01:00 (ข้ามวันจริง ไม่ใช่แค่ข้ามชั่วโมง)
+    ['Call SID', 'Phone', 'Campaign ID', 'Outcome', 'Duration', 'Timestamp'],
+    ['CA1', '081', 'camp1', 'interested', '30', '2026-03-01T18:00:00.000Z'],
+  ]
+  const stats = await sheetsService.getStats({ allTime: true })
+  assert.equal(stats.byHour[1].calls, 1, 'ชั่วโมง 01:00 ตามเวลาไทยต้องมี 1 สาย')
+  assert.equal(stats.byHour[1].interested, 1)
+  assert.equal(stats.byDayOfWeek[1].calls, 1, 'ต้องนับเป็นวันจันทร์ (index 1) ไม่ใช่วันอาทิตย์ตาม UTC ดิบ (index 0)')
+  assert.equal(stats.byDayOfWeek[0].calls, 0, 'ต้องไม่ค้างอยู่ที่วันอาทิตย์ตาม UTC ดิบ')
 })

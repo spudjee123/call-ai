@@ -40,6 +40,7 @@ async function postCallHandler(callSid, callStatus, duration, session) {
       phone: session.phone,
       name: session.name,
       campaign_id: session.campaign?.id || '',
+      twilio_number: session.twilioNumber || '',
       outcome,
       call_status: callStatus,
       hangup_reason: session.hangupReason || '',

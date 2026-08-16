@@ -204,6 +204,9 @@
 
   table { width: 100%; border-collapse: collapse; }
   th { text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--text-3); font-weight: 650; padding: 0 10px 10px; }
+  th.sortable { cursor: pointer; user-select: none; }
+  th.sortable:hover { color: var(--text); }
+  .sort-ind { font-size: 10px; color: var(--accent); margin-left: 3px; }
   td { padding: 13px 10px; border-top: 1px solid var(--glass-border); font-size: 13.5px; vertical-align: middle; }
   tbody tr.clickable { cursor: pointer; }
   tbody tr.clickable:hover { background: rgba(255,255,255,.15); }
@@ -368,6 +371,7 @@
   .toast svg { width: 15px; height: 15px; flex-shrink: 0; }
   .toast.success svg { color: var(--success); }
   .toast.danger svg { color: #ff8a80; }
+  .toast-action { all: unset; box-sizing: border-box; cursor: pointer; text-decoration: underline; font-weight: 700; margin-left: 6px; color: inherit; flex-shrink: 0; }
   @keyframes toastin { from { opacity:0; transform: translateY(8px) } to { opacity:1; transform: translateY(0) } }
 
   ::selection { background: var(--accent-soft); }
@@ -547,6 +551,30 @@ function fmtDur(sec){ sec=Number(sec)||0; const m=Math.floor(sec/60), s=Math.flo
 function fmtDate(iso){ if(!iso) return ''; const d=new Date(iso); if(isNaN(d)) return iso; return new Intl.DateTimeFormat('sv-SE',{timeZone:'Asia/Bangkok',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}).format(d) }
 function campaignName(id){ if(!id) return '—'; const c = campaignsCache.find(x => x.id === id); return c ? (c.name || c.id) : id }
 
+// เรียงลำดับแถวตามคอลัมน์ที่คลิก — ใช้ร่วมกันทั้งตารางประวัติการโทรและตารางเบอร์ติดต่อ
+// numericKeys/dateKeys ระบุไว้ล่วงหน้าเพราะเทียบแบบตัวเลข/วันที่ตรงๆ ต้องคนละวิธีกับเทียบตัวอักษร (localeCompare ภาษาไทย)
+const SORT_NUMERIC_KEYS = new Set(['duration', 'retry_count'])
+const SORT_DATE_KEYS = new Set(['timestamp'])
+function sortRows(rows, sortState, resolveValue){
+  if (!sortState.key) return rows
+  const { key, dir } = sortState
+  return [...rows].sort((a, b) => {
+    let av = resolveValue ? resolveValue(a, key) : a[key]
+    let bv = resolveValue ? resolveValue(b, key) : b[key]
+    if (SORT_NUMERIC_KEYS.has(key)) return ((Number(av) || 0) - (Number(bv) || 0)) * dir
+    if (SORT_DATE_KEYS.has(key)) return String(av || '').localeCompare(String(bv || '')) * dir
+    return String(av || '').localeCompare(String(bv || ''), 'th') * dir
+  })
+}
+// อัปเดตลูกศร ▲/▼ ให้โชว์เฉพาะคอลัมน์ที่กำลังเรียงอยู่ — theadId คือ id ของ <thead> ที่มี .sort-ind อยู่ข้างใน
+function updateSortIndicators(theadId, sortState){
+  const thead = document.getElementById(theadId)
+  if (!thead) return
+  thead.querySelectorAll('.sort-ind').forEach(el => {
+    el.textContent = el.dataset.key === sortState.key ? (sortState.dir === 1 ? ' ▲' : ' ▼') : ''
+  })
+}
+
 async function apiFetch(url, options = {}) {
   options.headers = Object.assign({}, options.headers, { 'Authorization': 'Bearer ' + token })
   if (options.body && typeof options.body !== 'string') {
@@ -606,13 +634,22 @@ async function logout() {
 }
 
 /* ==================== toast / confirm / modal ==================== */
-function toast(msg, type='success'){
+// action = { label, onClick } (ไม่บังคับ) — ใส่แล้วโชว์ปุ่มเล็กๆ ในตัว toast เอง เช่น "เลิกทำ" พร้อมยืดเวลาก่อนหายไปให้กดทัน
+function toast(msg, type='success', action=null){
   const stack = document.getElementById('toastStack')
   const el = document.createElement('div')
   el.className = 'toast ' + type
   el.innerHTML = icon(type==='danger'?'warn':'check') + `<span>${esc(msg)}</span>`
+  const dismiss = () => { el.style.transition='opacity .2s'; el.style.opacity='0'; setTimeout(()=>el.remove(), 200) }
+  if (action) {
+    const btn = document.createElement('button')
+    btn.className = 'toast-action'
+    btn.textContent = action.label
+    btn.onclick = () => { dismiss(); action.onClick() }
+    el.appendChild(btn)
+  }
   stack.appendChild(el)
-  setTimeout(() => { el.style.transition='opacity .2s'; el.style.opacity='0'; setTimeout(()=>el.remove(), 200) }, 2600)
+  setTimeout(dismiss, action ? 8000 : 2600)
 }
 function openConfirm({title, message, confirmLabel='ยืนยัน', danger=true, extraHtml='', onConfirm}){
   const ov = document.getElementById('confirmOverlay')
@@ -655,6 +692,7 @@ function openHistoryModal(i){
   document.getElementById('modalSubtitle').textContent = fmtDate(c.timestamp)
   document.getElementById('modalMeta').innerHTML = `
     <div><div class="k">Campaign</div><div class="v">${esc(campaignName(c.campaign_id))}</div></div>
+    <div><div class="k">เบอร์ที่โทร</div><div class="v">${esc(twilioNumberLabel(c.twilio_number))}</div></div>
     <div><div class="k">การเชื่อมต่อ</div><div class="v"><span class="pill ${esc(c.call_status)}">${esc(CALL_STATUS_LABELS[c.call_status] || c.call_status)}</span></div></div>
     <div><div class="k">ผล</div><div class="v">${c.outcome && c.outcome!=='-' ? `<span class="pill ${esc(c.outcome)}">${esc(outcomeLabel(c.outcome))}</span>` : '—'}</div></div>
     <div><div class="k">วางสายโดย</div><div class="v">${c.hangup_reason ? esc(HANGUP_LABELS[c.hangup_reason]||c.hangup_reason) : '—'}</div></div>
@@ -778,6 +816,13 @@ const TEMPLATES = {
     </div>
     <div id="heroSlot"></div>
     <div class="stats-grid" id="statsGrid"><div class="empty">กำลังโหลด...</div></div>
+    <div class="row" style="justify-content:space-between; align-items:center; margin-bottom:10px; flex-wrap:wrap; gap:10px">
+      <h2 style="font-size:15px; font-weight:650">สถิติแยกตาม</h2>
+      <div class="segmented" id="dashStripToggle">
+        <button data-mode="campaign" class="active" onclick="setDashboardStripMode('campaign')">Campaign</button>
+        <button data-mode="number" onclick="setDashboardStripMode('number')">เบอร์ Twilio</button>
+      </div>
+    </div>
     <div class="campaign-strip" id="campaignStrip"></div>
     <div class="grid-2">
       <div class="card">
@@ -788,6 +833,16 @@ const TEMPLATES = {
         <div class="card-head"><h2>สัดส่วนผลการโทร</h2></div>
         <div class="card-body" id="outcomeBars"><div class="empty">กำลังโหลด...</div></div>
       </div>
+    </div>
+    <div class="card">
+      <div class="card-head">
+        <h2>ช่วงเวลาที่โทรติดต่อได้ดีที่สุด</h2>
+        <div class="segmented" id="timePatternToggle">
+          <button data-mode="hour" class="active" onclick="setTimePatternMode('hour')">รายชั่วโมง</button>
+          <button data-mode="day" onclick="setTimePatternMode('day')">รายวัน</button>
+        </div>
+      </div>
+      <div class="card-body chart-wrap" id="timePatternWrap"><div class="empty">กำลังโหลด...</div></div>
     </div>
     <div class="grid-2">
       <div class="card">
@@ -812,8 +867,8 @@ const TEMPLATES = {
       </div>
       <div class="card-body table-scroll">
         <table>
-          <thead><tr><th>ชื่อ</th><th>สถานะ</th><th>ประเภท</th><th>Voice</th><th>สถิติ</th><th></th></tr></thead>
-          <tbody id="campaignTable"><tr><td colspan="6" class="empty">กำลังโหลด...</td></tr></tbody>
+          <thead><tr><th>ชื่อ</th><th>สถานะ</th><th>ประเภท</th><th>เบอร์</th><th>Voice</th><th>สถิติ</th><th></th></tr></thead>
+          <tbody id="campaignTable"><tr><td colspan="7" class="empty">กำลังโหลด...</td></tr></tbody>
         </table>
         <div id="campaignPanel"></div>
       </div>
@@ -840,8 +895,13 @@ const TEMPLATES = {
 
         <div class="tab-panel" id="tab-bulk">
           <p style="font-size:12.5px; color:var(--text-2); margin-bottom:10px">
-            เปิดไฟล์ใน Google Sheets หรือ Excel ให้มี 2 คอลัมน์ (<b>เบอร์โทร</b>, <b>ชื่อ</b>) แล้วเลือกช่วงที่ต้องการ กด Ctrl/⌘+C แล้วมาวาง (Ctrl/⌘+V) ในช่องด้านล่างนี้ได้เลย
+            เปิดไฟล์ใน Google Sheets หรือ Excel ให้มี 2 คอลัมน์ (<b>เบอร์โทร</b>, <b>ชื่อ</b>) แล้วเลือกช่วงที่ต้องการ กด Ctrl/⌘+C แล้วมาวาง (Ctrl/⌘+V) ในช่องด้านล่างนี้ได้เลย หรืออัปโหลดไฟล์ .csv ที่มีคอลัมน์เดียวกันโดยตรงก็ได้ (สะดวกกว่าถ้ารายชื่อมีจำนวนมาก)
           </p>
+          <div class="row" style="gap:10px; align-items:center; margin-bottom:10px">
+            <input type="file" id="bulkFileInput" accept=".csv,.txt" style="display:none" onchange="handleBulkFileUpload(this.files[0])">
+            <button class="btn btn-sm" onclick="document.getElementById('bulkFileInput').click()">${icon('sheet')} อัปโหลดไฟล์ .csv</button>
+            <span style="font-size:12px; color:var(--text-3)" id="bulkFileName"></span>
+          </div>
           <textarea class="import-zone" id="bulkPaste" placeholder="วางข้อมูลจาก Excel / Google Sheets ตรงนี้&#10;เช่น:&#10;0812345678&#9;สมชาย ใจดี&#10;0898765432&#9;วิภา สุขเจริญ" oninput="handleBulkPaste(this.value)"></textarea>
           <div class="import-summary" id="importSummary" style="display:none"></div>
           <div class="import-preview" id="importPreview" style="display:none"></div>
@@ -855,12 +915,18 @@ const TEMPLATES = {
     <div class="card">
       <div class="card-head">
         <h2>รายชื่อเบอร์</h2>
-        <div class="search-wrap">${icon('search')}<input id="contactsSearchInput" type="search" placeholder="ค้นหาเบอร์หรือชื่อ..." oninput="filterContacts(this.value)"></div>
+        <div class="row" style="gap:8px">
+          <button class="btn btn-sm btn-danger" title="เลือกเบอร์ที่จะหยุดคิวรอโทร (สายที่กำลังคุยอยู่จะไม่ถูกตัด)" onclick="confirmStopQueue()">${icon('pause')} หยุดคิวโทร</button>
+          <div class="search-wrap">${icon('search')}<input id="contactsSearchInput" type="search" placeholder="ค้นหาเบอร์หรือชื่อ..." oninput="filterContacts(this.value)"></div>
+        </div>
       </div>
       <div class="card-body">
         <div class="row" id="contactsBulkBar" style="display:none; margin-bottom:12px; justify-content:space-between; background:var(--surface-2); border:1px solid var(--glass-border); border-radius:var(--radius-sm); padding:10px 14px">
           <span style="font-size:13px; color:var(--text-2)"><b id="contactsSelectedCount">0</b> เบอร์ที่เลือก</span>
           <div class="row" style="gap:6px">
+            <select id="contactsCallNumber" class="twilio-number-select" style="width:auto; min-width:190px">
+              <option value="">-- เลือกเบอร์ที่จะใช้โทร --</option>
+            </select>
             <button class="btn btn-sm btn-accent" onclick="bulkCallContacts()">${icon('test')} โทรที่เลือก</button>
             <button class="btn btn-sm btn-ghost danger" onclick="bulkBlockContacts()">${icon('block')} บล็อกที่เลือก</button>
             <button class="btn btn-sm btn-danger" onclick="bulkDeleteContacts()">${icon('trash')} ลบที่เลือก</button>
@@ -870,7 +936,14 @@ const TEMPLATES = {
       </div>
       <div class="card-body table-scroll" style="padding-top:0">
         <table>
-          <thead><tr><th style="width:34px"><input type="checkbox" id="contactsSelectAll" onchange="toggleSelectAllContacts(this.checked)"></th><th>เบอร์</th><th>ชื่อ</th><th>Campaign</th><th>สถานะ</th><th></th></tr></thead>
+          <thead id="contactsThead"><tr>
+            <th style="width:34px"><input type="checkbox" id="contactsSelectAll" onchange="toggleSelectAllContacts(this.checked)"></th>
+            <th class="sortable" onclick="sortContacts('phone')">เบอร์<span class="sort-ind" data-key="phone"></span></th>
+            <th class="sortable" onclick="sortContacts('name')">ชื่อ<span class="sort-ind" data-key="name"></span></th>
+            <th class="sortable" onclick="sortContacts('campaign')">Campaign<span class="sort-ind" data-key="campaign"></span></th>
+            <th class="sortable" onclick="sortContacts('status')">สถานะ<span class="sort-ind" data-key="status"></span></th>
+            <th></th>
+          </tr></thead>
           <tbody id="contactsTable"><tr><td colspan="6" class="empty">กำลังโหลด...</td></tr></tbody>
         </table>
       </div>
@@ -891,6 +964,7 @@ const TEMPLATES = {
             <div class="field" style="flex:1; min-width:180px"><input type="tel" id="testPhone" placeholder="+66812345678"></div>
             <div class="field" style="flex:1; min-width:160px"><input type="text" id="testName" placeholder="ชื่อ (ไม่บังคับ)"></div>
             <div class="field" style="min-width:200px"><select id="testCampaign" class="campaign-select"><option value="">-- เลือก Campaign --</option></select></div>
+            <div class="field" style="min-width:200px"><select id="testCallNumber" class="twilio-number-select"><option value="">-- เลือกเบอร์ที่จะใช้โทร --</option></select></div>
             <button class="btn btn-accent" onclick="testCall()">${icon('test')} โทรทดสอบ</button>
           </div>
           <div class="msg" id="testCallMsg" style="font-size:13px; color:var(--text-2); min-height:18px; margin-top:6px"></div>
@@ -916,6 +990,7 @@ const TEMPLATES = {
         <h2>ประวัติการโทร</h2>
         <div class="row" style="gap:8px; flex-wrap:wrap">
           <select id="logCampaignFilter" class="campaign-select" onchange="loadLogs()" style="width:auto; min-width:170px"><option value="">ทุก Campaign</option></select>
+          <select id="logNumberFilter" class="twilio-number-select" onchange="historyFilterChanged()" style="width:auto; min-width:170px"><option value="">ทุกเบอร์ที่โทร</option></select>
           <select id="historyOutcomeFilter" onchange="historyFilterChanged()" style="width:auto; min-width:150px">
             <option value="">ทุกผลลัพธ์</option>
             <option value="interested">สนใจ</option>
@@ -958,8 +1033,18 @@ const TEMPLATES = {
       </div>
       <div class="card-body table-scroll">
         <table>
-          <thead><tr><th>เบอร์</th><th>ชื่อ</th><th>Campaign</th><th>การเชื่อมต่อ</th><th>ผล</th><th>สรุป</th><th>เวลาคุย</th><th>วันที่</th></tr></thead>
-          <tbody id="historyBody"><tr><td colspan="8" class="empty">กำลังโหลด...</td></tr></tbody>
+          <thead id="historyThead"><tr>
+            <th class="sortable" onclick="sortHistory('phone')">เบอร์<span class="sort-ind" data-key="phone"></span></th>
+            <th class="sortable" onclick="sortHistory('name')">ชื่อ<span class="sort-ind" data-key="name"></span></th>
+            <th>Campaign</th>
+            <th class="sortable" onclick="sortHistory('twilio_number')">เบอร์ที่โทร<span class="sort-ind" data-key="twilio_number"></span></th>
+            <th>การเชื่อมต่อ</th>
+            <th>ผล</th>
+            <th>สรุป</th>
+            <th class="sortable" onclick="sortHistory('duration')">เวลาคุย<span class="sort-ind" data-key="duration"></span></th>
+            <th class="sortable" onclick="sortHistory('timestamp')">วันที่<span class="sort-ind" data-key="timestamp"></span></th>
+          </tr></thead>
+          <tbody id="historyBody"><tr><td colspan="9" class="empty">กำลังโหลด...</td></tr></tbody>
         </table>
         <div style="text-align:center; margin-top:14px" id="historyLoadMoreWrap"></div>
       </div>
@@ -1019,9 +1104,13 @@ const INIT = {
   dashboard: async () => {
     initDashboardDateRange()
     await loadCampaigns()
+    // ต้องโหลด contacts ให้เสร็จก่อน loadStats() เสมอ — renderStatsStrip() (เรียกจากใน loadStats) อ่าน contactsCache
+    // ทันทีตอน render การ์ด "เบอร์ทั้งหมด" ต่อ Campaign ถ้ายังไม่เคยเปิดหน้าเบอร์ติดต่อมาก่อนในเซสชันนี้ contactsCache จะว่างเปล่า
+    // ทำให้ตัวเลขโชว์ 0 ผิดๆ ทั้งที่มีเบอร์จริงอยู่ — ต้องรอ loadContacts() เสร็จก่อนเสมอ ไม่ใช่ปล่อยให้แข่งกันแบบสุ่ม
+    await Promise.all([loadTwilioNumbers(), loadContacts()])
     await Promise.all([loadStats(), refreshActiveGlobal(true)])
   },
-  campaigns: async () => { await Promise.all([loadCampaigns(), loadStats('all'), loadSmsTemplates()]); renderCampaignTable() },
+  campaigns: async () => { await Promise.all([loadCampaigns(), loadStats('all'), loadSmsTemplates(), loadTwilioNumbers()]); renderCampaignTable() },
   contacts: async () => {
     document.getElementById('addTabs').addEventListener('click', e => {
       const btn = e.target.closest('button'); if (!btn) return
@@ -1030,7 +1119,7 @@ const INIT = {
       document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'))
       document.getElementById('tab-' + btn.dataset.t).classList.add('active')
     })
-    await loadCampaigns()
+    await Promise.all([loadCampaigns(), loadTwilioNumbers()])
     await loadContacts()
   },
   test: async () => {
@@ -1041,11 +1130,11 @@ const INIT = {
       document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'))
       document.getElementById('testtab-' + btn.dataset.t).classList.add('active')
     })
-    await Promise.all([loadCampaigns(), loadSmsTemplates()])
+    await Promise.all([loadCampaigns(), loadSmsTemplates(), loadTwilioNumbers()])
     populateTestSmsTemplateSelect()
   },
   history: async () => {
-    await loadCampaigns()
+    await Promise.all([loadCampaigns(), loadTwilioNumbers()])
     await loadLogs()
   },
   lookup: async () => { await loadCampaigns() },
@@ -1080,10 +1169,44 @@ async function loadCampaigns(){
   populateCampaignSelects()
   renderCampaignTable()
 }
+// เบอร์ Twilio จริงที่ซื้อไว้ในบัญชี — ใช้ร่วมกันหลายหน้า (Campaigns, เบอร์ติดต่อ, ทดสอบ, ประวัติการโทร)
+let twilioNumbersCache = []
+async function loadTwilioNumbers(){
+  try {
+    const res = await apiFetch('/api/twilio/numbers')
+    twilioNumbersCache = res.ok ? await res.json() : []
+  } catch (e) {
+    twilioNumbersCache = []
+  }
+  populateTwilioNumberSelects()
+}
+// เติม <select class="twilio-number-select"> ทุกตัวที่มีอยู่ตอนนี้ในหน้า — เหมือน populateCampaignSelects()
+// (ต่างจาก cf_twilio_number ในฟอร์มแก้ไข campaign ที่สร้างสดใหม่ทุกครั้งที่เปิดอยู่แล้ว ไม่ต้องพึ่งฟังก์ชันนี้)
+function populateTwilioNumberSelects(){
+  document.querySelectorAll('.twilio-number-select').forEach(sel => {
+    const current = sel.value
+    const keepFirst = sel.options[0]
+    sel.innerHTML = ''
+    sel.appendChild(keepFirst)
+    twilioNumbersCache.forEach(n => {
+      const opt = document.createElement('option')
+      opt.value = n.phoneNumber
+      opt.text = `${n.friendlyName} (${n.phoneNumber})`
+      sel.appendChild(opt)
+    })
+    sel.value = current
+  })
+}
+// โชว์ friendlyName แทนเบอร์ดิบถ้ามี — ใช้ในตาราง/รายละเอียดประวัติการโทร
+function twilioNumberLabel(number){
+  if (!number) return '—'
+  const n = twilioNumbersCache.find(x => x.phoneNumber === number)
+  return (n && n.friendlyName && n.friendlyName !== number) ? n.friendlyName : number
+}
 function renderCampaignTable(){
   const tbody = document.getElementById('campaignTable')
   if (!tbody) return
-  if (!campaignsCache.length) { tbody.innerHTML = '<tr><td colspan="6" class="empty">ยังไม่มี campaign</td></tr>'; return }
+  if (!campaignsCache.length) { tbody.innerHTML = '<tr><td colspan="7" class="empty">ยังไม่มี campaign</td></tr>'; return }
   tbody.innerHTML = campaignsCache.map(c => {
     const calls = (statsCache && statsCache.byCampaign && statsCache.byCampaign[c.id]) || 0
     const interested = (statsCache && statsCache.interestedByCampaign && statsCache.interestedByCampaign[c.id]) || 0
@@ -1093,6 +1216,7 @@ function renderCampaignTable(){
       <td><div style="font-weight:600">${esc(c.name)}</div><div class="num" style="font-size:11.5px;color:var(--text-3)">${esc(c.id)}</div></td>
       <td><span class="pill ${esc(c.status)}">${esc(c.status)}</span></td>
       <td style="color:var(--text-2)">${esc(c.type)}</td>
+      <td class="num" style="color:var(--text-2); font-size:12px">${esc(c.twilio_number || 'เริ่มต้น')}</td>
       <td class="num" style="color:var(--text-2); font-size:12px">${esc(c.voice_id)}</td>
       <td class="num" style="color:var(--text-2); font-size:12.5px">${calls ? `${calls} สาย · ${rate}% สนใจ` : '—'}</td>
       <td>
@@ -1116,6 +1240,14 @@ function campaignEditPanelHtml(c, isNew){
         <div class="field"><label>ชื่อ Campaign</label><input type="text" id="cf_name" value="${esc(c.name||'')}"></div>
         <div class="field"><label>Voice ID</label><input type="text" id="cf_voice" value="${esc(c.voice_id||'')}"></div>
         <div class="field"><label>ประเภท</label><select id="cf_type"><option value="outbound" ${c.type==='inbound'?'':'selected'}>outbound</option><option value="inbound" ${c.type==='inbound'?'selected':''}>inbound</option></select></div>
+        <div class="field">
+          <label>เบอร์ Twilio ที่ใช้ (โทรออก/รับสาย)</label>
+          <select id="cf_twilio_number" class="twilio-number-select">
+            <option value="">— ใช้เบอร์เริ่มต้นของระบบ —</option>
+            ${twilioNumbersCache.map(n => `<option value="${escAttr(n.phoneNumber)}" ${c.twilio_number===n.phoneNumber?'selected':''}>${esc(n.friendlyName)} (${esc(n.phoneNumber)})</option>`).join('')}
+          </select>
+          ${!twilioNumbersCache.length ? `<div style="font-size:11.5px; color:var(--text-3); margin-top:4px">ดึงรายชื่อเบอร์จาก Twilio ไม่สำเร็จ หรือยังไม่มีเบอร์ในบัญชี — ใช้เบอร์เริ่มต้นของระบบไปก่อนได้</div>` : ''}
+        </div>
       </div>
       <div class="field" style="margin-bottom:16px"><label>Prompt / Script</label><textarea id="cf_script" placeholder="System prompt ที่ AI ใช้พูดกับลูกค้า">${esc(c.script || c.system_prompt || '')}</textarea></div>
       <label style="font-size:12px; color:var(--text-2); font-weight:600">ส่ง SMS follow-up เมื่อผลเป็น — เลือก template ที่จะใช้ต่อผลลัพธ์ (แต่ละ template มี Sendername ของตัวเองอยู่แล้ว)</label>
@@ -1170,6 +1302,7 @@ function collectCampaignForm(){
     name: document.getElementById('cf_name').value,
     voice_id: document.getElementById('cf_voice').value,
     type: document.getElementById('cf_type').value,
+    twilio_number: document.getElementById('cf_twilio_number').value,
     [scriptKey]: document.getElementById('cf_script').value,
     sms_interested: document.getElementById('cf_sms_interested').value,
     sms_callback: document.getElementById('cf_sms_callback').value,
@@ -1658,13 +1791,17 @@ async function loadStats(days){
 
   const grid = document.getElementById('statsGrid')
   if (grid) {
+    const sms = statsCache.smsStats || { attempted: 0, delivered: 0, deliveryRate: 0 }
+    const smsValue = sms.attempted ? `${sms.deliveryRate}%` : '—'
+    const smsSub = sms.attempted ? `${sms.delivered}/${sms.attempted} ข้อความ` : 'ยังไม่มีการส่ง SMS'
     grid.innerHTML = `
       <div class="stat-tile"><div class="label">โทรทั้งหมด</div><div class="value num">${statsCache.total||0}</div></div>
       <div class="stat-tile"><div class="label">สนใจ</div><div class="value num success">${(statsCache.outcomes&&statsCache.outcomes.interested)||0}</div></div>
       <div class="stat-tile"><div class="label">นัด Callback</div><div class="value num warning">${(statsCache.outcomes&&statsCache.outcomes.callback)||0}</div></div>
       <div class="stat-tile"><div class="label">Conversion</div><div class="value num accent">${statsCache.conversionRate||0}%</div></div>
       <div class="stat-tile"><div class="label">เวลาคุยเฉลี่ย</div><div class="value num">${fmtDur(statsCache.avgDuration)}</div></div>
-      <div class="stat-tile"><div class="label">โทรวันนี้</div><div class="value num">${statsCache.callsToday||0}</div></div>`
+      <div class="stat-tile"><div class="label">โทรวันนี้</div><div class="value num">${statsCache.callsToday||0}</div></div>
+      <div class="stat-tile"><div class="label">ส่ง SMS ถึงมือลูกค้า</div><div class="value num accent">${smsValue}</div><div style="font-size:11px; color:var(--text-3); margin-top:4px">${esc(smsSub)}</div></div>`
   }
 
   const barsEl = document.getElementById('outcomeBars')
@@ -1683,15 +1820,86 @@ async function loadStats(days){
     chartWrap.innerHTML = buildComboChart(statsCache.dailyTrend.labels, statsCache.dailyTrend.calls, statsCache.dailyTrend.interested)
   }
 
-  renderCampaignStrip()
+  renderStatsStrip()
+  renderTimePattern()
 
   setText('lastUpdated', new Intl.DateTimeFormat('th-TH', { timeZone:'Asia/Bangkok', hour:'2-digit', minute:'2-digit', second:'2-digit' }).format(new Date()))
 }
 
-function renderCampaignStrip(){
+// สลับมุมมองการ์ดสรุปบน Dashboard ระหว่าง "ต่อ Campaign" กับ "ต่อเบอร์ Twilio" — เผื่อหลายคน/หลายทีมใช้คนละเบอร์
+// อยากเห็นผลงานแยกตามเบอร์ของตัวเองแทนที่จะไล่ดูทีละ Campaign
+let dashboardStripMode = 'campaign'
+function setDashboardStripMode(mode){
+  dashboardStripMode = mode
+  document.querySelectorAll('#dashStripToggle button').forEach(b => b.classList.toggle('active', b.dataset.mode === mode))
+  renderStatsStrip()
+}
+// สลับมุมมองการ์ด "ช่วงเวลาที่โทรติดต่อได้ดีที่สุด" ระหว่างรายชั่วโมง (0-23 ตามเวลาไทย) กับรายวันในสัปดาห์
+let timePatternMode = 'hour'
+function setTimePatternMode(mode){
+  timePatternMode = mode
+  document.querySelectorAll('#timePatternToggle button').forEach(b => b.classList.toggle('active', b.dataset.mode === mode))
+  renderTimePattern()
+}
+function renderTimePattern(){
+  const wrap = document.getElementById('timePatternWrap')
+  if (!wrap || !statsCache) return
+  if (timePatternMode === 'hour') {
+    const byHour = statsCache.byHour || []
+    if (!byHour.length) { wrap.innerHTML = '<div class="empty">ยังไม่มีข้อมูล</div>'; return }
+    const labels = byHour.map((_, i) => String(i).padStart(2, '0') + ':00')
+    // ส่ง formatLabel เข้าไปตรงๆ เพราะ label เป็น "09:00" ไม่ใช่ "YYYY-MM-DD" แบบกราฟแนวโน้มรายวัน (ตัวช่วยเริ่มต้นของฟังก์ชันจะ slice ผิดรูปแบบ)
+    wrap.innerHTML = buildComboChart(labels, byHour.map(h => h.calls), byHour.map(h => h.interested), l => esc(l))
+    return
+  }
+  // รายวันในสัปดาห์ — เรียงแสดงเริ่มจันทร์ถึงอาทิตย์ตามความคุ้นเคย แม้ backend เก็บดัชนีตาม Date#getUTCDay (0=อาทิตย์)
+  const dayNames = ['อาทิตย์', 'จันทร์', 'อังคาร', 'พุธ', 'พฤหัสบดี', 'ศุกร์', 'เสาร์']
+  const order = [1, 2, 3, 4, 5, 6, 0]
+  const byDay = statsCache.byDayOfWeek || []
+  if (!byDay.length) { wrap.innerHTML = '<div class="empty">ยังไม่มีข้อมูล</div>'; return }
+  const maxCalls = Math.max(1, ...order.map(i => byDay[i]?.calls || 0))
+  wrap.innerHTML = order.map(i => {
+    const d = byDay[i] || { calls: 0, interested: 0 }
+    const pct = Math.round((d.calls / maxCalls) * 100)
+    const rate = d.calls ? Math.round((d.interested / d.calls) * 100) : 0
+    return `
+    <div class="bar-row">
+      <div class="bar-label">${dayNames[i]}</div>
+      <div class="bar-track"><div class="bar-fill" style="width:${pct}%"></div></div>
+      <div class="bar-value num" style="width:auto; white-space:nowrap">${d.calls} <span style="color:var(--text-3); font-weight:400">(${rate}% สนใจ)</span></div>
+    </div>`
+  }).join('')
+}
+function renderStatsStrip(){
   const el = document.getElementById('campaignStrip')
   if (!el) return
   const grads = ['g0','g1','g2','g3']
+
+  if (dashboardStripMode === 'number') {
+    if (!twilioNumbersCache.length) { el.innerHTML = '<div class="empty">ยังไม่มีเบอร์ Twilio ในระบบ</div>'; return }
+    el.innerHTML = twilioNumbersCache.map((n,i) => {
+      const calls = (statsCache && statsCache.byTwilioNumber && statsCache.byTwilioNumber[n.phoneNumber]) || 0
+      const interested = (statsCache && statsCache.interestedByTwilioNumber && statsCache.interestedByTwilioNumber[n.phoneNumber]) || 0
+      const pct = calls ? Math.round(interested / calls * 100) : 0
+      return `
+      <div class="gcard ${grads[i % grads.length]}" onclick="go('history')">
+        <div class="top-row">
+          <div class="chip">${icon('waveform')}</div>
+          <span class="pill">${calls} สาย</span>
+        </div>
+        <div>
+          <div class="name">${esc(n.friendlyName)}</div>
+          <div class="stats">
+            <div><div class="n num">${calls}</div><div class="l">โทรทั้งหมด</div></div>
+            <div><div class="n num">${interested}</div><div class="l">สนใจ</div></div>
+          </div>
+          <div class="progress"><div class="progress-fill" style="width:${pct}%"></div></div>
+        </div>
+      </div>`
+    }).join('')
+    return
+  }
+
   el.innerHTML = campaignsCache.map((c,i) => {
     const totalContacts = contactsCache.filter(x => x.campaign === c.id && x.status !== 'deleted').length
     const called = (statsCache && statsCache.byCampaign && statsCache.byCampaign[c.id]) || 0
@@ -1714,12 +1922,14 @@ function renderCampaignStrip(){
   }).join('')
 }
 
-function buildComboChart(labels, bars, line){
+// formatLabel ไม่ระบุ = ใช้ค่าเริ่มต้นเดิม (ตัด YYYY- ออกจาก label วันที่ YYYY-MM-DD) — กราฟแนวโน้มรายวันเดิมยังทำงานเหมือนเดิมทุกจุด
+// ใส่ formatLabel เองได้เมื่อ label ไม่ใช่รูปแบบวันที่ (เช่น "09:00" ของกราฟรายชั่วโมง) กันไม่ให้ถูก slice(5) มั่วจนว่างเปล่า
+function buildComboChart(labels, bars, line, formatLabel){
   const w = 640, h = 220, padL = 34, padR = 14, padT = 16, padB = 26
   const innerW = w - padL - padR, innerH = h - padT - padB
   const maxV = Math.max(1, ...bars) * 1.2
   const bw = innerW / Math.max(1, bars.length)
-  const fmtDate = l => esc((l||'').slice(5))
+  const fmtDate = formatLabel || (l => esc((l||'').slice(5)))
 
   // เส้น grid 4 เส้น พร้อมตัวเลขกำกับแกน Y (ปัดเป็นเลขกลมๆ) — เดิมไม่มีเลย อ่านค่าไม่ได้เลยถ้าไม่กะจากความสูงเอาเอง
   const tickCount = 3
@@ -1858,6 +2068,42 @@ async function openHealthModal(){
 }
 
 /* ==================== contacts ==================== */
+// คิวโทรแยกอิสระต่อเบอร์ Twilio (ดู src/utils/callQueue.js) — ให้เลือกได้ว่าจะหยุดคิวของเบอร์ไหนเบอร์เดียว
+// โดยไม่กระทบคิว/สายที่กำลังคุยอยู่ของเบอร์อื่นเลย ดึงสถานะคิวสดจาก server ทุกครั้งที่เปิด ไม่ใช้ cache เก่า
+async function confirmStopQueue(){
+  const res = await apiFetch('/api/campaign/status')
+  if (!res.ok) { toast('โหลดสถานะคิวไม่สำเร็จ', 'danger'); return }
+  const status = await res.json()
+  const entries = Object.entries(status.byNumber || {})
+  if (!entries.length) { toast('ไม่มีคิวโทรที่กำลังทำงานอยู่ตอนนี้', 'danger'); return }
+
+  const extraHtml = `
+    <div class="field" style="text-align:left; margin-top:6px">
+      ${entries.map(([number, s], i) => `
+        <label style="display:flex; align-items:center; gap:8px; margin-bottom:8px">
+          <input type="radio" name="stopQueueTarget" value="${escAttr(number)}" ${i===0?'checked':''}>
+          ${esc(twilioNumberLabel(number))} — รอคิว ${s.queueSize} สาย, กำลังคุยอยู่ ${s.running} สาย
+        </label>`).join('')}
+      <label style="display:flex; align-items:center; gap:8px">
+        <input type="radio" name="stopQueueTarget" value="__all__">
+        ทุกเบอร์ (หยุดคิวทั้งหมดในระบบ)
+      </label>
+    </div>`
+
+  openConfirm({
+    title: 'หยุดคิวโทร',
+    message: 'เลือกเบอร์ที่จะหยุดคิวรอโทร — สายที่กำลังคุยอยู่ตอนนี้จะไม่ถูกตัด',
+    confirmLabel: 'หยุดคิว',
+    extraHtml,
+    onConfirm: async () => {
+      const target = document.querySelector('input[name="stopQueueTarget"]:checked')?.value
+      const body = target === '__all__' ? {} : { twilioNumber: target }
+      const res2 = await apiFetch('/api/campaign/stop', { method: 'POST', body })
+      if (!res2.ok) { toast('หยุดคิวไม่สำเร็จ', 'danger'); return }
+      toast('หยุดคิวโทรแล้ว', 'danger')
+    }
+  })
+}
 let blocklistCache = new Set()
 async function loadContacts(){
   // เบอร์ contacts ต้องโหลดให้ได้ ไม่งั้นทั้งหน้าใช้ไม่ได้ — blocklist แค่ badge เสริม ถ้าโหลดไม่ได้ให้หน้าใช้งานต่อได้ปกติ (แค่ไม่โชว์ badge บล็อก)
@@ -1903,12 +2149,14 @@ function toggleSelectAllContacts(checked){
 function clearContactsSelection(){ selectedContacts.clear(); updateContactsBulkBar(); filterContacts('') }
 function bulkCallContacts(){
   const phones = [...selectedContacts]
+  const twilioNumber = document.getElementById('contactsCallNumber').value
+  if (!twilioNumber) { toast('เลือกเบอร์ที่จะใช้โทรก่อน', 'danger'); return }
   openConfirm({
     title: `โทรออก ${phones.length} เบอร์ที่เลือก?`,
-    message: 'แต่ละเบอร์จะโทรตาม Campaign ที่ผูกไว้อยู่แล้ว เข้าคิวเดียวกับระบบจริง (โทรพร้อมกันสูงสุดตามที่ตั้งไว้ ที่เหลือรอคิว) มีค่าใช้จ่ายจริงต่อสาย',
+    message: `ใช้เบอร์ ${twilioNumberLabel(twilioNumber)} โทรออกทุกเบอร์ที่เลือก เข้าคิวเดียวกับระบบจริง (โทรพร้อมกันสูงสุดตามที่ตั้งไว้ ที่เหลือรอคิว) มีค่าใช้จ่ายจริงต่อสาย`,
     confirmLabel: 'เริ่มโทร', danger: false,
     onConfirm: async () => {
-      const res = await apiFetch('/api/contacts/call', { method: 'POST', body: { phones } })
+      const res = await apiFetch('/api/contacts/call', { method: 'POST', body: { phones, twilioNumber } })
       const data = await res.json()
       if (!res.ok) { toast(data.error || 'โทรไม่สำเร็จ', 'danger'); return }
       toast(`เข้าคิวโทร ${data.queued} เบอร์แล้ว${data.skipped?.length ? ` (ข้าม ${data.skipped.length} เบอร์ — ไม่พบเบอร์หรือไม่มี campaign)` : ''}`)
@@ -1925,9 +2173,16 @@ function bulkBlockContacts(){
     confirmLabel: 'บล็อกทั้งหมด',
     onConfirm: async () => {
       await Promise.all(phones.map(phone => apiFetch('/api/blocklist', { method: 'POST', body: { phone, reason: 'bulk blocked from admin' } })))
-      toast(`บล็อก ${phones.length} เบอร์แล้ว`, 'danger')
       selectedContacts.clear()
       loadContacts()
+      toast(`บล็อก ${phones.length} เบอร์แล้ว`, 'danger', {
+        label: 'เลิกทำ',
+        onClick: async () => {
+          await Promise.all(phones.map(phone => apiFetch(`/api/blocklist/${encodeURIComponent(phone)}`, { method: 'DELETE' })))
+          toast(`เลิกทำแล้ว — ปลดบล็อก ${phones.length} เบอร์`)
+          loadContacts()
+        }
+      })
     }
   })
 }
@@ -1938,16 +2193,35 @@ function bulkDeleteContacts(){
     message: 'เบอร์ทั้งหมดที่เลือกจะถูกทำเครื่องหมายว่าลบแล้ว',
     confirmLabel: 'ลบทั้งหมด',
     onConfirm: async () => {
+      // เก็บสถานะเดิมไว้ก่อนลบเสมอ — เผื่อกด "เลิกทำ" จะได้คืนค่าสถานะเดิมเป๊ะๆ (เช่น retry_pending) ไม่ใช่เดาว่าเป็น pending เสมอไป
+      const previous = phones.map(phone => ({ phone, status: contactsCache.find(c => c.phone === phone)?.status || 'pending' }))
       await Promise.all(phones.map(phone => apiFetch(`/api/contacts/${encodeURIComponent(phone)}`, { method: 'DELETE' })))
-      toast(`ลบ ${phones.length} เบอร์แล้ว`, 'danger')
       selectedContacts.clear()
       loadContacts()
+      toast(`ลบ ${phones.length} เบอร์แล้ว`, 'danger', {
+        label: 'เลิกทำ',
+        onClick: async () => {
+          await Promise.all(previous.map(({phone, status}) => apiFetch(`/api/contacts/${encodeURIComponent(phone)}`, { method: 'PATCH', body: { status } })))
+          toast(`เลิกทำแล้ว — คืนค่า ${previous.length} เบอร์`)
+          loadContacts()
+        }
+      })
     }
   })
 }
+let contactsSortState = { key: null, dir: 1 }
+function sortContacts(key){
+  if (contactsSortState.key === key) contactsSortState.dir *= -1
+  else { contactsSortState.key = key; contactsSortState.dir = 1 }
+  // เรียงใหม่โดยคงคำค้นหาที่พิมพ์ค้างอยู่ไว้ (ไม่รีเซ็ตช่องค้นหาทิ้ง)
+  filterContacts(document.getElementById('contactsSearchInput')?.value || '')
+}
 function filterContacts(q){
   q = q.trim().toLowerCase()
-  const rows = visibleContacts().filter(c => !q || c.phone.includes(q) || (c.name||'').toLowerCase().includes(q))
+  updateSortIndicators('contactsThead', contactsSortState)
+  const filtered = visibleContacts().filter(c => !q || c.phone.includes(q) || (c.name||'').toLowerCase().includes(q))
+  // คอลัมน์ Campaign เรียงตามชื่อที่โชว์จริง (campaignName) ไม่ใช่ id ดิบ — ผู้ใช้เห็นชื่อ ไม่เห็น id
+  const rows = sortRows(filtered, contactsSortState, (c, key) => key === 'campaign' ? campaignName(c.campaign) : c[key])
   const body = document.getElementById('contactsTable')
   if (!body) return
   if (!rows.length) { body.innerHTML = '<tr><td colspan="6" class="empty">ไม่พบข้อมูล</td></tr>'; return }
@@ -2085,6 +2359,21 @@ function parsePastedContacts(text){
     return { phone, name, valid: digits.length >= 9 }
   })
 }
+// อ่านไฟล์ .csv/.txt ที่อัปโหลดแล้วใส่ลงช่องวางข้อความเดิม — ใช้ parser ตัวเดียวกับการ paste เป๊ะ (parsePastedContacts รองรับ comma อยู่แล้ว)
+// ให้ผู้ใช้เห็นและตรวจสอบตัวอย่างในกล่อง preview ก่อนกดนำเข้าจริงเสมอ ไม่นำเข้าจากไฟล์ตรงๆ โดยไม่ให้ตรวจก่อน
+function handleBulkFileUpload(file){
+  if (!file) return
+  document.getElementById('bulkFileName').textContent = file.name
+  const reader = new FileReader()
+  reader.onload = (e) => {
+    const text = String(e.target.result || '')
+    document.getElementById('bulkPaste').value = text
+    handleBulkPaste(text)
+    toast('โหลดไฟล์แล้ว — ตรวจสอบตัวอย่างข้อมูลก่อนกดนำเข้า')
+  }
+  reader.onerror = () => toast('อ่านไฟล์ไม่สำเร็จ', 'danger')
+  reader.readAsText(file, 'UTF-8')
+}
 function handleBulkPaste(text){
   lastParsedRows = parsePastedContacts(text)
   const summaryEl = document.getElementById('importSummary')
@@ -2131,11 +2420,13 @@ async function testCall(){
   const phone = document.getElementById('testPhone').value.trim()
   const name = document.getElementById('testName').value.trim()
   const campaignId = document.getElementById('testCampaign').value
+  const twilioNumber = document.getElementById('testCallNumber').value
   const msgEl = document.getElementById('testCallMsg')
   if (!phone || !campaignId) { msgEl.textContent = 'กรอกเบอร์และเลือก campaign ก่อน'; return }
+  if (!twilioNumber) { msgEl.textContent = 'เลือกเบอร์ที่จะใช้โทรก่อน'; return }
   msgEl.textContent = 'กำลังยิงโทร...'
   try {
-    const res = await apiFetch('/api/calls/test', { method: 'POST', body: { phone, name, campaignId } })
+    const res = await apiFetch('/api/calls/test', { method: 'POST', body: { phone, name, campaignId, twilioNumber } })
     const data = await res.json()
     if (!res.ok) { msgEl.textContent = data.error || 'ล้มเหลว'; return }
     msgEl.textContent = ''
@@ -2224,27 +2515,39 @@ function applyHistoryMonth(value){
 }
 function historyFilterChanged(){ historyPage = 1; renderHistoryRows() }
 function loadMoreHistory(){ historyPage++; renderHistoryRows() }
-// ใช้ร่วมกันทั้งตารางและ CSV export เพื่อให้ export ตรงกับสิ่งที่กรองเห็นอยู่จริง
+// ค่าเริ่มต้นเรียงตามวันที่ล่าสุดก่อน (ตรงกับลำดับเดิมที่ backend ส่งมาให้อยู่แล้ว — ไม่ใช่การเปลี่ยนพฤติกรรม default)
+let historySortState = { key: 'timestamp', dir: -1 }
+function sortHistory(key){
+  if (historySortState.key === key) historySortState.dir *= -1
+  else { historySortState.key = key; historySortState.dir = 1 }
+  historyPage = 1
+  renderHistoryRows()
+}
+// ใช้ร่วมกันทั้งตารางและ CSV export เพื่อให้ export ตรงกับสิ่งที่กรอง+เรียงอยู่บนหน้าจอจริง
 function getFilteredHistory(){
   const q = (document.getElementById('historySearchInput')?.value || '').trim().toLowerCase()
   const outcomeFilter = document.getElementById('historyOutcomeFilter')?.value || ''
+  const numberFilter = document.getElementById('logNumberFilter')?.value || ''
   const dateFrom = document.getElementById('historyDateFrom')?.value || ''
   const dateTo = document.getElementById('historyDateTo')?.value || ''
-  return historyCache.map((c,i) => ({...c, i})).filter(c => {
+  const filtered = historyCache.map((c,i) => ({...c, i})).filter(c => {
     if (q && !((c.phone||'').includes(q) || (c.name||'').toLowerCase().includes(q))) return false
     if (outcomeFilter && c.outcome !== outcomeFilter) return false
+    if (numberFilter && c.twilio_number !== numberFilter) return false
     const day = (c.timestamp || '').slice(0, 10)
     if (dateFrom && day < dateFrom) return false
     if (dateTo && day > dateTo) return false
     return true
   })
+  return sortRows(filtered, historySortState)
 }
 function renderHistoryRows(){
+  updateSortIndicators('historyThead', historySortState)
   const all = getFilteredHistory()
   const shown = all.slice(0, historyPage * HISTORY_PAGE_SIZE)
   const body = document.getElementById('historyBody')
   if (!body) return
-  if (!shown.length) { body.innerHTML = '<tr><td colspan="8" class="empty">ไม่พบข้อมูล</td></tr>'; document.getElementById('historyLoadMoreWrap').innerHTML = ''; return }
+  if (!shown.length) { body.innerHTML = '<tr><td colspan="9" class="empty">ไม่พบข้อมูล</td></tr>'; document.getElementById('historyLoadMoreWrap').innerHTML = ''; return }
   body.innerHTML = shown.map(c => {
     const needsFollowup = (c.next_action || '').trim() && c.next_action.trim() !== '-'
     return `
@@ -2252,6 +2555,7 @@ function renderHistoryRows(){
       <td class="num">${esc(c.phone)}</td>
       <td>${esc(c.name)}</td>
       <td style="color:var(--text-2)">${esc(campaignName(c.campaign_id))}</td>
+      <td class="num" style="color:var(--text-2); font-size:12.5px">${esc(twilioNumberLabel(c.twilio_number))}</td>
       <td><span class="pill ${esc(c.call_status)}">${esc(CALL_STATUS_LABELS[c.call_status] || c.call_status || '-')}</span></td>
       <td>
         ${c.outcome && c.outcome !== '-' ? `<span class="pill ${esc(c.outcome)}">${esc(outcomeLabel(c.outcome))}</span>` : '<span style="color:var(--text-3)">—</span>'}
@@ -2271,7 +2575,7 @@ function renderHistoryRows(){
 function exportHistoryCsv(){
   const rows = getFilteredHistory()
   if (!rows.length) { toast('ไม่มีข้อมูลให้ออกรายงาน', 'danger'); return }
-  const cols = ['phone','name','campaign_id','call_status','outcome','summary','key_points','next_action','duration','timestamp']
+  const cols = ['phone','name','campaign_id','twilio_number','call_status','outcome','summary','key_points','next_action','duration','timestamp']
   // เติม ' นำหน้าถ้าค่าขึ้นต้นด้วยอักขระที่ Excel/Sheets ตีความเป็นสูตร (มาตรฐาน OWASP CSV injection) — ใช้กับทุกคอลัมน์รวมถึง phone ด้วย
   // เคยลองยกเว้นคอลัมน์ phone (เพราะขึ้นต้นด้วย + เสมอจาก normalizePhone ไม่ใช่ข้อความอิสระ) แต่ทดสอบเปิดจริงด้วย Excel (COM automation) แล้วพบว่า
   // ถ้าไม่มี ' นำหน้า Excel จะตีความ "+66812345678" เป็นตัวเลขแล้วโชว์เป็น "6.68E+10" (เลขหาย/อ่านไม่ออกเลย) แย่กว่าการมี ' ค้างให้เห็นมาก

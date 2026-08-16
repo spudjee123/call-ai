@@ -49,6 +49,7 @@ module.exports = async function contactsRoutes(fastify) {
   // ใช้ campaign ที่ผูกกับแต่ละ contact อยู่แล้วในชีต ไม่ต้องเลือกใหม่
   fastify.post('/api/contacts/call', async (req, reply) => {
     const phones = Array.isArray(req.body?.phones) ? req.body.phones.map(normalizePhone) : []
+    const twilioNumber = req.body?.twilioNumber || ''
     if (!phones.length) return reply.code(400).send({ error: 'phones[] required' })
 
     // ดึงทีเดียวแล้ว lookup ใน memory — กันยิง Sheets API ทีละเบอร์ (ช้า + เสี่ยงชน quota เวลาเลือกเยอะๆ)
@@ -67,7 +68,8 @@ module.exports = async function contactsRoutes(fastify) {
       if (!contact || contact.status === 'deleted') { skipped.push(phone); continue }
       const campaign = campaignById.get(contact.campaign)
       if (!campaign) { skipped.push(phone); continue }
-      callQueue.add({ contact, campaign })
+      // เบอร์ที่แอดมินเลือกตอนกดโทร (ถ้ามี) ทับเบอร์ที่ตั้งไว้ระดับ campaign เฉพาะสายชุดนี้ — ไม่แก้ campaign จริง
+      callQueue.add({ contact, campaign: twilioNumber ? { ...campaign, twilio_number: twilioNumber } : campaign })
       queued++
     }
     return reply.send({ message: 'Queued', queued, skipped })

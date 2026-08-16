@@ -8,11 +8,20 @@ const healthMonitor = require('../utils/healthMonitor')
 const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
 
 
+// เบอร์ที่จะใช้จริงของ campaign นี้ (ของตัวเองถ้าตั้งไว้ ไม่งั้น fallback เบอร์เริ่มต้นของระบบ) — export ให้ callQueue.js เรียกใช้ตัวเดียวกันเป๊ะ
+// กันกรณีเบอร์ที่ใช้เป็น key ของคิว (callQueue.js) กับเบอร์ที่โทรออกจริง (ตรงนี้) เพี้ยนไม่ตรงกันถ้าคำนวณแยกกันคนละที่
+function effectiveTwilioNumber(campaign) {
+  return campaign?.twilio_number || process.env.TWILIO_PHONE_NUMBER
+}
+
 async function makeOutboundCall(contact, campaign, onCallCreated) {
   if (await sheetsService.isBlocked(contact.phone)) {
     console.log(`[Twilio] Skipped ${contact.phone} — อยู่ใน Do-not-call list`)
     return null
   }
+
+  // เบอร์ที่ใช้โทรออกจริง — เก็บไว้ใน session เพื่อบันทึกลงผลการโทร (ให้หน้าประวัติการโทรโชว์/กรองตามเบอร์ที่ใช้จริงได้)
+  const twilioNumber = effectiveTwilioNumber(campaign)
 
   const session = {
     callSid: null,
@@ -23,6 +32,7 @@ async function makeOutboundCall(contact, campaign, onCallCreated) {
     direction: 'outbound',
     startTime: Date.now(),
     greetingChunks: null,
+    twilioNumber,
   }
 
   // Pre-generate greeting ขณะรอสายต่อ (~3-4s) เพื่อลด silence
@@ -42,7 +52,7 @@ async function makeOutboundCall(contact, campaign, onCallCreated) {
 
   const call = await client.calls.create({
     to: contact.phone,
-    from: process.env.TWILIO_PHONE_NUMBER,
+    from: twilioNumber,
     url: `${process.env.BASE_URL}/webhook/outbound`,
     statusCallback: `${process.env.BASE_URL}/webhook/status`,
     statusCallbackMethod: 'POST',
@@ -66,4 +76,10 @@ async function hangupCall(callSid) {
   return client.calls(callSid).update({ status: 'completed' })
 }
 
-module.exports = { makeOutboundCall, hangupCall }
+// เบอร์ที่ซื้อไว้จริงทั้งหมดในบัญชี Twilio — ให้แอดมินเลือกจากของจริงแทนพิมพ์เอง กัน typo/เบอร์ที่ไม่ได้เป็นเจ้าของ
+async function listPhoneNumbers() {
+  const numbers = await client.incomingPhoneNumbers.list({ limit: 100 })
+  return numbers.map(n => ({ phoneNumber: n.phoneNumber, friendlyName: n.friendlyName || n.phoneNumber }))
+}
+
+module.exports = { makeOutboundCall, hangupCall, listPhoneNumbers, effectiveTwilioNumber }

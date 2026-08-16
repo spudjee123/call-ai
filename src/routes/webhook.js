@@ -47,17 +47,18 @@ module.exports = async function webhookRoutes(fastify) {
   fastify.post('/webhook/inbound', async (req, reply) => {
     const callSid = req.body.CallSid
     const from = req.body.From
+    const to = req.body.To
     reply.header('Content-Type', 'text/xml')
 
-    // หา campaign สำหรับ inbound
-    const campaign = await sheetsService.getDefaultInboundCampaign()
+    // หา campaign สำหรับ inbound — ตรงกับเบอร์ที่ลูกค้าโทรเข้ามาจริง (รองรับหลาย campaign ใช้คนละเบอร์พร้อมกัน)
+    const campaign = await sheetsService.getInboundCampaignForNumber(to)
 
-    // ไม่มี campaign type=inbound ในระบบเลย — ปฏิเสธสายอย่างสุภาพ แทนที่จะเดาเอา campaign อื่น (เช่น outbound) มาใช้แบบผิดบริบทเงียบๆ
+    // ไม่มี campaign inbound ที่ตั้งไว้ตรงกับเบอร์นี้เลย — ปฏิเสธสายอย่างสุภาพ แทนที่จะเดาเอา campaign อื่น (เช่น outbound หรือเบอร์อื่น) มาใช้แบบผิดบริบทเงียบๆ
     // ใช้ <Play> เล่นไฟล์เสียงไทยที่ gen เองผ่าน Google TTS แทน <Say> ของ Twilio ตรงๆ
     // เพราะเช็คเอกสาร Twilio แล้วไม่ยืนยันว่า th-TH อยู่ในภาษาที่ <Say> รองรับ — Google TTS ของเรา
     // เป็นตัวเดียวกับที่ใช้พูดจริงทุกสายอยู่แล้ว มั่นใจได้ว่าออกเสียงไทยถูกต้องแน่นอน
     if (!campaign) {
-      console.error('[Inbound] ไม่มี campaign type=inbound เลย — ปฏิเสธสาย')
+      console.error(`[Inbound] ไม่มี campaign inbound ที่ตั้งเบอร์ตรงกับ ${to} เลย — ปฏิเสธสาย`)
       const twiml = new twilio.twiml.VoiceResponse()
       twiml.play(`${process.env.BASE_URL}/webhook/inbound-fallback.wav`)
       twiml.hangup()
@@ -71,7 +72,8 @@ module.exports = async function webhookRoutes(fastify) {
       campaign,
       messages: [],
       direction: 'inbound',
-      startTime: Date.now()
+      startTime: Date.now(),
+      twilioNumber: to,
     })
 
     const wsUrl = `${process.env.BASE_URL.replace(/^http/, 'ws')}/stream?callSid=${callSid}`
