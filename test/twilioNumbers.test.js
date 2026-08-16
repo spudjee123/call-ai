@@ -12,13 +12,19 @@ require.cache[googleSheetsPath] = {
     sheetsService: {
       getTwilioNumbers: async () => Object.values(state.numbers),
       getTwilioNumberByPhone: async (phone) => state.numbers[phone] || null,
-      addTwilioNumber: async (fields) => { state.numbers[fields.phone_number] = { ...fields }; return true },
+      addTwilioNumber: async (fields) => {
+        if (state.sheetMissing) throw new Error('Unable to parse range: Twilio Numbers: Unable to parse range: Twilio Numbers')
+        state.numbers[fields.phone_number] = { ...fields }
+        return true
+      },
       updateTwilioNumber: async (phone, updates) => {
+        if (state.sheetMissing) throw new Error('Unable to parse range: Twilio Numbers: Unable to parse range: Twilio Numbers')
         if (!state.numbers[phone]) return false
         state.numbers[phone] = { ...state.numbers[phone], ...updates }
         return true
       },
       deleteTwilioNumber: async (phone) => {
+        if (state.sheetMissing) throw new Error('Unable to parse range: Twilio Numbers: Unable to parse range: Twilio Numbers')
         if (!state.numbers[phone]) return false
         delete state.numbers[phone]
         return true
@@ -49,6 +55,15 @@ beforeEach(() => {
   state.numbers = {}
   state.campaigns = { camp1: { id: 'camp1' } }
   state.accountNumbers = [{ phoneNumber: '+66811111111', friendlyName: '+66811111111' }]
+  state.sheetMissing = false
+})
+
+test('POST /api/twilio-numbers: ยังไม่ได้สร้างแท็บชีต "Twilio Numbers" → ต้องได้ข้อความบอกสาเหตุชัดเจน ไม่ใช่ "Bad Request" เฉยๆ (บั๊กจริงที่เจอในโปรดักชัน)', async () => {
+  state.sheetMissing = true
+  const app = await buildApp()
+  const res = await app.inject({ method: 'POST', url: '/api/twilio-numbers', payload: { phone_number: '+66811111111' } })
+  assert.equal(res.statusCode, 500)
+  assert.match(res.json().error, /สร้างแท็บชีต.*Twilio Numbers/)
 })
 
 test('POST /api/twilio-numbers: ลงทะเบียนเบอร์ที่มีจริงในบัญชี Twilio สำเร็จ', async () => {
