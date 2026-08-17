@@ -383,6 +383,9 @@ function registerWebSocket(fastify) {
                 try {
                   for await (const chunk of synthesizeSpeechStream(cleanText, currentSession.campaign.voice_id, signal)) {
                     if (socket.readyState !== socket.OPEN || signal.aborted) break
+                    // จุดวัด "ความเงียบจริง" ที่ลูกค้ารู้สึก — ต่างจาก [AI full] ที่รวมเวลาพูดทั้งประโยคเข้าไปด้วย
+                    // (ประโยคยาวก็ใช้เวลาส่งครบนานกว่าเป็นธรรมชาติ ไม่ได้แปลว่าดีเลย์มากขึ้น) ต้องวัดจาก [STT] ถึง log นี้เท่านั้น
+                    if (totalSent === 0) console.log('[TTS] First audio chunk sent')
                     socket.send(JSON.stringify({ event: 'media', streamSid, media: { payload: chunk.toString('base64') } }))
                     totalSent++
                   }
@@ -402,6 +405,9 @@ function registerWebSocket(fastify) {
               try {
                 for await (const chunk of synthesizeSpeechStream(followUp, currentSession.campaign.voice_id, signal)) {
                   if (socket.readyState !== socket.OPEN || signal.aborted) break
+                  // เผื่อ cleanText ว่างเปล่า (คำตอบ AI มีแค่ [END_CALL] ล้วนๆ) — ลูปหลักด้านบนไม่ได้ส่งอะไรเลย
+                  // ทำให้นี่กลายเป็นก้อนเสียงแรกจริงของเทิร์นนี้ ต้อง log จุดนี้ด้วยกันพลาดข้อมูล
+                  if (totalSent === 0) console.log('[TTS] First audio chunk sent')
                   socket.send(JSON.stringify({ event: 'media', streamSid, media: { payload: chunk.toString('base64') } }))
                   totalSent++
                 }
