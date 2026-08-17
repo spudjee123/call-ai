@@ -14,6 +14,23 @@ function addRecording(twiml) {
   })
 }
 
+// recordingStatusCallback ของ Twilio อาจมาถึงก่อนที่ postCallHandler จะเขียนแถวผลการโทรเสร็จ (แข่งกันเป็น race
+// เพราะเป็น webhook คนละเส้นทาง ไม่การันตีลำดับ) — retry แบบมีช่วงห่างเพิ่มขึ้นเรื่อยๆ ก่อนยอมแพ้จริงๆ
+// รอก่อนลองทุกครั้งแม้แต่ครั้งแรก (ไม่ลองทันที) เพราะ postCallHandler แทบไม่มีทางเขียนแถวเสร็จทัน t=0 อยู่แล้ว
+// (ต้องรอ Claude วิเคราะห์ + เขียน Sheets ก่อน) ลองทันทีมีแต่จะเสียการอ่านทั้งชีตไปฟรีๆ เกือบทุกครั้ง
+const RECORDING_RETRY_DELAYS_MS = [2000, 5000, 10000, 15000]
+async function saveRecordingWithRetry(callSid, recordingUrl, delays = RECORDING_RETRY_DELAYS_MS) {
+  for (let i = 0; i < delays.length; i++) {
+    await new Promise(r => setTimeout(r, delays[i]))
+    try {
+      if (await sheetsService.saveRecordingUrl(callSid, recordingUrl)) return
+    } catch (err) {
+      console.error(`[Recording] Save error (attempt ${i + 1}/${delays.length}):`, err.message)
+    }
+  }
+  console.warn(`[Recording] ไม่พบแถวผลการโทรสำหรับ callSid=${callSid} (retry ครบ ${delays.length} ครั้งแล้ว)`)
+}
+
 // ข้อความไทยเมื่อสายเข้ามาแต่ไม่มี campaign type=inbound ในระบบเลย — cache ไว้หลัง gen ครั้งแรก
 // ไม่ยิง Google TTS ใหม่ทุกครั้งที่มีสายเข้ามาช่วงระบบยังไม่พร้อม (เคสนี้ควรเกิดไม่บ่อยอยู่แล้ว)
 const INBOUND_FALLBACK_TEXT = 'ขออภัยค่ะ ขณะนี้ระบบยังไม่พร้อมรับสาย กรุณาติดต่อใหม่อีกครั้ง'
@@ -91,12 +108,8 @@ module.exports = async function webhookRoutes(fastify) {
   fastify.post('/webhook/recording', async (req, reply) => {
     const { CallSid, RecordingUrl, RecordingStatus } = req.body
     if (RecordingStatus === 'completed' && CallSid && RecordingUrl) {
-      try {
-        const saved = await sheetsService.saveRecordingUrl(CallSid, RecordingUrl)
-        if (!saved) console.warn(`[Recording] ไม่พบแถวผลการโทรสำหรับ callSid=${CallSid}`)
-      } catch (err) {
-        console.error('[Recording] Save error:', err.message)
-      }
+      // ไม่ await — ตอบ Twilio กลับทันที ไม่ให้ต้องรอ retry (อาจกินเวลาหลายสิบวินาที) ก่อน Twilio จะได้ 200
+      saveRecordingWithRetry(CallSid, RecordingUrl)
     }
     return reply.send({ ok: true })
   })
@@ -149,3 +162,5 @@ module.exports = async function webhookRoutes(fastify) {
     return reply.send({ ok: true })
   })
 }
+
+module.exports.saveRecordingWithRetry = saveRecordingWithRetry
