@@ -2,9 +2,9 @@ const { test, beforeEach } = require('node:test')
 const assert = require('node:assert/strict')
 require('dotenv').config()
 
-// stub googleSheets และ thaiBulkSms ก่อน require postCall.js — กันยิง Sheets/SMS API จริง
+// stub googleSheets, thaiBulkSms, callQueue, claude ก่อน require postCall.js — กันยิง Sheets/SMS/Anthropic API จริง
 // และคุมผลลัพธ์การ resolve template/sender เองได้ (pattern เดียวกับ test/googleSheets.test.js)
-const state = { templates: {}, senders: {}, smsCalls: [] }
+const state = { templates: {}, senders: {}, smsCalls: [], savedResults: [], contacts: {}, queueReleases: [], summarizeResult: null }
 
 const googleSheetsPath = require.resolve('../src/services/googleSheets')
 require.cache[googleSheetsPath] = {
@@ -14,6 +14,10 @@ require.cache[googleSheetsPath] = {
       getSmsTemplateById: async (id) => state.templates[id] || null,
       getSenderNameById: async (id) => state.senders[id] || null,
       updateCallResultSmsStatus: async () => true,
+      saveCallResult: async (result) => { state.savedResults.push(result) },
+      updateContactStatus: async () => true,
+      getContact: async (phone) => state.contacts[phone] || null,
+      updateContact: async () => true,
     },
   },
 }
@@ -29,9 +33,24 @@ require.cache[thaiBulkSmsPath] = {
   },
 }
 
-const { handleSmsFollowup } = require('../src/services/postCall')
+const callQueuePath = require.resolve('../src/utils/callQueue')
+require.cache[callQueuePath] = {
+  id: callQueuePath, filename: callQueuePath, loaded: true,
+  exports: { callQueue: { release: (callSid) => { state.queueReleases.push(callSid) } } },
+}
 
-beforeEach(() => { state.templates = {}; state.senders = {}; state.smsCalls = [] })
+const claudePath = require.resolve('../src/services/claude')
+require.cache[claudePath] = {
+  id: claudePath, filename: claudePath, loaded: true,
+  exports: { summarizeCall: async () => state.summarizeResult },
+}
+
+const { handleSmsFollowup, postCallHandler } = require('../src/services/postCall')
+
+beforeEach(() => {
+  state.templates = {}; state.senders = {}; state.smsCalls = []
+  state.savedResults = []; state.contacts = {}; state.queueReleases = []; state.summarizeResult = null
+})
 
 test('resolve template ตาม campaign.sms_<outcome> แล้วแทน {name} ในเนื้อความก่อนส่งจริง', async () => {
   state.templates['tpl1'] = { template_text: 'สวัสดีคุณ {name} สนใจติดต่อกลับด้วยนะคะ' }
@@ -68,4 +87,31 @@ test('sender ที่ template อ้างอิงถูกลบไปแล
   await handleSmsFollowup(session, 'interested')
   assert.equal(state.smsCalls.length, 1)
   assert.equal(state.smsCalls[0].senderName, undefined)
+})
+
+test('postCallHandler: สายไม่รับ/สายไม่ว่าง/ต่อไม่ติด ต้องบันทึก transcript ว่างเปล่าเสมอ แม้ session.messages จะมี greeting ที่เตรียมไว้ล่วงหน้าอยู่ก็ตาม (ลูกค้าไม่เคยได้ยินจริง)', async () => {
+  for (const callStatus of ['busy', 'no-answer', 'failed', 'canceled']) {
+    state.savedResults = []
+    const session = {
+      phone: '0812345678', name: 'ทดสอบ', campaign: { id: 'camp1' },
+      messages: [{ role: 'assistant', content: 'สวัสดีค่ะ ยินดีให้บริการค่ะ' }], // greeting ที่เตรียมไว้ล่วงหน้า
+    }
+    await postCallHandler('CA' + callStatus, callStatus, 0, session)
+    assert.equal(state.savedResults.length, 1, `ต้องบันทึกผล 1 แถวสำหรับ ${callStatus}`)
+    assert.equal(state.savedResults[0].transcript, '', `transcript ต้องว่างเปล่าสำหรับสถานะ ${callStatus}`)
+  }
+})
+
+test('postCallHandler: สายที่ต่อติดจริง (completed) พร้อมบทสนทนา ยังบันทึก transcript ตามจริงเหมือนเดิม ไม่ถูกกรองทิ้ง', async () => {
+  state.summarizeResult = { outcome: 'interested', summary: 'สรุป', key_points: 'ประเด็น', next_action: 'ต่อไป' }
+  const session = {
+    phone: '0812345678', name: 'ทดสอบ', campaign: { id: 'camp1' },
+    messages: [
+      { role: 'assistant', content: 'สวัสดีค่ะ' },
+      { role: 'user', content: 'สนใจครับ' },
+    ],
+  }
+  await postCallHandler('CA123', 'completed', 45, session)
+  assert.equal(state.savedResults.length, 1)
+  assert.equal(state.savedResults[0].transcript, 'AI: สวัสดีค่ะ | ลูกค้า: สนใจครับ')
 })

@@ -29,9 +29,12 @@ async function postCallHandler(callSid, callStatus, duration, session) {
       outcome = 'no_conversation'
     }
 
-    const transcript = session.messages
-      .map(m => `${m.role === 'user' ? 'ลูกค้า' : 'AI'}: ${m.content}`)
-      .join(' | ')
+    // เบอร์ที่ไม่รับสาย/สายไม่ว่าง/ต่อไม่ติด ไม่เคยได้ยินบทสนทนาที่เตรียมไว้ล่วงหน้าจริง (twilio.js เตรียม greeting
+    // คู่ขนานไปพร้อมสั่งโทร เพื่อลดดีเลย์ตอนสายต่อติด แล้ว push เข้า session.messages ทันทีที่เตรียมเสร็จ ไม่ว่าสายจะ
+    // ต่อติดจริงไหม) ถ้าไม่กรองตรงนี้ให้เหมือนจุดวิเคราะห์ผลลัพธ์ด้านบน ประวัติจะโชว์บทสนทนาที่ไม่เคยเกิดขึ้นจริง
+    const transcript = callStatus === 'completed'
+      ? session.messages.map(m => `${m.role === 'user' ? 'ลูกค้า' : 'AI'}: ${m.content}`).join(' | ')
+      : ''
 
     // บันทึกผลใน Google Sheets — แยก call_status (เชื่อมสายได้ไหม) ออกจาก outcome (ผลลัพธ์เชิงธุรกิจ)
     await sheetsService.saveCallResult({
