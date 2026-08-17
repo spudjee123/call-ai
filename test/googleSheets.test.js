@@ -7,13 +7,19 @@ process.env.TZ = 'Asia/Bangkok'
 
 // stub googleapis ก่อน require googleSheets.js — กันยิง Sheets API จริงและคุมข้อมูลทดสอบเองได้
 // (pattern เดียวกับที่ใช้พิสูจน์บั๊กจริงมาตลอดทั้งเซสชันตรวจสอบระบบนี้ ผ่าน require.cache injection)
-const state = { data: {}, calls: [], throwOnRange: new Set() }
+const state = { data: {}, calls: [], throwOnRange: new Set(), failGetNTimes: 0 }
 const fakeClient = {
   spreadsheets: {
     values: {
       get: async ({ range }) => {
         state.calls.push({ method: 'get', range })
         if (state.throwOnRange.has(range)) throw new Error(`Unable to parse range: ${range}`) // จำลอง error จริงของ Sheets API เมื่อชีตแท็บนี้ยังไม่ถูกสร้าง
+        if (state.failGetNTimes > 0) {
+          state.failGetNTimes--
+          const err = new Error("Quota exceeded for quota metric 'Read requests' and limit 'Read requests per minute per user'")
+          err.code = 429
+          throw err
+        }
         return { data: { values: state.data[range] || [] } }
       },
       update: async (params) => { state.calls.push({ method: 'update', ...params }); return {} },
@@ -29,9 +35,9 @@ require.cache[googleapisPath] = {
   exports: { google: { auth: { GoogleAuth: function () {} }, sheets: () => fakeClient } },
 }
 
-const { sheetsService } = require('../src/services/googleSheets')
+const { sheetsService, isRetryableSheetsError, withRetry } = require('../src/services/googleSheets')
 
-beforeEach(() => { state.data = {}; state.calls = []; state.throwOnRange = new Set() })
+beforeEach(() => { state.data = {}; state.calls = []; state.throwOnRange = new Set(); state.failGetNTimes = 0 })
 
 function lastCall(method) {
   return [...state.calls].reverse().find(c => c.method === method)
@@ -69,6 +75,51 @@ test('updateRowByKey แก้เฉพาะ column ที่ระบุ ค�
 test('updateRowByKey throw ถ้า key column ไม่มีอยู่ในชีตเลย (กัน silent no-op ที่ตรวจจับไม่ได้)', async () => {
   state.data['Call Results'] = [['Phone', 'Outcome']] // ไม่มีคอลัมน์ call_sid
   await assert.rejects(() => sheetsService.updateCallResultSmsStatus('CA123', { messageId: 'm1', status: 'sent' }))
+})
+
+test('isRetryableSheetsError: แยก error โควตา/rate-limit จริง (429/503/ข้อความ quota) ออกจาก error อื่นๆ ที่ไม่ควรลองใหม่', () => {
+  assert.equal(isRetryableSheetsError({ code: 429 }), true)
+  assert.equal(isRetryableSheetsError({ response: { status: 429 } }), true)
+  assert.equal(isRetryableSheetsError({ response: { status: 503 } }), true)
+  assert.equal(isRetryableSheetsError({ message: "Quota exceeded for quota metric 'Read requests'" }), true)
+  assert.equal(isRetryableSheetsError({ code: 400, message: "Column 'x' not found" }), false)
+  assert.equal(isRetryableSheetsError({ message: 'Unable to parse range: Foo' }), false)
+})
+
+test('withRetry: ลองใหม่อัตโนมัติเมื่อเจอ error โควตา แล้วสำเร็จตอนลองรอบถัดไป — ผู้เรียกไม่เห็น error เลย', async () => {
+  let calls = 0
+  const result = await withRetry(async () => {
+    calls++
+    if (calls < 3) { const err = new Error('Quota exceeded'); err.code = 429; throw err }
+    return 'ok'
+  }, { baseDelayMs: 5 })
+  assert.equal(result, 'ok')
+  assert.equal(calls, 3)
+})
+
+test('withRetry: error ที่ไม่ใช่ rate-limit ต้อง throw ทันที ไม่เสียเวลาลองใหม่เลย', async () => {
+  let calls = 0
+  await assert.rejects(
+    () => withRetry(async () => { calls++; throw new Error("Column 'x' not found") }, { baseDelayMs: 5 }),
+    /Column 'x' not found/
+  )
+  assert.equal(calls, 1, 'ต้องเรียกแค่ครั้งเดียว ไม่ลองใหม่กับ error ที่ไม่ใช่ rate-limit')
+})
+
+test('withRetry: โควตาเต็มติดต่อกันเกินจำนวนที่กำหนด ต้อง throw error เดิมกลับไปหลังลองครบทุกครั้ง', async () => {
+  let calls = 0
+  await assert.rejects(
+    () => withRetry(async () => { calls++; const err = new Error('Quota exceeded'); err.code = 429; throw err }, { baseDelayMs: 5, maxAttempts: 3 }),
+    /Quota exceeded/
+  )
+  assert.equal(calls, 3)
+})
+
+test('getRows: เจอ error โควตาจาก Sheets API ครั้งเดียวแล้วสำเร็จตอนลองใหม่ — ไม่ throw ออกไปให้ผู้เรียกเห็น', async () => {
+  state.data['Contacts'] = [['Phone', 'Name'], ['0811111111', 'ทดสอบ']]
+  state.failGetNTimes = 1
+  const rows = await sheetsService.getContacts()
+  assert.deepEqual(rows, [{ phone: '0811111111', name: 'ทดสอบ' }])
 })
 
 test('getInboundCampaignForNumber เลือกเฉพาะ campaign type=inbound ไม่ fallback ไปแถวแรกที่เป็น outbound (บั๊กเดิม)', async () => {

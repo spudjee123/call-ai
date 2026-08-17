@@ -27,6 +27,34 @@ function withSheetLock(sheetName, fn) {
   return run
 }
 
+// Google Sheets API มี quota "requests per minute per user" — พัง 100% ทันทีไม่มีการลองใหม่เดิม
+// ทำให้เจอ error นี้เมื่อไหร่ (ช่วงแอดมิน+สายที่กำลังคุยยิง sheet พร้อมกันเยอะ) ผลการโทร/ข้อมูลที่ควรบันทึกหายไปเงียบๆ
+// retry เฉพาะ error ที่เป็น rate-limit จริงๆ เท่านั้น (429/503 หรือข้อความ quota) — error อื่น (เช่น column ไม่มีจริง)
+// ต้อง fail ทันทีเหมือนเดิม ไม่งั้นบั๊กจริงจะถูกดีเลย์การแจ้งเตือนโดยไม่จำเป็น
+function isRetryableSheetsError(err) {
+  const status = err?.code || err?.response?.status
+  if (status === 429 || status === 503) return true
+  return /quota exceeded/i.test(err?.message || '')
+}
+
+// exponential backoff + jitter — jitter กันหลาย request ที่โดน quota พร้อมกันแล้วลองใหม่จังหวะเดียวกันเป๊ะๆ
+// จนไปชนกำแพง quota ซ้ำอีกรอบ (thundering herd) จำกัดไว้ 3 ครั้งลองใหม่ (รวมดีเลย์สูงสุด ~5s) กันค้างนานเกินไป
+async function withRetry(fn, { maxAttempts = 4, baseDelayMs = 500 } = {}) {
+  let lastErr
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await fn()
+    } catch (err) {
+      lastErr = err
+      if (attempt === maxAttempts || !isRetryableSheetsError(err)) throw err
+      const delay = baseDelayMs * 2 ** (attempt - 1) * (0.75 + Math.random() * 0.5)
+      console.warn(`[Sheets] ${(err.message || '').slice(0, 100)} — retry ${attempt}/${maxAttempts - 1} in ${Math.round(delay)}ms`)
+      await new Promise(r => setTimeout(r, delay))
+    }
+  }
+  throw lastErr
+}
+
 async function getClient() {
   if (sheets) return sheets
   const auth = new google.auth.GoogleAuth({
@@ -40,10 +68,10 @@ async function getClient() {
 // ดึงข้อมูลดิบ (headers ที่ normalize แล้ว + rows แบบ array) เก็บ row index ไว้ใช้ update ทีหลัง
 async function getSheetData(sheetName) {
   const client = await getClient()
-  const res = await client.spreadsheets.values.get({
+  const res = await withRetry(() => client.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
     range: sheetName,
-  })
+  }))
   const values = res.data.values || []
   if (!values.length) return { headers: [], rows: [] }
   const headers = values[0].map(h => h.toLowerCase().trim().replace(/\s+/g, '_'))
@@ -85,12 +113,12 @@ async function updateRowByKey(sheetName, keyField, keyValue, updates) {
 
     const client = await getClient()
     const lastCol = String.fromCharCode(65 + headers.length - 1)
-    await client.spreadsheets.values.update({
+    await withRetry(() => client.spreadsheets.values.update({
       spreadsheetId: SPREADSHEET_ID,
       range: `${sheetName}!A${rowIdx + 2}:${lastCol}${rowIdx + 2}`,
       valueInputOption: 'RAW',
       requestBody: { values: [row] },
-    })
+    }))
     return true
   })
 }
@@ -100,7 +128,7 @@ async function updateRowByKey(sheetName, keyField, keyValue, updates) {
 // เก่าถ้ามีคนลบ/สร้างแท็บซ้ำชื่อเดิมระหว่าง process ยังรันอยู่ ซึ่งจะไปลบผิดแถวผิดชีตแบบเงียบๆ ไม่คุ้มกับที่ประหยัดได้
 async function getSheetId(sheetName) {
   const client = await getClient()
-  const meta = await client.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID })
+  const meta = await withRetry(() => client.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID }))
   const sheet = (meta.data.sheets || []).find(s => s.properties.title === sheetName)
   if (!sheet) throw new Error(`Sheet '${sheetName}' not found`)
   return sheet.properties.sheetId
@@ -115,7 +143,7 @@ async function deleteRowByKey(sheetName, keyField, keyValue) {
 
     const sheetId = await getSheetId(sheetName)
     const client = await getClient()
-    await client.spreadsheets.batchUpdate({
+    await withRetry(() => client.spreadsheets.batchUpdate({
       spreadsheetId: SPREADSHEET_ID,
       requestBody: {
         requests: [{
@@ -124,19 +152,19 @@ async function deleteRowByKey(sheetName, keyField, keyValue) {
           },
         }],
       },
-    })
+    }))
     return true
   })
 }
 
 async function appendRow(sheetName, values) {
   const client = await getClient()
-  await client.spreadsheets.values.append({
+  await withRetry(() => client.spreadsheets.values.append({
     spreadsheetId: SPREADSHEET_ID,
     range: sheetName,
     valueInputOption: 'RAW',
     requestBody: { values: [values] },
-  })
+  }))
 }
 
 // เติมค่าตามชื่อ column (ไม่สนลำดับ) แล้ว append — กันพังถ้า column ในชีตสลับตำแหน่ง
@@ -151,12 +179,12 @@ async function appendRowsByFields(sheetName, fieldsArray) {
   const { headers } = await getSheetData(sheetName)
   const client = await getClient()
   const values = fieldsArray.map(fields => headers.map(h => (fields[h] !== undefined ? fields[h] : '')))
-  await client.spreadsheets.values.append({
+  await withRetry(() => client.spreadsheets.values.append({
     spreadsheetId: SPREADSHEET_ID,
     range: sheetName,
     valueInputOption: 'RAW',
     requestBody: { values },
-  })
+  }))
 }
 
 // Blocklist อาจยังไม่ถูกสร้างเป็นชีตแยก — กันพังถ้ายังไม่มี ให้ถือว่าลิสต์ว่าง
@@ -482,4 +510,6 @@ const sheetsService = {
   }
 }
 
-module.exports = { sheetsService }
+// isRetryableSheetsError/withRetry exported แยกจาก sheetsService ตั้งใจ — ไม่ใช่ API ที่ route อื่นควรเรียกใช้ตรงๆ
+// export ไว้แค่ให้เทสยิง withRetry({baseDelayMs: เล็กๆ}) ได้ตรงๆ กันเทสช้าจากรอ backoff จริงหลักวินาที
+module.exports = { sheetsService, isRetryableSheetsError, withRetry }
