@@ -18,13 +18,22 @@ const DEFAULT_REFRESH_INTERVAL_MS = 30000
 // "abc"/"" ทั้งหมด (bucket มีแค่ 100 ช่อง 0..99 จริง เศษทศนิยมไม่มีความหมาย) และถ้ามีแถว rollout_percent
 // มากกว่า 1 แถว ถือว่า config ทั้งชุด invalid ไปเลย ไม่เดาว่าจะใช้แถวแรกหรือแถวสุดท้าย (แก้ผิดบน sheet ไม่ควร
 // เปลี่ยน traffic แบบเงียบๆ โดยไม่มีใครรู้ตัว)
-function parseRolloutPercent(rows) {
+//
+// คืน { value, reason } เสมอ — reason ไม่ null เฉพาะตอน value เป็น null (ใช้บอกสาเหตุใน log ตอน refresh ล้มเหลว
+// แบบ "invalid config" ไม่ใช่ error จริง — parseRolloutPercent ด้านล่างเป็น wrapper คืนแค่ value ตาม contract เดิม)
+function classifyRolloutPercent(rows) {
   const matches = rows.filter(r => r.key === 'rollout_percent')
-  if (matches.length !== 1) return null
+  if (matches.length === 0) return { value: null, reason: 'missing_rollout_percent' }
+  if (matches.length > 1) return { value: null, reason: 'duplicate_rollout_percent' }
   const raw = String(matches[0].value ?? '').trim()
-  if (!/^\d+$/.test(raw)) return null
+  if (!/^\d+$/.test(raw)) return { value: null, reason: `invalid_value value=${JSON.stringify(raw)}` }
   const n = Number(raw)
-  return n >= 0 && n <= 100 ? n : null
+  if (n < 0 || n > 100) return { value: null, reason: `invalid_value value=${JSON.stringify(raw)}` }
+  return { value: n, reason: null }
+}
+
+function parseRolloutPercent(rows) {
+  return classifyRolloutPercent(rows).value
 }
 
 function createRolloutConfig({ getRows = () => sheetsService.getStreamingConfig(), refreshIntervalMs = DEFAULT_REFRESH_INTERVAL_MS } = {}) {
@@ -34,20 +43,35 @@ function createRolloutConfig({ getRows = () => sheetsService.getStreamingConfig(
   let refreshInFlight = null
   let timer = null
 
+  // C6b — log แบบ state-change เท่านั้น ไม่ log ทุกรอบ poll (30s) เพราะจะ spam production logs โดยไม่มีประโยชน์
+  // log signature เปลี่ยนเมื่อไหร่ก็ต่อเมื่อผลลัพธ์เปลี่ยนจริง (success→success ค่าเดิม ไม่ log ซ้ำ, error เดิมซ้ำๆ
+  // ไม่ log ซ้ำ) แต่เปลี่ยนค่า/ฟื้นจาก error/เปลี่ยนชนิด error จะ log ทันที — ทำให้ audit rollout เปลี่ยนแปลงได้ง่าย
+  // และแยกแยะ "Sheets control plane ทำงานจริง" ออกจาก "แค่ cold-start default 0" ได้จาก log บรรทัดเดียว
+  let lastLogSignature = null
+  function logOnChange(signature, logFn) {
+    if (signature === lastLogSignature) return
+    lastLogSignature = signature
+    logFn()
+  }
+
   async function refresh() {
     if (refreshInFlight) return refreshInFlight
     refreshInFlight = (async () => {
       lastAttemptAt = Date.now() // อัปเดตทุกครั้งที่ "พยายาม" ไม่ว่าผลจะสำเร็จหรือไม่ — คุม backoff ของ refreshIfStale
       try {
         const rows = await getRows()
-        const percent = parseRolloutPercent(rows)
-        if (percent != null) {
-          cachedPercent = percent
+        const { value, reason } = classifyRolloutPercent(rows)
+        if (value != null) {
+          cachedPercent = value
           lastSuccessAt = Date.now()
+          logOnChange(`success:${value}`, () => console.log(`[RolloutConfig] refresh success percent=${value}`))
+        } else {
+          // ไม่มีแถว/ซ้ำ/format ผิด → ไม่แตะ cachedPercent เดิมเลย ถือเป็น refresh failed เหมือน error (last-known-good)
+          logOnChange(`invalid:${reason}`, () => console.warn(`[RolloutConfig] refresh invalid reason=${reason} using_lkg=${cachedPercent ?? 0}`))
         }
-        // percent == null (ไม่มีแถว/ซ้ำ/format ผิด) → ไม่แตะ cachedPercent เดิมเลย ถือเป็น refresh failed เหมือน error
       } catch (err) {
-        // เงียบโดยเจตนา — ใช้ last-known-good ต่อไป ไม่ throw ให้กระทบ caller (ทั้ง background poll และ manual call)
+        // ใช้ last-known-good ต่อไป ไม่ throw ให้กระทบ caller (ทั้ง background poll และ manual call)
+        logOnChange(`failure:${err.message}`, () => console.error(`[RolloutConfig] refresh failed error=${JSON.stringify(err.message)} using_lkg=${cachedPercent ?? 0}`))
       } finally {
         refreshInFlight = null
       }

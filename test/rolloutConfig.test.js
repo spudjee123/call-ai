@@ -188,3 +188,112 @@ test('start() เรียกซ้ำหลายครั้งไม่สร
   assert.equal(fetchCount, 1, 'start() ซ้ำต้องไม่สร้าง timer ซ้อนหลายตัว ไม่งั้นจะ fetch ถี่กว่ารอบ poll ที่ตั้งไว้')
   rc.stop()
 })
+
+// ---------------------------------------------------------------------------
+// C6b — state-change logging: log เฉพาะตอนผลลัพธ์เปลี่ยน ไม่ log ซ้ำทุกรอบ poll
+// ---------------------------------------------------------------------------
+
+function captureLogs() {
+  const logs = { log: [], warn: [], error: [] }
+  const original = { log: console.log, warn: console.warn, error: console.error }
+  console.log = (...args) => logs.log.push(args.join(' '))
+  console.warn = (...args) => logs.warn.push(args.join(' '))
+  console.error = (...args) => logs.error.push(args.join(' '))
+  return { logs, restore: () => { console.log = original.log; console.warn = original.warn; console.error = original.error } }
+}
+
+test('logging: refresh สำเร็จครั้งแรก → log ทันที', async () => {
+  const { logs, restore } = captureLogs()
+  try {
+    const rc = createRolloutConfig({ getRows: async () => [{ key: 'rollout_percent', value: '0' }], refreshIntervalMs: 10000 })
+    rc.start()
+    await delay(20)
+    assert.ok(logs.log.some(l => l.includes('refresh success percent=0')))
+    rc.stop()
+  } finally { restore() }
+})
+
+test('logging: refresh สำเร็จซ้ำด้วยค่าเดิม → ไม่ log ซ้ำ', async () => {
+  const { logs, restore } = captureLogs()
+  try {
+    const rc = createRolloutConfig({ getRows: async () => [{ key: 'rollout_percent', value: '5' }], refreshIntervalMs: 30 })
+    rc.start()
+    await delay(20)
+    const countAfterFirst = logs.log.length
+    await delay(120) // ผ่านไปหลายรอบ poll ค่าเดิมตลอด
+    assert.equal(logs.log.length, countAfterFirst, 'ค่าเดิมซ้ำๆ ไม่ควร log เพิ่มเลย')
+    rc.stop()
+  } finally { restore() }
+})
+
+test('logging: ค่าเปลี่ยน (0 → 5) → log บรรทัดใหม่', async () => {
+  const { logs, restore } = captureLogs()
+  try {
+    let value = 0
+    const rc = createRolloutConfig({ getRows: async () => [{ key: 'rollout_percent', value: String(value) }], refreshIntervalMs: 30 })
+    rc.start()
+    await delay(20)
+    assert.ok(logs.log.some(l => l.includes('percent=0')))
+    value = 5
+    await delay(60)
+    assert.ok(logs.log.some(l => l.includes('percent=5')), 'ค่าที่เปลี่ยนไปต้อง log ให้เห็นทันที ไม่ถูก dedupe ทิ้ง')
+    rc.stop()
+  } finally { restore() }
+})
+
+test('logging: refresh ล้มเหลวครั้งแรก → log ด้วย console.error', async () => {
+  const { logs, restore } = captureLogs()
+  try {
+    const rc = createRolloutConfig({ getRows: async () => { throw new Error('Sheets down') }, refreshIntervalMs: 10000 })
+    rc.start()
+    await delay(20)
+    assert.ok(logs.error.some(l => l.includes('refresh failed') && l.includes('Sheets down')))
+    rc.stop()
+  } finally { restore() }
+})
+
+test('logging: error เดิมซ้ำๆ ต่อเนื่อง → ไม่ log ซ้ำ', async () => {
+  const { logs, restore } = captureLogs()
+  try {
+    const rc = createRolloutConfig({ getRows: async () => { throw new Error('Sheets down') }, refreshIntervalMs: 30 })
+    rc.start()
+    await delay(20)
+    const countAfterFirst = logs.error.length
+    await delay(120)
+    assert.equal(logs.error.length, countAfterFirst, 'error ชนิดเดิมซ้ำๆ ไม่ควร log เพิ่มเลย')
+    rc.stop()
+  } finally { restore() }
+})
+
+test('logging: fail แล้วฟื้นตัว (recovery) → log success อีกครั้งตอนกลับมาใช้ได้', async () => {
+  const { logs, restore } = captureLogs()
+  try {
+    let shouldFail = true
+    const rc = createRolloutConfig({
+      getRows: async () => { if (shouldFail) throw new Error('Sheets down'); return [{ key: 'rollout_percent', value: '10' }] },
+      refreshIntervalMs: 30,
+    })
+    rc.start()
+    await delay(20)
+    assert.ok(logs.error.some(l => l.includes('refresh failed')))
+    shouldFail = false
+    await delay(60)
+    assert.ok(logs.log.some(l => l.includes('refresh success percent=10')), 'ฟื้นตัวจาก error ต้อง log success ใหม่ทันที ไม่ถูก dedupe ทิ้งเพราะเคย log อย่างอื่นมาก่อน')
+    rc.stop()
+  } finally { restore() }
+})
+
+test('logging: config ผิดรูปแบบ (ซ้ำ key) → log ด้วย console.warn และ cachedPercent ไม่เปลี่ยน (LKG)', async () => {
+  const { logs, restore } = captureLogs()
+  try {
+    const rc = createRolloutConfig({
+      getRows: async () => [{ key: 'rollout_percent', value: '5' }, { key: 'rollout_percent', value: '50' }],
+      refreshIntervalMs: 10000,
+    })
+    rc.start()
+    await delay(20)
+    assert.ok(logs.warn.some(l => l.includes('refresh invalid') && l.includes('duplicate_rollout_percent')))
+    assert.equal(rc.getCurrentRolloutPercent(), 0, 'ไม่เคย fetch สำเร็จเลยตั้งแต่ต้น (cold start) → ยังเป็น 0 ตามปกติ ไม่ใช่ 5 หรือ 50')
+    rc.stop()
+  } finally { restore() }
+})
