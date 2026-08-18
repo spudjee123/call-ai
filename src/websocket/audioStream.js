@@ -31,6 +31,16 @@ const CHUNK_READY_TIMEOUT_MS = 2000
 // ด้วยข้อมูลจริงจาก [Metrics] log ก่อนเปิด rollout เกิน 0%
 const TTS_FIRST_AUDIO_TIMEOUT_MS = 2000
 
+// Checkpoint C4c — timeout รวมของ legacy fallback ทั้งก้อน (Claude แบบไม่ stream + TTS) ไม่ใช่ staged เหมือน
+// A/B/C เพราะนี่คือ "ความพยายามสุดท้าย" ของเทิร์นนี้แล้ว — ถ้าไม่ทันเวลานี้ก็จบเทิร์นแบบไม่มีเสียงไปเลย ไม่พยายาม
+// fallback ซ้อน fallback (จะเปิด recursion/retry complexity โดยไม่จำเป็น) ตั้งไว้กว้างกว่า budget รวมของ
+// chunked path เพราะ askClaudeStream ต้องรอ "คำตอบเต็มก้อน" ก่อนถึงจะเริ่ม TTS ได้ ไม่ใช่ stream ทีละ token
+//
+// ตั้งชื่อ FALLBACK_TIMEOUT (ไม่ใช่ FALLBACK_TTS_TIMEOUT) เพราะ timer นี้ครอบทั้ง askClaudeStream + TTS รวมกัน
+// ไม่ใช่แค่ TTS — ถ้า Claude เองช้าจน timeout ป้ายที่ผิดจะชี้ทางแก้ผิดจุดตอนวิเคราะห์ production traces ทีหลัง
+// ถ้าวันหลังอยากแยกจริงๆ ค่อยเพิ่ม milestone watchdog ของ fallback เอง (FALLBACK_CLAUDE_TIMEOUT/FALLBACK_TTS_TIMEOUT)
+const FALLBACK_TIMEOUT_MS = 8000
+
 function shouldBlockEndCall(session, aiResponse) {
   const userMessages = session.messages.filter(m => m.role === 'user')
   const lastUserMsg = userMessages.at(-1)?.content ?? ''
@@ -503,12 +513,22 @@ function registerWebSocket(fastify) {
                 fullText = guarded.fullText
                 endCallRequested = guarded.endCallRequested
                 totalSent = guarded.totalSent
+              } else if (attempt.outcome === 'aborted') {
+                // C4c: barge-in ยกเลิก attempt นี้กลางทาง (ไม่ใช่ watchdog/error) — bargeIn() จัดการ cleanup
+                // (clear event, isSpeaking/sttProcessing reset) ไปแล้วแยกต่างหาก ห้าม fallback ต่อเด็ดขาด
+                // เพราะลูกค้ากำลังพูดแทรกอยู่ พยายามพูดอะไรตอนนี้ผิดหลักการเดียวกับที่ C3b ทั้งชุดกันไว้
+                console.log('[Chunked] Attempt aborted by barge-in — no fallback, turn ends with no audio')
               } else {
                 // outcome: 'timeout' (watchdog) หรือ 'error' (Claude/TTS จริง) — ทั้งสองทางวิ่งเข้า fallback gate เดียวกัน
                 // runAttemptWithWatchdog abort child ไปให้แล้วก่อน return ในทั้งสองกรณี ไม่ต้อง abort เพิ่มที่นี่
+                let triggerReason
                 if (attempt.outcome === 'timeout') {
+                  triggerReason = attempt.reason // CLAUDE_FIRST_DELTA_TIMEOUT / CHUNK_READY_TIMEOUT / TTS_FIRST_AUDIO_TIMEOUT
                   console.log(`[Watchdog] ${attempt.reason} — chunked attempt aborted, considering fallback`)
                 } else {
+                  // C4c: แยก CLAUDE_ERROR/TTS_ERROR จาก tag ที่ chunkedTurn.js ใส่ไว้ให้แล้ว แทนป้ายรวมๆ เดิม —
+                  // สำคัญกับการวิเคราะห์ตอน rollout จริง เพราะ Claude กับ ElevenLabs พังคนละสาเหตุคนละทางแก้กัน
+                  triggerReason = attempt.error.source === 'TTS' ? 'TTS_ERROR' : 'CLAUDE_ERROR'
                   console.error('[AI/TTS error]', attempt.error.message)
                   healthMonitor.reportError('ai_tts', attempt.error.message)
                 }
@@ -517,17 +537,29 @@ function registerWebSocket(fastify) {
                 // เทิร์นนี้แทน ปล่อยลูกค้าเงียบไปเฉยๆ ไม่ bump generation เพราะนี่คือการกู้ turn เดิม ไม่ใช่ turn ใหม่
                 if (isCurrentGeneration(callState, generationId) && claimFallback(turnState)) {
                   turnMetrics.fallbackTriggered = true
-                  turnMetrics.fallbackReason = attempt.outcome === 'timeout' ? attempt.reason : 'CLAUDE_OR_TTS_ERROR'
+                  turnMetrics.fallbackReason = triggerReason
                   turnMetrics.fallbackStartedAt = performance.now()
                   console.log('[Fallback] Falling back to legacy Claude/TTS for this turn')
-                  try {
-                    const fb = await runLegacyFallback({
-                      session: currentSession, signal, socket, streamSid,
+
+                  // C4c: fallback มี terminal timeout ของตัวเอง ไม่ staged เหมือน A/B/C — ถ้าไม่ทันก็จบเทิร์นเลย
+                  // ไม่พยายาม fallback ซ้อน fallback (recursion complexity โดยไม่จำเป็น) ใช้ primitive เดียวกัน
+                  // แต่ run() ไม่เรียก arm() เองเลย จึงเป็นแค่ single-shot timeout ธรรมดา ไม่มีการ rearm
+                  const fallbackAttempt = await runAttemptWithWatchdog({
+                    signal,
+                    timeoutMs: FALLBACK_TIMEOUT_MS,
+                    reason: 'FALLBACK_TIMEOUT',
+                    run: (fallbackSignal) => runLegacyFallback({
+                      session: currentSession, signal: fallbackSignal, socket, streamSid,
                       voiceId: currentSession.campaign.voice_id, turnMetrics, turnState, callState, generationId,
-                    })
+                    }),
+                  })
+
+                  if (fallbackAttempt.outcome === 'success' || fallbackAttempt.outcome === 'aborted') {
+                    const fb = fallbackAttempt.result
                     // เช็คซ้ำหลัง await ยาว (askClaudeStream) — ห้ามเอาผลลัพธ์ของ generation ที่ stale ไปแล้วมาใช้
                     // ต่อ ไม่งั้น [END_CALL] เก่าอาจไปสั่ง hangup ทั้งที่ลูกค้ากำลังคุยกับ generation ใหม่อยู่
                     if (isCurrentGeneration(callState, generationId)) {
+                      turnMetrics.fallbackOutcome = 'SPOKEN'
                       const guarded = await applyChunkedEndCallGuard({
                         endCallRequested: fb.endCallRequested, fullText: fb.fullText, totalSent: fb.totalSent,
                         currentSession, signal, socket, streamSid, voiceId: currentSession.campaign.voice_id,
@@ -537,11 +569,16 @@ function registerWebSocket(fastify) {
                       endCallRequested = guarded.endCallRequested
                       totalSent = guarded.totalSent
                     } else {
+                      turnMetrics.fallbackOutcome = 'STALE'
                       console.log('[Fallback] Generation went stale while legacy fallback was in flight — discarding its result')
                     }
-                  } catch (fallbackErr) {
-                    console.error('[Fallback error]', fallbackErr.message)
-                    healthMonitor.reportError('ai_tts_fallback', fallbackErr.message)
+                  } else if (fallbackAttempt.outcome === 'timeout') {
+                    turnMetrics.fallbackOutcome = 'FALLBACK_TIMEOUT'
+                    console.error('[Fallback] FALLBACK_TIMEOUT — giving up, no further recovery attempted for this turn')
+                  } else {
+                    turnMetrics.fallbackOutcome = 'FALLBACK_ERROR'
+                    console.error('[Fallback error]', fallbackAttempt.error.message)
+                    healthMonitor.reportError('ai_tts_fallback', fallbackAttempt.error.message)
                   }
                 }
               }

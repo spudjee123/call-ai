@@ -25,7 +25,13 @@ function attachChildAbort(signal) {
 // If nothing ever re-arms, the attempt runs to completion with no watchdog once the first arm() fires.
 //
 // คืนค่าอย่างใดอย่างหนึ่ง:
-//   { outcome: 'success', result }   — run() ชนะ race ก่อน watchdog (วงไหนก็ตามที่กำลัง arm อยู่) จะ timeout
+//   { outcome: 'success', result }   — run() ชนะ race จริง ก่อน watchdog (วงไหนก็ตามที่กำลัง arm อยู่) จะ timeout
+//                                       และ child ไม่เคยถูก abort เลยตลอดทาง (completion ปกติแท้ๆ)
+//   { outcome: 'aborted', result }   — run() resolve สำเร็จก็จริง (ไม่ throw) แต่ child ถูก abort ไปแล้วระหว่างทาง
+//                                       (จาก outer signal เท่านั้น — watchdog เองไม่มีทางทำให้ resolve สำเร็จได้
+//                                       เพราะมันแพ้ race ด้วยการ reject) เช่น barge-in กลาง run() ที่จัดการ
+//                                       signal.aborted แบบ graceful-return แทนที่จะ throw — ไม่ควรถูกนับเป็น
+//                                       "completion สำเร็จ" ตอนอ่าน telemetry เพราะ turn ถูกยกเลิกจริง ไม่ใช่จบปกติ
 //   { outcome: 'timeout', reason }   — watchdog ชนะ (reason ของวงที่กำลัง arm อยู่ ณ ตอนนั้น); child ถูก abort ไปแล้วก่อน return
 //   { outcome: 'error', error }      — run() reject ด้วย error จริง (ไม่ใช่ watchdog); child ถูก abort ไปแล้วก่อน return
 async function runAttemptWithWatchdog({ signal, timeoutMs, reason, run }) {
@@ -65,7 +71,9 @@ async function runAttemptWithWatchdog({ signal, timeoutMs, reason, run }) {
     const result = await Promise.race([attemptPromise, watchdogPromise])
     arm() // เคลียร์วงที่เหลืออยู่ (ถ้ามี) ให้หมด
     settled = true
-    return { outcome: 'success', result }
+    // child ถูก abort ได้จากทางเดียวเท่านั้นตอนที่ยัง resolve สำเร็จ (ไม่ reject): outer signal propagate ลงมา —
+    // ถ้าเป็นเช่นนั้นจริง turn นี้ถูกยกเลิกกลางทาง ไม่ใช่ completion ปกติ ต้องแยกให้ telemetry อ่านไม่หลอกว่า success
+    return { outcome: child.signal.aborted ? 'aborted' : 'success', result }
   } catch (err) {
     arm()
     child.abort() // ฆ่า loser ก่อนเสมอ ไม่ว่าจะแพ้ด้วย watchdog หรือ error จริง — ก่อน caller จะไปทำอะไรต่อ (เช่น claimFallback)

@@ -80,6 +80,7 @@ test('outer signal ถูก abort ระหว่าง run() กำลัง�
   const outcome = await runPromise
   assert.equal(childSignalSeen.aborted, true, 'child ต้อง abort ทันทีที่ outer abort ไม่ต้องรอ run() เสร็จ')
   assert.equal(outcome.result, 'saw-abort')
+  assert.equal(outcome.outcome, 'aborted', 'ถูก outer abort กลางทาง (แม้ run() จะ resolve แบบ graceful) ต้องไม่รายงานเป็น success')
 })
 
 test('outer signal abort ไปแล้วตั้งแต่ก่อนเรียก runAttemptWithWatchdog เลย → child ต้อง abort ทันทีตั้งแต่เริ่ม ไม่พลาด', async () => {

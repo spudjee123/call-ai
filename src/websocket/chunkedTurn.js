@@ -185,7 +185,12 @@ async function runChunkedTurn({ session, signal, socket, streamSid, voiceId, tur
   await producer
 
   const err = consumerError || producerError
-  if (err) throw err
+  if (err) {
+    // C4c: tag ว่า error มาจาก Claude (producer) หรือ TTS (consumer) — ให้ caller (audioStream.js) จัดหมวด
+    // fallbackReason เป็น CLAUDE_ERROR/TTS_ERROR แทนป้ายรวมๆ อย่างเดียวได้ ไม่ต้องเดาจาก error.message
+    err.source = consumerError ? 'TTS' : 'CLAUDE'
+    throw err
+  }
 
   return { totalSent, fullText: fullTextAccum }
 }

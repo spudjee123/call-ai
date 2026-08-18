@@ -20,8 +20,9 @@ function createTurnMetrics({ callSid, generationId, path, rolloutBucket, rollout
     t6: null, // first TTS audio chunk received
     t7: null, // first audio chunk sent to Twilio
     fallbackTriggered: false,
-    fallbackReason: null,
+    fallbackReason: null, // C4c — เหตุผลที่ "เริ่ม" fallback: CLAUDE_ERROR/TTS_ERROR/CLAUDE_FIRST_DELTA_TIMEOUT/CHUNK_READY_TIMEOUT/TTS_FIRST_AUDIO_TIMEOUT
     fallbackStartedAt: null, // C4a — performance.now() ตอนเริ่มพยายาม fallback (ถ้ามี) ใช้แยกวิเคราะห์ turn ที่ fallback ออกจาก pure-chunked latency percentile
+    fallbackOutcome: null, // C4c — สิ่งที่เกิดกับ "ความพยายาม fallback เอง": SPOKEN/STALE/FALLBACK_TIMEOUT/FALLBACK_ERROR
     audioCommitted: false,
   }
 }

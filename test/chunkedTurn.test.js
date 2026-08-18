@@ -202,25 +202,25 @@ test('12) abort กลางทาง (barge-in) → หยุดทันที
   assert.equal(result.totalSent, 0)
 })
 
-test('13) Claude error (ไม่ใช่ abort) → propagate ออกจาก runChunkedTurn ให้ caller จัดการเอง', async () => {
+test('13) Claude error (ไม่ใช่ abort) → propagate ออกจาก runChunkedTurn ให้ caller จัดการเอง พร้อม tag source=CLAUDE (C4c)', async () => {
   state.claudeImpl = async function* () { throw new Error('Claude boom') }
   state.ttsImpl = async function* () { yield Buffer.from('a') }
   const socket = makeSocket()
   const { turnMetrics, turnState, callState, generationId } = makeMetricsAndState()
   await assert.rejects(
     () => runChunkedTurn({ session: {}, signal: null, socket, streamSid: 'SS1', voiceId: 'v1', turnMetrics, turnState, callState, generationId }),
-    /Claude boom/
+    (err) => { assert.match(err.message, /Claude boom/); assert.equal(err.source, 'CLAUDE'); return true }
   )
 })
 
-test('14) TTS error (ไม่ใช่ abort) → propagate ออกจาก runChunkedTurn ให้ caller จัดการเอง', async () => {
+test('14) TTS error (ไม่ใช่ abort) → propagate ออกจาก runChunkedTurn ให้ caller จัดการเอง พร้อม tag source=TTS (C4c)', async () => {
   state.claudeImpl = fakeClaude(['Hello world. '])
   state.ttsImpl = async function* () { throw new Error('TTS boom') }
   const socket = makeSocket()
   const { turnMetrics, turnState, callState, generationId } = makeMetricsAndState()
   await assert.rejects(
     () => runChunkedTurn({ session: {}, signal: null, socket, streamSid: 'SS1', voiceId: 'v1', turnMetrics, turnState, callState, generationId }),
-    /TTS boom/
+    (err) => { assert.match(err.message, /TTS boom/); assert.equal(err.source, 'TTS'); return true }
   )
 })
 
