@@ -205,6 +205,42 @@ test('watchdog สองวงเรียงกัน จำลอง Watchdog 
   assert.equal(childSignalAtFailure.aborted, true)
 })
 
+test('watchdog สามวงเรียงกัน จำลอง Watchdog A → B → C จริง (t3, t4 มาทัน, t5 มาทัน แต่ t6 ไม่มาเลย) → outcome timeout ของ C', async () => {
+  const outcome = await runAttemptWithWatchdog({
+    signal: new AbortController().signal,
+    timeoutMs: 100, // CLAUDE_FIRST_DELTA_TIMEOUT จำลอง
+    reason: 'CLAUDE_FIRST_DELTA_TIMEOUT',
+    run: async (childSignal, arm) => {
+      await delay(5) // t3 มาทัน A
+      arm(100, 'CHUNK_READY_TIMEOUT') // arm B
+      await delay(5) // t4 มาทัน B
+      arm(15, 'TTS_FIRST_AUDIO_TIMEOUT') // arm C (จำลองเริ่ม TTS request จริง)
+      await delay(200) // t6 ไม่เคยมา — ควรแพ้ race ให้ C ก่อนถึงตรงนี้
+      return 'unreachable'
+    },
+  })
+  assert.equal(outcome.outcome, 'timeout')
+  assert.equal(outcome.reason, 'TTS_FIRST_AUDIO_TIMEOUT')
+})
+
+test('watchdog สามวงเรียงกัน ทุกวงทันเวลาหมด (t3, t4, t6 มาครบก่อน timeout ของแต่ละวง) → outcome success', async () => {
+  const outcome = await runAttemptWithWatchdog({
+    signal: new AbortController().signal,
+    timeoutMs: 100,
+    reason: 'CLAUDE_FIRST_DELTA_TIMEOUT',
+    run: async (childSignal, arm) => {
+      await delay(5)
+      arm(100, 'CHUNK_READY_TIMEOUT')
+      await delay(5)
+      arm(100, 'TTS_FIRST_AUDIO_TIMEOUT')
+      await delay(5)
+      arm() // t6 มาทัน — disarm สนิท ไม่เหลือวงไหนค้างอยู่
+      return 'all milestones on time'
+    },
+  })
+  assert.deepEqual(outcome, { outcome: 'success', result: 'all milestones on time' })
+})
+
 test('claimFallback-style caller: หลัง timeout ต้อง detach listener แล้ว ไม่ throw ถ้า outer abort ซ้ำอีกทีหลังจบไปแล้ว', async () => {
   const outer = new AbortController()
   await runAttemptWithWatchdog({

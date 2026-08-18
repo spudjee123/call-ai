@@ -286,6 +286,37 @@ test('onFirstChunk ถูกเรียกจาก final-flush path ด้ว�
   assert.equal(calls, 1)
 })
 
+test('C4b Watchdog C: onFirstTtsRequest/onFirstTtsAudio ถูกเรียกครั้งเดียวต่อทั้งเทิร์น แม้มีหลาย speech chunk เข้า TTS ต่อกัน', async () => {
+  // 3 ประโยค = 3 รอบ TTS request/audio ในเทิร์นเดียว — ฮุคของ Watchdog C ต้องยิงแค่ครั้งแรกของทั้งเทิร์นเท่านั้น
+  // (ไม่ใช่ต่อ chunk) ไม่งั้น chunk #2/#3 จะไป rearm watchdog หลัง AUDIO_COMMITTED ไปแล้วอย่างผิดๆ
+  state.claudeImpl = fakeClaude(['One. ', 'Two. ', 'Three.'])
+  state.ttsImpl = async function* () { yield Buffer.from('a') }
+  const socket = makeSocket()
+  const { turnMetrics, turnState, callState, generationId } = makeMetricsAndState()
+  let requestCalls = 0
+  let audioCalls = 0
+  await runChunkedTurn({
+    session: {}, signal: null, socket, streamSid: 'SS1', voiceId: 'v1', turnMetrics, turnState, callState, generationId,
+    onFirstTtsRequest: () => { requestCalls++ },
+    onFirstTtsAudio: () => { audioCalls++ },
+  })
+  assert.equal(requestCalls, 1, 'onFirstTtsRequest ต้องยิงแค่ครั้งเดียวทั้งเทิร์น ไม่ใช่ต่อ speech chunk')
+  assert.equal(audioCalls, 1, 'onFirstTtsAudio ต้องยิงแค่ครั้งเดียวทั้งเทิร์น ไม่ใช่ต่อ speech chunk')
+})
+
+test('C4b Watchdog C: onFirstTtsRequest ยิงก่อน synthesizeSpeechStream ถูกเรียกจริงเสมอ (arm ก่อน request ไม่ใช่หลัง)', async () => {
+  state.claudeImpl = fakeClaude(['Hello world. '])
+  const order = []
+  state.ttsImpl = async function* () { order.push('tts-called'); yield Buffer.from('a') }
+  const socket = makeSocket()
+  const { turnMetrics, turnState, callState, generationId } = makeMetricsAndState()
+  await runChunkedTurn({
+    session: {}, signal: null, socket, streamSid: 'SS1', voiceId: 'v1', turnMetrics, turnState, callState, generationId,
+    onFirstTtsRequest: () => order.push('armed'),
+  })
+  assert.deepEqual(order, ['armed', 'tts-called'])
+})
+
 // ---------------------------------------------------------------------------
 // Checkpoint C3b — isCurrentGeneration() guards ที่ 5 boundary
 // ---------------------------------------------------------------------------

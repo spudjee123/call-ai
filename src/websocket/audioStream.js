@@ -26,6 +26,11 @@ const CLAUDE_FIRST_DELTA_TIMEOUT_MS = 3000
 // ก่อนที่ chunker จะได้โอกาสทำ fallback boundary ของตัวเองครบตามสัญญา — เผื่อ margin ~2.5 เท่า
 const CHUNK_READY_TIMEOUT_MS = 2000
 
+// Watchdog C — เวลาสูงสุดที่ยอมรอ ElevenLabs ส่ง audio ก้อนแรกกลับมาหลังจาก TTS request แรกของทั้งเทิร์นเริ่ม
+// (t5→t6) ยังไม่มี baseline ttsTTFB จริงจาก production (rollout ยัง 0%) ใช้ค่าตาม roadmap เดิมไปก่อน — ควร tune
+// ด้วยข้อมูลจริงจาก [Metrics] log ก่อนเปิด rollout เกิน 0%
+const TTS_FIRST_AUDIO_TIMEOUT_MS = 2000
+
 function shouldBlockEndCall(session, aiResponse) {
   const userMessages = session.messages.filter(m => m.role === 'user')
   const lastUserMsg = userMessages.at(-1)?.content ?? ''
@@ -456,11 +461,13 @@ function registerWebSocket(fastify) {
           // rollout ยัง 0% เสมอตอนนี้ จึงยังไม่มีสายไหนเข้า branch นี้จริงในโปรดักชัน (ดู C0/decideRollout)
           if (rollout.useChunkedStreaming) {
             try {
-              // C4b: race runChunkedTurn ต่อ watchdog สองวงเรียงกัน (Watchdog A → B) ผ่าน child AbortController
+              // C4b: race runChunkedTurn ต่อ watchdog สามวงเรียงกัน (Watchdog A → B → C) ผ่าน child AbortController
               // เดียวที่ compose มาจาก outer signal (barge-in) — barge-in ยังฆ่าทั้งคู่ได้เสมอ แต่ watchdog ฆ่าได้แค่
               // chunked attempt นี้เท่านั้น ไม่แตะ outer signal เลย เพื่อให้ fallback ด้านล่าง (ที่ใช้ outer signal)
-              // ยังทำงานได้จริง — arm() วงแรก (CLAUDE_FIRST_DELTA_TIMEOUT) ตั้งไว้ก่อนเริ่ม แล้ว rearm เป็นวงที่สอง
-              // (CHUNK_READY_TIMEOUT) ตอน t3 เกิดจริง ไม่ใช่เริ่มพร้อมกันตั้งแต่ t2
+              // ยังทำงานได้จริง — A (CLAUDE_FIRST_DELTA_TIMEOUT) ตั้งไว้ก่อนเริ่ม, rearm เป็น B (CHUNK_READY_TIMEOUT)
+              // ตอน t3, disarm ตอน t4 (ไม่ rearm ทันที — ช่องว่างจนกว่า TTS request แรกจะเริ่มจริงคือ intentional gap),
+              // แล้ว rearm เป็น C (TTS_FIRST_AUDIO_TIMEOUT) ตอน t5 (TTS request แรกของทั้งเทิร์นเริ่มจริง ไม่ใช่ตอน
+              // chunk ถูก dequeue), disarm ตอน t6 — first-only ทั้งคู่ ไม่ rearm ตาม speech chunk ถัดๆ ไป
               const attempt = await runAttemptWithWatchdog({
                 signal,
                 timeoutMs: CLAUDE_FIRST_DELTA_TIMEOUT_MS,
@@ -478,6 +485,8 @@ function registerWebSocket(fastify) {
                   onControl: (control) => { if (control?.type === 'end_call') endCallRequested = true },
                   onFirstDelta: () => armWatchdog(CHUNK_READY_TIMEOUT_MS, 'CHUNK_READY_TIMEOUT'),
                   onFirstChunk: () => armWatchdog(),
+                  onFirstTtsRequest: () => armWatchdog(TTS_FIRST_AUDIO_TIMEOUT_MS, 'TTS_FIRST_AUDIO_TIMEOUT'),
+                  onFirstTtsAudio: () => armWatchdog(),
                 }),
               })
 

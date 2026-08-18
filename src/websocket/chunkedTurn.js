@@ -45,11 +45,17 @@ const { isCurrentGeneration } = require('../utils/generationGuard')
 // startingSentCount: จำนวน audio chunk ที่ส่งไปแล้วของทั้งเทิร์น (ก่อนเรียกฟังก์ชันนี้) — ใช้ตัดสิน "นี่คือก้อน
 // แรกของทั้งเทิร์นจริงไหม" (สำหรับ [TTS] First audio chunk sent log และ onFirstAudioSent) ให้ตรงกับความหมาย
 // เดียวกับที่ legacy ใช้ totalSent ตัวเดียวร่วมกันระหว่าง primary block กับ guard/follow-up block
-async function synthesizeAndSend({ text, signal, socket, streamSid, voiceId, turnMetrics, turnState, isCurrent, startingSentCount, onFirstAudioSent }) {
+//
+// onFirstTtsRequest/onFirstTtsAudio (C4b Watchdog C) เป็น first-only ของทั้งเทิร์น เหมือน t5/t6 เอง — ถ้า chunk
+// #1 คอมมิตเสียงไปแล้วและ chunk #2 เริ่ม TTS ใหม่ ฮุคเหล่านี้จะไม่ยิงซ้ำ (เช็คจาก turnMetrics.t5/t6 == null ก่อน
+// markOnce เสมอ ไม่ใช่ per-call) — Watchdog C วัดแค่ "ได้ audio ก้อนแรกของทั้งเทิร์นไหม" ไม่ใช่ทุก TTS chunk
+async function synthesizeAndSend({ text, signal, socket, streamSid, voiceId, turnMetrics, turnState, isCurrent, startingSentCount, onFirstAudioSent, onFirstTtsRequest, onFirstTtsAudio }) {
   if (!isCurrent() || signal?.aborted) return 0
 
+  const isFirstTtsRequest = turnMetrics.t5 == null
   markOnce(turnMetrics, 't5')
   markTtsPending(turnState) // no-op ถ้า phase ไม่ใช่ GENERATING แล้ว (เช่น AUDIO_COMMITTED ไปแล้วจากข้อความก่อนหน้าในเทิร์นเดียวกัน) — monotonic โดย turnState.js เอง ไม่มีทาง regress
+  if (isFirstTtsRequest) onFirstTtsRequest?.() // arm Watchdog C ตอน TTS request เริ่มจริง ไม่ใช่ตอน chunk ถูก dequeue จาก queue
 
   let sentCount = 0
   for await (const audioChunk of synthesizeSpeechStream(text, voiceId, signal)) {
@@ -59,7 +65,9 @@ async function synthesizeAndSend({ text, signal, socket, streamSid, voiceId, tur
     if (signal?.aborted) break
     if (socket.readyState !== socket.OPEN) break
 
+    const isFirstTtsAudio = turnMetrics.t6 == null
     markOnce(turnMetrics, 't6')
+    if (isFirstTtsAudio) onFirstTtsAudio?.() // disarm Watchdog C — first-only เช่นกัน
     if (startingSentCount + sentCount === 0) console.log('[TTS] First audio chunk sent')
     socket.send(JSON.stringify({ event: 'media', streamSid, media: { payload: audioChunk.toString('base64') } }))
     markOnce(turnMetrics, 't7')
@@ -73,13 +81,16 @@ async function synthesizeAndSend({ text, signal, socket, streamSid, voiceId, tur
 // พูดข้อความคงที่หนึ่งก้อน (ไม่ผ่าน Claude/chunker) ด้วย guard เดียวกับ consumer loop ปกติทุกประการ — ใช้กับ
 // follow-up question ตอน shouldBlockEndCall() บล็อกการวางสายก่อนเวลาอันควร (audioStream.js เป็นเจ้าของ policy
 // ว่าเมื่อไหร่ควรเรียก ฟังก์ชันนี้แค่รับผิดชอบพูดออกไปอย่างปลอดภัยเท่านั้น)
+//
+// หมายเหตุ: ไม่รับ onFirstTtsRequest/onFirstTtsAudio ตอนนี้ — Watchdog C ยังไม่ครอบคลุมการเรียกผ่านทางนี้
+// (follow-up หลัง blocked end_call, หรือ TTS ของ legacy fallback ใน audioStream.js) เป็น gap ที่รู้ไว้ก่อน
 async function speakFixedText({ text, signal, socket, streamSid, voiceId, turnMetrics, turnState, callState, generationId, onFirstAudioSent, startingSentCount = 0 }) {
   const isCurrent = () => isCurrentGeneration(callState, generationId)
   const sentCount = await synthesizeAndSend({ text, signal, socket, streamSid, voiceId, turnMetrics, turnState, isCurrent, startingSentCount, onFirstAudioSent })
   return { sentCount }
 }
 
-async function runChunkedTurn({ session, signal, socket, streamSid, voiceId, turnMetrics, turnState, callState, generationId, onControl, onFirstAudioSent, onFirstDelta, onFirstChunk }) {
+async function runChunkedTurn({ session, signal, socket, streamSid, voiceId, turnMetrics, turnState, callState, generationId, onControl, onFirstAudioSent, onFirstDelta, onFirstChunk, onFirstTtsRequest, onFirstTtsAudio }) {
   const isCurrent = () => isCurrentGeneration(callState, generationId)
   const queue = []
   let producerDone = false
@@ -165,7 +176,7 @@ async function runChunkedTurn({ session, signal, socket, streamSid, voiceId, tur
       if (!isCurrent()) break // boundary 3: ก่อน TTS request — stale ต้องไม่ markOnce(t5)/markTtsPending
 
       const chunk = queue.shift()
-      totalSent += await synthesizeAndSend({ text: chunk, signal, socket, streamSid, voiceId, turnMetrics, turnState, isCurrent, startingSentCount: totalSent, onFirstAudioSent })
+      totalSent += await synthesizeAndSend({ text: chunk, signal, socket, streamSid, voiceId, turnMetrics, turnState, isCurrent, startingSentCount: totalSent, onFirstAudioSent, onFirstTtsRequest, onFirstTtsAudio })
     }
   } catch (err) {
     if (!signal?.aborted) consumerError = err
