@@ -5,6 +5,7 @@ const { synthesizeSpeechStream } = require('../services/tts')
 const healthMonitor = require('../utils/healthMonitor')
 const { createCallState, endCall } = require('../utils/generationGuard')
 const { decideRollout } = require('../utils/rolloutBucket')
+const { createTurnMetrics, markOnce, computeDerivedMetrics } = require('../utils/turnMetrics')
 
 const MAX_CALL_DURATION_MS = (parseInt(process.env.MAX_CALL_DURATION_SECONDS) || 300) * 1000
 
@@ -357,6 +358,16 @@ function registerWebSocket(fastify) {
           const pipelineId = ++activePipelineId
           isSpeaking = true
 
+          // C1: per-turn latency instrumentation (ยังไม่มี chunked path ให้ path='chunked' จริง เพราะ rollout=0%)
+          const turnMetrics = createTurnMetrics({
+            callSid,
+            generationId: callState.generationId,
+            path: rollout?.useChunkedStreaming ? 'chunked' : 'legacy',
+            rolloutBucket: rollout?.bucket ?? null,
+            rolloutPercent: rollout?.percentAtStart ?? null,
+          })
+          markOnce(turnMetrics, 't1')
+
           ttsAbortController = new AbortController()
           const signal = ttsAbortController.signal
           let fullText = ''
@@ -380,6 +391,7 @@ function registerWebSocket(fastify) {
           try {
             // Use pre-warmed Claude response if available and applicable
             let aiText = null
+            markOnce(turnMetrics, 't2') // legacy: askClaudeStream yield ข้อความเต็มก้อนเดียว จึงไม่มี t3/t4 ที่มีความหมาย
             if (myPrewarm && isPrewarmUsable(myPrewarmText, transcript)) {
               console.log(`[Prewarm] Awaiting pre-warmed response for: "${transcript}"`)
               aiText = await myPrewarm
@@ -401,12 +413,15 @@ function registerWebSocket(fastify) {
               const cleanText = aiText.replace(/\[END_CALL\]/g, '').trim()
               if (cleanText) {
                 try {
+                  markOnce(turnMetrics, 't5')
                   for await (const chunk of synthesizeSpeechStream(cleanText, currentSession.campaign.voice_id, signal)) {
                     if (socket.readyState !== socket.OPEN || signal.aborted) break
+                    markOnce(turnMetrics, 't6')
                     // จุดวัด "ความเงียบจริง" ที่ลูกค้ารู้สึก — ต่างจาก [AI full] ที่รวมเวลาพูดทั้งประโยคเข้าไปด้วย
                     // (ประโยคยาวก็ใช้เวลาส่งครบนานกว่าเป็นธรรมชาติ ไม่ได้แปลว่าดีเลย์มากขึ้น) ต้องวัดจาก [STT] ถึง log นี้เท่านั้น
                     if (totalSent === 0) console.log('[TTS] First audio chunk sent')
                     socket.send(JSON.stringify({ event: 'media', streamSid, media: { payload: chunk.toString('base64') } }))
+                    markOnce(turnMetrics, 't7')
                     totalSent++
                   }
                 } catch (err) {
@@ -423,12 +438,15 @@ function registerWebSocket(fastify) {
               const followUp = 'มีอะไรสอบถามเพิ่มเติมไหมคะ'
               fullText = fullText.replace(/\[END_CALL\]/g, '').trim() + ' ' + followUp
               try {
+                markOnce(turnMetrics, 't5')
                 for await (const chunk of synthesizeSpeechStream(followUp, currentSession.campaign.voice_id, signal)) {
                   if (socket.readyState !== socket.OPEN || signal.aborted) break
+                  markOnce(turnMetrics, 't6')
                   // เผื่อ cleanText ว่างเปล่า (คำตอบ AI มีแค่ [END_CALL] ล้วนๆ) — ลูปหลักด้านบนไม่ได้ส่งอะไรเลย
                   // ทำให้นี่กลายเป็นก้อนเสียงแรกจริงของเทิร์นนี้ ต้อง log จุดนี้ด้วยกันพลาดข้อมูล
                   if (totalSent === 0) console.log('[TTS] First audio chunk sent')
                   socket.send(JSON.stringify({ event: 'media', streamSid, media: { payload: chunk.toString('base64') } }))
+                  markOnce(turnMetrics, 't7')
                   totalSent++
                 }
               } catch (err) {
@@ -456,6 +474,8 @@ function registerWebSocket(fastify) {
             currentSession.messages.push({ role: 'assistant', content: fullText })
             console.log(`[AI full] "${fullText}"`)
           }
+
+          console.log('[Metrics]', JSON.stringify({ ...turnMetrics, ...computeDerivedMetrics(turnMetrics) }))
 
           if (!signal?.aborted && isSpeaking && socket.readyState === socket.OPEN && totalSent > 0) {
             socket.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'ai_done' } }))
