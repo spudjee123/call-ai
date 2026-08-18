@@ -21,9 +21,9 @@ require.cache[ttsPath] = {
   },
 }
 
-const { runChunkedTurn } = require('../src/websocket/chunkedTurn')
+const { runChunkedTurn, speakFixedText } = require('../src/websocket/chunkedTurn')
 const { createTurnMetrics } = require('../src/utils/turnMetrics')
-const { createTurnState } = require('../src/utils/turnState')
+const { createTurnState, markAudioCommitted } = require('../src/utils/turnState')
 const { createCallState, bumpGeneration } = require('../src/utils/generationGuard')
 
 beforeEach(() => {
@@ -321,6 +321,70 @@ test('C3b-4/5) ElevenLabs audio กลับมาหลัง gen ถูก inv
   const result = await runChunkedTurn({ session: {}, signal: null, socket, streamSid: 'SS1', voiceId: 'v1', turnMetrics, turnState, callState, generationId })
   assert.equal(result.totalSent, 1) // มีแค่ก้อนแรกก่อน bump เท่านั้นที่ผ่าน guard
   assert.equal(socket.sent.length, 1)
+})
+
+// ---------------------------------------------------------------------------
+// Checkpoint C3c-2 — speakFixedText() ใช้สำหรับ follow-up question ตอน blocked end_call
+// ---------------------------------------------------------------------------
+
+test('C3c-1) end_call blocked ก่อนมี audio ใดๆ → follow-up พูดได้ปกติ ผ่าน GENERATING → TTS_PENDING → AUDIO_COMMITTED', async () => {
+  const { turnMetrics, turnState, callState, generationId } = makeMetricsAndState()
+  assert.equal(turnState.phase, 'GENERATING')
+  const socket = makeSocket()
+  state.ttsImpl = async function* () { yield Buffer.from('a') }
+  const result = await speakFixedText({ text: 'มีอะไรสอบถามเพิ่มเติมไหมคะ', signal: null, socket, streamSid: 'SS1', voiceId: 'v1', turnMetrics, turnState, callState, generationId, startingSentCount: 0 })
+  assert.equal(result.sentCount, 1)
+  assert.equal(turnState.phase, 'AUDIO_COMMITTED')
+  assert.equal(turnState.audioCommitted, true)
+  assert.equal(socket.sent.length, 1)
+})
+
+test('C3c-2) end_call blocked หลังมี audio ของข้อความหลักไปแล้ว (AUDIO_COMMITTED) → follow-up ต่อได้ แต่ state ต้องไม่ regress กลับ TTS_PENDING', async () => {
+  const { turnMetrics, turnState, callState, generationId } = makeMetricsAndState()
+  markAudioCommitted(turnState) // จำลองว่าข้อความหลักของ Claude ถูกพูด/commit ไปแล้วก่อนหน้านี้ในเทิร์นเดียวกัน
+  assert.equal(turnState.phase, 'AUDIO_COMMITTED')
+
+  const socket = makeSocket()
+  state.ttsImpl = async function* () { yield Buffer.from('a') }
+  const result = await speakFixedText({ text: 'มีอะไรสอบถามเพิ่มเติมไหมคะ', signal: null, socket, streamSid: 'SS1', voiceId: 'v1', turnMetrics, turnState, callState, generationId, startingSentCount: 3 })
+  assert.equal(result.sentCount, 1)
+  assert.equal(turnState.phase, 'AUDIO_COMMITTED', 'ห้าม regress กลับไป TTS_PENDING เด็ดขาด')
+  assert.equal(socket.sent.length, 1)
+})
+
+test('C3c-3) generation stale ไปแล้วก่อนเรียก speakFixedText เลย → ไม่เริ่ม TTS ใดๆ ทั้งสิ้น', async () => {
+  const { turnMetrics, turnState, callState, generationId } = makeMetricsAndState()
+  bumpGeneration(callState) // stale ไปแล้วตั้งแต่ก่อนเรียก
+  const socket = makeSocket()
+  let ttsCalled = false
+  state.ttsImpl = async function* () { ttsCalled = true; yield Buffer.from('a') }
+  const result = await speakFixedText({ text: 'มีอะไรสอบถามเพิ่มเติมไหมคะ', signal: null, socket, streamSid: 'SS1', voiceId: 'v1', turnMetrics, turnState, callState, generationId, startingSentCount: 0 })
+  assert.equal(result.sentCount, 0)
+  assert.equal(ttsCalled, false)
+  assert.equal(turnMetrics.t5, null)
+  assert.deepEqual(socket.sent, [])
+})
+
+test('C3c-4) generation stale กลาง TTS ของ follow-up → audio ที่เหลือไม่ถึง Twilio', async () => {
+  const { turnMetrics, turnState, callState, generationId } = makeMetricsAndState()
+  const socket = makeSocket()
+  state.ttsImpl = async function* () {
+    yield Buffer.from('a') // ก้อนแรกผ่านได้ตามปกติ
+    bumpGeneration(callState) // barge-in เกิดกลาง TTS ของ follow-up นี้เอง
+    yield Buffer.from('b') // ต้องถูกกันไว้
+  }
+  const result = await speakFixedText({ text: 'มีอะไรสอบถามเพิ่มเติมไหมคะ', signal: null, socket, streamSid: 'SS1', voiceId: 'v1', turnMetrics, turnState, callState, generationId, startingSentCount: 0 })
+  assert.equal(result.sentCount, 1)
+  assert.equal(socket.sent.length, 1)
+})
+
+test('C3c-5) startingSentCount > 0 (follow-up ต่อจากข้อความหลักที่พูดไปแล้ว) → ไม่นับเป็น "first audio chunk" ซ้ำอีกรอบ', async () => {
+  const { turnMetrics, turnState, callState, generationId } = makeMetricsAndState()
+  const socket = makeSocket()
+  state.ttsImpl = async function* () { yield Buffer.from('a') }
+  let onFirstCalls = 0
+  await speakFixedText({ text: 'follow up', signal: null, socket, streamSid: 'SS1', voiceId: 'v1', turnMetrics, turnState, callState, generationId, startingSentCount: 5, onFirstAudioSent: () => { onFirstCalls++ } })
+  assert.equal(onFirstCalls, 0, 'ไม่ใช่ audio chunk แรกของทั้งเทิร์น (มี 5 ก้อนก่อนหน้าจากข้อความหลักแล้ว) ไม่ควรเรียก onFirstAudioSent ซ้ำ')
 })
 
 test('stale callback ต้องไม่มีสิทธิ์แตะ metrics/state ของ generation อื่นเลย แม้จะเป็นแค่การ mark ไม่ใช่ side effect ที่มองเห็นได้จากภายนอก', async () => {

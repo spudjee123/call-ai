@@ -7,7 +7,7 @@ const { createCallState, bumpGeneration, endCall } = require('../utils/generatio
 const { decideRollout } = require('../utils/rolloutBucket')
 const { createTurnMetrics, markOnce, computeDerivedMetrics } = require('../utils/turnMetrics')
 const { createTurnState, markTtsPending, markAudioCommitted, markDone } = require('../utils/turnState')
-const { runChunkedTurn } = require('./chunkedTurn')
+const { runChunkedTurn, speakFixedText } = require('./chunkedTurn')
 
 const MAX_CALL_DURATION_MS = (parseInt(process.env.MAX_CALL_DURATION_SECONDS) || 300) * 1000
 
@@ -415,6 +415,35 @@ function registerWebSocket(fastify) {
               })
               fullText = result.fullText
               totalSent = result.totalSent
+
+              // C3c: parity กับ legacy's shouldBlockEndCall guard — shouldBlockEndCall() เป็น policy ล้วนๆ
+              // ไม่ขึ้นกับ transport ([END_CALL] marker vs end_call tool) จึงใช้ฟังก์ชันเดิมได้ตรงๆ ไม่ต้องแก้
+              if (endCallRequested && shouldBlockEndCall(currentSession, fullText)) {
+                console.log('[Guard] Premature END_CALL blocked — injecting follow-up question (chunked)')
+                const followUp = 'มีอะไรสอบถามเพิ่มเติมไหมคะ'
+                fullText = fullText.trim() + ' ' + followUp
+                endCallRequested = false // ยกเลิก hangup ของเทิร์นนี้ — ให้ shared tail ด้านล่างไม่เห็นสัญญาณ end_call แล้ว
+                try {
+                  const followUpResult = await speakFixedText({
+                    text: followUp,
+                    signal,
+                    socket,
+                    streamSid,
+                    voiceId: currentSession.campaign.voice_id,
+                    turnMetrics,
+                    turnState,
+                    callState,
+                    generationId,
+                    startingSentCount: totalSent,
+                  })
+                  totalSent += followUpResult.sentCount
+                } catch (err) {
+                  if (err.code !== 'ERR_CANCELED' && err.name !== 'CanceledError') {
+                    console.error('[Guard TTS error]', err.message)
+                    healthMonitor.reportError('tts', err.message)
+                  }
+                }
+              }
             } catch (err) {
               console.error('[AI/TTS error]', err.message)
               healthMonitor.reportError('ai_tts', err.message)
@@ -548,6 +577,9 @@ function registerWebSocket(fastify) {
           if (!callActive || isSpeaking || sttProcessing || bargeInCooldown) return
           clearSilenceTimer()
           silencePromptCount = 0
+          // C3c: prewarm ยิง askClaudeStream เดิมเสมอ ไม่เกี่ยวกับ chunked path เลย — สายที่ freeze เป็น chunked
+          // bucket ไม่ควรยิง Claude request ที่ไม่มีทางถูกใช้นี้ (เสียเงิน/เพิ่ม concurrency โดยเปล่าประโยชน์)
+          if (rollout?.useChunkedStreaming) return
           const session = callSessions.get(callSid)
           if (session) startPrewarm(session, interimText)
         })

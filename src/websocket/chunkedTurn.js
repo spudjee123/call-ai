@@ -38,6 +38,47 @@ const { markOnce } = require('../utils/turnMetrics')
 const { markTtsPending, markAudioCommitted } = require('../utils/turnState')
 const { isCurrentGeneration } = require('../utils/generationGuard')
 
+// Checkpoint C3c — logic ของ "พูด text หนึ่งก้อนผ่าน TTS พร้อม guard เต็มชุด" ถูกแยกมาไว้ที่เดียว ใช้ร่วมกัน
+// ทั้งจาก consumer loop ปกติ (ทีละ chunk จาก Claude) และจาก speakFixedText() (ข้อความคงที่ เช่น follow-up
+// question ตอน blocked end_call) — กัน guard สองชุดที่ทำหน้าที่เดียวกัน drift ออกจากกันในอนาคต
+//
+// startingSentCount: จำนวน audio chunk ที่ส่งไปแล้วของทั้งเทิร์น (ก่อนเรียกฟังก์ชันนี้) — ใช้ตัดสิน "นี่คือก้อน
+// แรกของทั้งเทิร์นจริงไหม" (สำหรับ [TTS] First audio chunk sent log และ onFirstAudioSent) ให้ตรงกับความหมาย
+// เดียวกับที่ legacy ใช้ totalSent ตัวเดียวร่วมกันระหว่าง primary block กับ guard/follow-up block
+async function synthesizeAndSend({ text, signal, socket, streamSid, voiceId, turnMetrics, turnState, isCurrent, startingSentCount, onFirstAudioSent }) {
+  if (!isCurrent() || signal?.aborted) return 0
+
+  markOnce(turnMetrics, 't5')
+  markTtsPending(turnState) // no-op ถ้า phase ไม่ใช่ GENERATING แล้ว (เช่น AUDIO_COMMITTED ไปแล้วจากข้อความก่อนหน้าในเทิร์นเดียวกัน) — monotonic โดย turnState.js เอง ไม่มีทาง regress
+
+  let sentCount = 0
+  for await (const audioChunk of synthesizeSpeechStream(text, voiceId, signal)) {
+    // boundary 4+5 รวมกัน (ElevenLabs audio arrival + ก่อน socket.send) — ไม่มี async gap คั่นสองจุดนี้จริง
+    // นี่คือ "ด่านสุดท้าย" ที่สำคัญที่สุด: ต้องเช็คก่อนแม้แต่ markOnce(t6)/markAudioCommitted ไม่ใช่แค่ก่อน send
+    if (!isCurrent()) break
+    if (signal?.aborted) break
+    if (socket.readyState !== socket.OPEN) break
+
+    markOnce(turnMetrics, 't6')
+    if (startingSentCount + sentCount === 0) console.log('[TTS] First audio chunk sent')
+    socket.send(JSON.stringify({ event: 'media', streamSid, media: { payload: audioChunk.toString('base64') } }))
+    markOnce(turnMetrics, 't7')
+    markAudioCommitted(turnState)
+    if (startingSentCount + sentCount === 0) onFirstAudioSent?.()
+    sentCount++
+  }
+  return sentCount
+}
+
+// พูดข้อความคงที่หนึ่งก้อน (ไม่ผ่าน Claude/chunker) ด้วย guard เดียวกับ consumer loop ปกติทุกประการ — ใช้กับ
+// follow-up question ตอน shouldBlockEndCall() บล็อกการวางสายก่อนเวลาอันควร (audioStream.js เป็นเจ้าของ policy
+// ว่าเมื่อไหร่ควรเรียก ฟังก์ชันนี้แค่รับผิดชอบพูดออกไปอย่างปลอดภัยเท่านั้น)
+async function speakFixedText({ text, signal, socket, streamSid, voiceId, turnMetrics, turnState, callState, generationId, onFirstAudioSent, startingSentCount = 0 }) {
+  const isCurrent = () => isCurrentGeneration(callState, generationId)
+  const sentCount = await synthesizeAndSend({ text, signal, socket, streamSid, voiceId, turnMetrics, turnState, isCurrent, startingSentCount, onFirstAudioSent })
+  return { sentCount }
+}
+
 async function runChunkedTurn({ session, signal, socket, streamSid, voiceId, turnMetrics, turnState, callState, generationId, onControl, onFirstAudioSent }) {
   const isCurrent = () => isCurrentGeneration(callState, generationId)
   const queue = []
@@ -118,24 +159,7 @@ async function runChunkedTurn({ session, signal, socket, streamSid, voiceId, tur
       if (!isCurrent()) break // boundary 3: ก่อน TTS request — stale ต้องไม่ markOnce(t5)/markTtsPending
 
       const chunk = queue.shift()
-      markOnce(turnMetrics, 't5')
-      markTtsPending(turnState)
-
-      for await (const audioChunk of synthesizeSpeechStream(chunk, voiceId, signal)) {
-        // boundary 4+5 รวมกัน (ElevenLabs audio arrival + ก่อน socket.send) — ไม่มี async gap คั่นสองจุดนี้จริง
-        // นี่คือ "ด่านสุดท้าย" ที่สำคัญที่สุด: ต้องเช็คก่อนแม้แต่ markOnce(t6)/markAudioCommitted ไม่ใช่แค่ก่อน send
-        if (!isCurrent()) break
-        if (signal?.aborted) break
-        if (socket.readyState !== socket.OPEN) break
-
-        markOnce(turnMetrics, 't6')
-        if (totalSent === 0) console.log('[TTS] First audio chunk sent')
-        socket.send(JSON.stringify({ event: 'media', streamSid, media: { payload: audioChunk.toString('base64') } }))
-        markOnce(turnMetrics, 't7')
-        markAudioCommitted(turnState)
-        if (totalSent === 0) onFirstAudioSent?.()
-        totalSent++
-      }
+      totalSent += await synthesizeAndSend({ text: chunk, signal, socket, streamSid, voiceId, turnMetrics, turnState, isCurrent, startingSentCount: totalSent, onFirstAudioSent })
     }
   } catch (err) {
     if (!signal?.aborted) consumerError = err
@@ -149,4 +173,4 @@ async function runChunkedTurn({ session, signal, socket, streamSid, voiceId, tur
   return { totalSent, fullText: fullTextAccum }
 }
 
-module.exports = { runChunkedTurn }
+module.exports = { runChunkedTurn, speakFixedText }
