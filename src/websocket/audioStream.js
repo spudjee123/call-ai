@@ -7,6 +7,7 @@ const { createCallState, bumpGeneration, endCall } = require('../utils/generatio
 const { decideRollout } = require('../utils/rolloutBucket')
 const { createTurnMetrics, markOnce, computeDerivedMetrics } = require('../utils/turnMetrics')
 const { createTurnState, markTtsPending, markAudioCommitted, markDone } = require('../utils/turnState')
+const { runChunkedTurn } = require('./chunkedTurn')
 
 const MAX_CALL_DURATION_MS = (parseInt(process.env.MAX_CALL_DURATION_SECONDS) || 300) * 1000
 
@@ -379,6 +380,7 @@ function registerWebSocket(fastify) {
           const signal = ttsAbortController.signal
           let fullText = ''
           let totalSent = 0
+          let endCallRequested = false // C3a: signaled by chunkedTurn.js's onControl (end_call tool) — separate channel from legacy's [END_CALL] text marker
 
           // Safety: ถ้า Claude/TTS ค้างนานผิดปกติ ให้ unlock อัตโนมัติ
           // เช็ค pipelineId ด้วย — ถ้า pipeline นี้ถูก barge-in ทิ้งไปแล้วและมี pipeline ใหม่เริ่มทำงานอยู่
@@ -395,6 +397,34 @@ function registerWebSocket(fastify) {
           const myPrewarm = prewarmPromise
           const myPrewarmText = prewarmStartText
 
+          // C3a: ตัดสิน branch ก่อน Claude side effect แรกเสมอ — ห้ามมี code เรียก Claude ก่อนจุดนี้ไม่ว่า path ไหน
+          // rollout ยัง 0% เสมอตอนนี้ จึงยังไม่มีสายไหนเข้า branch นี้จริงในโปรดักชัน (ดู C0/decideRollout)
+          if (rollout.useChunkedStreaming) {
+            try {
+              const result = await runChunkedTurn({
+                session: currentSession,
+                signal,
+                socket,
+                streamSid,
+                voiceId: currentSession.campaign.voice_id,
+                turnMetrics,
+                turnState,
+                onControl: (control) => { if (control?.type === 'end_call') endCallRequested = true },
+              })
+              fullText = result.fullText
+              totalSent = result.totalSent
+            } catch (err) {
+              console.error('[AI/TTS error]', err.message)
+              healthMonitor.reportError('ai_tts', err.message)
+            } finally {
+              clearTimeout(processingGuard)
+              if (prewarmPromise === myPrewarm) clearPrewarm()
+              if (activePipelineId === pipelineId) {
+                ttsAbortController = null
+                sttProcessing = false
+              }
+            }
+          } else {
           try {
             // Use pre-warmed Claude response if available and applicable
             let aiText = null
@@ -480,6 +510,7 @@ function registerWebSocket(fastify) {
               sttProcessing = false
             }
           }
+          } // end legacy else branch (C3a)
 
           if (fullText) {
             currentSession.messages.push({ role: 'assistant', content: fullText })
@@ -504,7 +535,7 @@ function registerWebSocket(fastify) {
             }
           }, playbackMs)
 
-          if (fullText.includes('[END_CALL]')) {
+          if (fullText.includes('[END_CALL]') || endCallRequested) {
             pendingEndCall = true
             currentSession.hangupReason = 'ai_ended'
             // Fallback: ปิดสายถ้า mark ไม่มาภายในเวลาที่คาดไว้
