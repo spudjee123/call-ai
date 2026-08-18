@@ -11,9 +11,19 @@
 //   audioStream.js  — rollout decision, generationId, turnState creation, barge-in lifecycle,
 //                      markDone, end-call policy, legacy-vs-chunked branch selection
 //
-// No isCurrentGeneration() guard here yet — that's Checkpoint C3b, added at the same boundaries
-// this file already marks (Claude delta / chunker output / before TTS / TTS audio / before Twilio
-// send). This file is not called from the live path yet (rollout stays 0% through C3a).
+// Checkpoint C3b — isCurrentGeneration() guards at 5 boundaries, locked before writing:
+//   1. Claude delta received        (producer, top of for-await body)
+//   2. chunker output / enqueue     (producer, right before enqueue())
+//   3. before TTS request           (consumer, right before synthesizeSpeechStream call)
+//   4+5. ElevenLabs audio arrival + before Twilio send — combined into one check, since nothing
+//        async separates "audio chunk arrived" from "about to send" in this loop body
+// A stale check must block BEFORE any markOnce()/turnState transition too, not just before the
+// side effect (send/enqueue) — a Gen 12 callback arriving after Gen 13 started must not touch t6,
+// t7, or turnState at all, not merely be denied socket.send(). Guard-then-mark-then-act everywhere.
+//
+// This is defense in depth on top of `signal` — in the real call path, bumpGeneration() always runs
+// immediately before abort() (barge-in's invalidate-before-abort ordering, C2), so in practice both
+// become stale together. isCurrentGeneration() covers the edge cases signal.aborted alone would miss.
 //
 // Error contract: does NOT swallow errors — a real Claude or TTS error rejects the promise this
 // function returns, left for the caller (audioStream.js) to catch/log/report, same as the legacy
@@ -26,8 +36,10 @@ const { synthesizeSpeechStream } = require('../services/tts')
 const { findChunkBoundary } = require('../utils/speechChunker')
 const { markOnce } = require('../utils/turnMetrics')
 const { markTtsPending, markAudioCommitted } = require('../utils/turnState')
+const { isCurrentGeneration } = require('../utils/generationGuard')
 
-async function runChunkedTurn({ session, signal, socket, streamSid, voiceId, turnMetrics, turnState, onControl, onFirstAudioSent }) {
+async function runChunkedTurn({ session, signal, socket, streamSid, voiceId, turnMetrics, turnState, callState, generationId, onControl, onFirstAudioSent }) {
+  const isCurrent = () => isCurrentGeneration(callState, generationId)
   const queue = []
   let producerDone = false
   let producerError = null
@@ -53,6 +65,7 @@ async function runChunkedTurn({ session, signal, socket, streamSid, voiceId, tur
     try {
       for await (const delta of askClaudeStreamChunked(session, signal, onControl)) {
         if (signal?.aborted) break
+        if (!isCurrent()) break // boundary 1: Claude delta — stale generation ต้องไม่แม้แต่ markOnce(t3)
         if (!delta) continue // empty delta → ไม่มีอะไรให้พูด ข้ามไปเฉยๆ
 
         markOnce(turnMetrics, 't3')
@@ -61,10 +74,16 @@ async function runChunkedTurn({ session, signal, socket, streamSid, voiceId, tur
         const wasEmpty = buffer.length === 0
         buffer += delta
         if (wasEmpty) segmentStartMs = performance.now() // elapsedMs นับจากตัวอักษรแรกของ buffer นี้ ตามสัญญาของ speechChunker
-        const elapsedMs = performance.now() - segmentStartMs
 
-        const result = findChunkBoundary(buffer, elapsedMs)
-        if (result) {
+        // แยกไว้ต่างหากจาก loop ด้านบนที่รับ delta ทีละก้อน: หนึ่ง delta อาจมีมากกว่าหนึ่งประโยคสมบูรณ์ปนกันมาได้
+        // (ไม่บ่อยแต่เกิดได้จริง) — findChunkBoundary คืนทีละจุดตัดตามสัญญาของมันเอง ต้องวนเรียกจนกว่าจะ null
+        // เพื่อ drain ทุกก้อนที่พร้อมพูดออกจาก buffer นี้ให้หมดก่อนรอ delta ถัดไป ไม่งั้นประโยคที่สองจะติดอยู่ในนี้
+        // เฉยๆ โดยไม่มีเหตุผล จนกว่า delta ถัดไปมาถึง (หรือ stream จบ) ทั้งที่พร้อมพูดตั้งแต่ตอนนี้แล้ว
+        while (true) {
+          const elapsedMs = performance.now() - segmentStartMs
+          const result = findChunkBoundary(buffer, elapsedMs)
+          if (!result) break
+          if (!isCurrent()) break // boundary 2: chunker output/enqueue — stale ต้องไม่ markOnce(t4)/enqueue
           markOnce(turnMetrics, 't4')
           enqueue(result.chunk)
           buffer = result.remainder
@@ -76,7 +95,7 @@ async function runChunkedTurn({ session, signal, socket, streamSid, voiceId, tur
       // Claude stream จบแล้ว (ปกติ หรือเพราะเรียก end_call tool) — flush ก้อนสุดท้ายที่ค้างอยู่ แม้ไม่มี punctuation
       // ปิดท้าย (ล็อกไว้ตั้งแต่ B1/B4: ประโยคจริงอาจจบโดยไม่มี . ? ! ตัวสุดท้ายเลย)
       const finalText = buffer.trim()
-      if (finalText && !signal?.aborted) {
+      if (finalText && !signal?.aborted && isCurrent()) {
         markOnce(turnMetrics, 't4')
         enqueue(finalText)
       }
@@ -96,13 +115,19 @@ async function runChunkedTurn({ session, signal, socket, streamSid, voiceId, tur
       await waitForWork()
       if (signal?.aborted) break
       if (queue.length === 0) break // waitForWork รับประกันว่าถ้าไม่มีงาน แปลว่า producer จบแล้วแน่นอน
+      if (!isCurrent()) break // boundary 3: ก่อน TTS request — stale ต้องไม่ markOnce(t5)/markTtsPending
 
       const chunk = queue.shift()
       markOnce(turnMetrics, 't5')
       markTtsPending(turnState)
 
       for await (const audioChunk of synthesizeSpeechStream(chunk, voiceId, signal)) {
-        if (socket.readyState !== socket.OPEN || signal?.aborted) break
+        // boundary 4+5 รวมกัน (ElevenLabs audio arrival + ก่อน socket.send) — ไม่มี async gap คั่นสองจุดนี้จริง
+        // นี่คือ "ด่านสุดท้าย" ที่สำคัญที่สุด: ต้องเช็คก่อนแม้แต่ markOnce(t6)/markAudioCommitted ไม่ใช่แค่ก่อน send
+        if (!isCurrent()) break
+        if (signal?.aborted) break
+        if (socket.readyState !== socket.OPEN) break
+
         markOnce(turnMetrics, 't6')
         if (totalSent === 0) console.log('[TTS] First audio chunk sent')
         socket.send(JSON.stringify({ event: 'media', streamSid, media: { payload: audioChunk.toString('base64') } }))

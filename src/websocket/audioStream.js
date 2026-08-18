@@ -409,6 +409,8 @@ function registerWebSocket(fastify) {
                 voiceId: currentSession.campaign.voice_id,
                 turnMetrics,
                 turnState,
+                callState,
+                generationId,
                 onControl: (control) => { if (control?.type === 'end_call') endCallRequested = true },
               })
               fullText = result.fullText
