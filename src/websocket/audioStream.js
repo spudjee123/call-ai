@@ -3,8 +3,14 @@ const { transcribeStream } = require('../services/googleSTT')
 const { askClaude, askClaudeStream } = require('../services/claude')
 const { synthesizeSpeechStream } = require('../services/tts')
 const healthMonitor = require('../utils/healthMonitor')
+const { createCallState, endCall } = require('../utils/generationGuard')
+const { decideRollout } = require('../utils/rolloutBucket')
 
 const MAX_CALL_DURATION_MS = (parseInt(process.env.MAX_CALL_DURATION_SECONDS) || 300) * 1000
+
+// Checkpoint C0: หาร้อยเปอร์เซ็นต์ chunked-streaming path ใหม่ตายตัวที่ 0% ก่อน — ยังไม่ให้สายไหนเข้าเลย
+// จะย้ายไปอ่านค่าจาก Google Sheets ใน Checkpoint C5 (พร้อม cache + last-known-good fallback)
+const CHUNKED_ROLLOUT_PERCENT = 0
 
 function shouldBlockEndCall(session, aiResponse) {
   const userMessages = session.messages.filter(m => m.role === 'user')
@@ -42,6 +48,11 @@ function registerWebSocket(fastify) {
     let prewarmStartText = null  // interim text that triggered prewarm
     let prewarmAbort = null      // AbortController for prewarm call
     let prewarmRetriggerAt = 0   // เวลาต่ำสุดที่อนุญาตเดาใหม่รอบถัดไป (throttle กันยิง Claude ถี่เกิน)
+
+    // Checkpoint C0: safety infrastructure ของ B.5 ผูกไว้กับสายนี้แล้ว แต่ยังไม่มีจุดไหนอ่าน/ใช้งานจริง
+    // (ไม่มี chunked path ให้ guard ในไฟล์นี้เลยตอนนี้) — legacy path ทั้งหมดด้านล่างยังทำงานเหมือนเดิมทุกบรรทัด
+    const callState = createCallState()
+    let rollout = null // freeze ตอน 'start' event เพราะ callSid อาจยังไม่ resolve ตอน connection เปิด
 
     console.log(`[WS] Connected callSid=${callSid}`)
 
@@ -284,6 +295,10 @@ function registerWebSocket(fastify) {
         console.log(`[WS] callSid resolved: ${callSid}`)
         const session = callSessions.get(callSid)
         if (!session) return
+
+        // Freeze ครั้งเดียวต่อสาย ไม่คำนวณใหม่ทุกเทิร์น — ที่ 0% ปัจจุบัน useChunkedStreaming จะเป็น false เสมอ
+        rollout = decideRollout(callSid, CHUNKED_ROLLOUT_PERCENT)
+        console.log(`[Rollout] callSid=${callSid} bucket=${rollout.bucket} percent=${rollout.percentAtStart} chunked=${rollout.useChunkedStreaming}`)
 
         console.log(`[WS] Stream started: ${streamSid}`)
 
@@ -547,6 +562,7 @@ function registerWebSocket(fastify) {
         clearSilenceTimer()
         clearDurationTimer()
         clearPrewarm()
+        endCall(callState)
         if (sttStream) { sttStream.end(); sttStream = null }
       }
     })
@@ -557,6 +573,7 @@ function registerWebSocket(fastify) {
       clearPrewarm()
       clearSilenceTimer()
       clearDurationTimer()
+      endCall(callState)
       if (sttStream) { sttStream.end(); sttStream = null }
       // ถ้ายังไม่มีเหตุผลปิดสายถูก tag ไว้เลย (ไม่ใช่ AI ปิดปกติ/หมดเวลาเงียบ) แปลว่าอีกฝั่งวางสายเอง
       const endedSession = callSessions.get(callSid)
