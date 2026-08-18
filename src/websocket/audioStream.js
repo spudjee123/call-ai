@@ -9,13 +9,17 @@ const { createTurnMetrics, markOnce, computeDerivedMetrics } = require('../utils
 const { createTurnState, markTtsPending, markAudioCommitted, markDone, claimFallback } = require('../utils/turnState')
 const { runChunkedTurn, speakFixedText } = require('./chunkedTurn')
 const { runAttemptWithWatchdog } = require('../utils/attemptWithWatchdog')
+const { createRolloutConfig } = require('../utils/rolloutConfig')
 const { performance } = require('perf_hooks')
 
 const MAX_CALL_DURATION_MS = (parseInt(process.env.MAX_CALL_DURATION_SECONDS) || 300) * 1000
 
-// Checkpoint C0: หาร้อยเปอร์เซ็นต์ chunked-streaming path ใหม่ตายตัวที่ 0% ก่อน — ยังไม่ให้สายไหนเข้าเลย
-// จะย้ายไปอ่านค่าจาก Google Sheets ใน Checkpoint C5 (พร้อม cache + last-known-good fallback)
-const CHUNKED_ROLLOUT_PERCENT = 0
+// Checkpoint C5: % rollout ของ chunked-streaming path มาจาก Google Sheets แล้ว (แท็บ "Streaming Config")
+// ผ่าน background polling ของตัวเอง ไม่ใช่ hardcoded คงที่แบบ C0 อีกต่อไป — start() ครั้งเดียวตอน module load
+// (เท่ากับตอน process bootstrap เพราะไฟล์นี้ถูก require ครั้งเดียวตอนเริ่ม server) ให้เริ่ม poll ทันที ไม่ต้องรอ
+// สายแรกเข้ามาก่อนถึงจะ trigger fetch ครั้งแรก — cold start ก่อน fetch สำเร็จครั้งแรกยังคง 0% เสมอ (ปลอดภัยไว้ก่อน)
+const rolloutConfig = createRolloutConfig()
+rolloutConfig.start()
 
 // Checkpoint C4b — เวลาสูงสุดที่ยอมรอ Claude ส่ง delta แรกของ chunked path มา ก่อนจะเลิกรอแล้ว fallback ไป
 // legacy แทน ตั้งไว้เผื่อเหนือ TTFT ปกติของ Claude พอสมควร (ปกติต่ำกว่า 1-2s มาก) แต่ไม่นานจนลูกค้ารอเงียบเกินไป
@@ -370,8 +374,9 @@ function registerWebSocket(fastify) {
         const session = callSessions.get(callSid)
         if (!session) return
 
-        // Freeze ครั้งเดียวต่อสาย ไม่คำนวณใหม่ทุกเทิร์น — ที่ 0% ปัจจุบัน useChunkedStreaming จะเป็น false เสมอ
-        rollout = decideRollout(callSid, CHUNKED_ROLLOUT_PERCENT)
+        // Freeze ครั้งเดียวต่อสาย ไม่คำนวณใหม่ทุกเทิร์น — อ่าน % ปัจจุบันจาก memory cache (rolloutConfig.js)
+        // แค่ตอนนี้จุดเดียว ไม่อ่านซ้ำอีกเลยตลอดสาย แม้ % ใน Sheets จะเปลี่ยนกลางสายก็ไม่กระทบสายที่ freeze ไปแล้ว
+        rollout = decideRollout(callSid, rolloutConfig.getCurrentRolloutPercent())
         console.log(`[Rollout] callSid=${callSid} bucket=${rollout.bucket} percent=${rollout.percentAtStart} chunked=${rollout.useChunkedStreaming}`)
 
         console.log(`[WS] Stream started: ${streamSid}`)

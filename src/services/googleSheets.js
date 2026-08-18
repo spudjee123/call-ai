@@ -11,7 +11,8 @@ const SHEETS = {
   TEMPLATES: 'SMS Templates',
   BLOCKLIST: 'Blocklist',
   SENDER_NAMES: 'Sender Names',
-  TWILIO_NUMBERS: 'Twilio Numbers'
+  TWILIO_NUMBERS: 'Twilio Numbers',
+  STREAMING_CONFIG: 'Streaming Config'
 }
 
 let sheets = null
@@ -191,6 +192,17 @@ async function appendRowsByFields(sheetName, fieldsArray) {
 async function getBlocklistRows() {
   try {
     return await getRows(SHEETS.BLOCKLIST)
+  } catch (err) {
+    return []
+  }
+}
+
+// C5 — ชีต "Streaming Config" เป็น key/value config tab (คอลัมน์ key, value) สำหรับ chunked-streaming rollout
+// เป็นฟีเจอร์ใหม่เหมือนกัน ผู้ใช้อาจยังไม่ได้สร้างแท็บนี้ — ให้ rolloutConfig.js ตีความ [] ว่า "อ่านค่าไม่ได้"
+// (last-known-good/cold-start 0% แล้วแต่กรณี) ไม่ใช่ throw ทำให้ระบบสายเข้า/ออกอื่นพังไปด้วย
+async function getStreamingConfigRows() {
+  try {
+    return await getRows(SHEETS.STREAMING_CONFIG)
   } catch (err) {
     return []
   }
@@ -507,7 +519,13 @@ const sheetsService = {
         interested: dayBuckets.map(b => b.interested),
       },
     }
-  }
+  },
+
+  // C5 — key/value rows จากแท็บ "Streaming Config" (เช่น { key: 'rollout_percent', value: '5' }) ใช้โดย
+  // rolloutConfig.js เท่านั้น — คืน [] ถ้ายังไม่มีแท็บนี้ ไม่ throw
+  async getStreamingConfig() {
+    return getStreamingConfigRows()
+  },
 }
 
 // isRetryableSheetsError/withRetry exported แยกจาก sheetsService ตั้งใจ — ไม่ใช่ API ที่ route อื่นควรเรียกใช้ตรงๆ
