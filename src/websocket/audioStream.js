@@ -3,9 +3,10 @@ const { transcribeStream } = require('../services/googleSTT')
 const { askClaude, askClaudeStream } = require('../services/claude')
 const { synthesizeSpeechStream } = require('../services/tts')
 const healthMonitor = require('../utils/healthMonitor')
-const { createCallState, endCall } = require('../utils/generationGuard')
+const { createCallState, bumpGeneration, endCall } = require('../utils/generationGuard')
 const { decideRollout } = require('../utils/rolloutBucket')
 const { createTurnMetrics, markOnce, computeDerivedMetrics } = require('../utils/turnMetrics')
+const { createTurnState, markTtsPending, markAudioCommitted, markDone } = require('../utils/turnState')
 
 const MAX_CALL_DURATION_MS = (parseInt(process.env.MAX_CALL_DURATION_SECONDS) || 300) * 1000
 
@@ -224,6 +225,7 @@ function registerWebSocket(fastify) {
     function bargeIn() {
       if (!isSpeaking) return
       console.log('[Barge-in] Customer interrupted — stopping AI audio')
+      bumpGeneration(callState) // C2: invalidate ก่อนทุกอย่าง — ยัง observational, ไม่ได้ใช้ gate การ abort จริงที่อยู่ถัดไป
       clearSilenceTimer()
       silencePromptCount = 0
       clearPrewarm()
@@ -358,10 +360,15 @@ function registerWebSocket(fastify) {
           const pipelineId = ++activePipelineId
           isSpeaking = true
 
+          // C2: sync generationId/turnState กับ turn lifecycle จริง — ยัง observational เท่านั้น
+          // (ไม่มี isCurrentGeneration gate ใน legacy path ตอนนี้ — activePipelineId/signal.aborted เดิมยังคุม cancellation ทั้งหมด)
+          const generationId = bumpGeneration(callState)
+          const turnState = createTurnState(generationId)
+
           // C1: per-turn latency instrumentation (ยังไม่มี chunked path ให้ path='chunked' จริง เพราะ rollout=0%)
           const turnMetrics = createTurnMetrics({
             callSid,
-            generationId: callState.generationId,
+            generationId,
             path: rollout?.useChunkedStreaming ? 'chunked' : 'legacy',
             rolloutBucket: rollout?.bucket ?? null,
             rolloutPercent: rollout?.percentAtStart ?? null,
@@ -414,6 +421,7 @@ function registerWebSocket(fastify) {
               if (cleanText) {
                 try {
                   markOnce(turnMetrics, 't5')
+                  markTtsPending(turnState)
                   for await (const chunk of synthesizeSpeechStream(cleanText, currentSession.campaign.voice_id, signal)) {
                     if (socket.readyState !== socket.OPEN || signal.aborted) break
                     markOnce(turnMetrics, 't6')
@@ -422,6 +430,7 @@ function registerWebSocket(fastify) {
                     if (totalSent === 0) console.log('[TTS] First audio chunk sent')
                     socket.send(JSON.stringify({ event: 'media', streamSid, media: { payload: chunk.toString('base64') } }))
                     markOnce(turnMetrics, 't7')
+                    markAudioCommitted(turnState) // อยู่หลัง signal.aborted/readyState check (legacy staleness ของลูปนี้) และหลัง socket.send() จริงเท่านั้น
                     totalSent++
                   }
                 } catch (err) {
@@ -439,6 +448,7 @@ function registerWebSocket(fastify) {
               fullText = fullText.replace(/\[END_CALL\]/g, '').trim() + ' ' + followUp
               try {
                 markOnce(turnMetrics, 't5')
+                markTtsPending(turnState)
                 for await (const chunk of synthesizeSpeechStream(followUp, currentSession.campaign.voice_id, signal)) {
                   if (socket.readyState !== socket.OPEN || signal.aborted) break
                   markOnce(turnMetrics, 't6')
@@ -447,6 +457,7 @@ function registerWebSocket(fastify) {
                   if (totalSent === 0) console.log('[TTS] First audio chunk sent')
                   socket.send(JSON.stringify({ event: 'media', streamSid, media: { payload: chunk.toString('base64') } }))
                   markOnce(turnMetrics, 't7')
+                  markAudioCommitted(turnState) // อยู่หลัง signal.aborted/readyState check (legacy staleness ของลูปนี้) และหลัง socket.send() จริงเท่านั้น
                   totalSent++
                 }
               } catch (err) {
@@ -475,6 +486,7 @@ function registerWebSocket(fastify) {
             console.log(`[AI full] "${fullText}"`)
           }
 
+          markDone(turnState) // ทุก pre-terminal phase ไปจบที่ DONE ได้ตรงๆ (turnState.js ไม่ guard transition นี้) — ครอบคลุมทุกทางจบของ legacy turn
           console.log('[Metrics]', JSON.stringify({ ...turnMetrics, ...computeDerivedMetrics(turnMetrics) }))
 
           if (!signal?.aborted && isSpeaking && socket.readyState === socket.OPEN && totalSent > 0) {
