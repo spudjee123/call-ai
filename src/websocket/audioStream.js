@@ -21,6 +21,11 @@ const CHUNKED_ROLLOUT_PERCENT = 0
 // legacy แทน ตั้งไว้เผื่อเหนือ TTFT ปกติของ Claude พอสมควร (ปกติต่ำกว่า 1-2s มาก) แต่ไม่นานจนลูกค้ารอเงียบเกินไป
 const CLAUDE_FIRST_DELTA_TIMEOUT_MS = 3000
 
+// Watchdog B — เวลาสูงสุดที่ยอมรอ "safe chunk" ก้อนแรกจาก speechChunker หลังจาก delta แรกมาถึงแล้ว (t3→t4)
+// ต้องเผื่อ margin เหนือ speechChunker เอง (HARD_MAX_MS=800 ในนั้น) พอสมควร ไม่งั้น watchdog ภายนอกจะฆ่า turn
+// ก่อนที่ chunker จะได้โอกาสทำ fallback boundary ของตัวเองครบตามสัญญา — เผื่อ margin ~2.5 เท่า
+const CHUNK_READY_TIMEOUT_MS = 2000
+
 function shouldBlockEndCall(session, aiResponse) {
   const userMessages = session.messages.filter(m => m.role === 'user')
   const lastUserMsg = userMessages.at(-1)?.content ?? ''
@@ -451,14 +456,16 @@ function registerWebSocket(fastify) {
           // rollout ยัง 0% เสมอตอนนี้ จึงยังไม่มีสายไหนเข้า branch นี้จริงในโปรดักชัน (ดู C0/decideRollout)
           if (rollout.useChunkedStreaming) {
             try {
-              // C4b: race runChunkedTurn ต่อ Claude-first-delta watchdog ผ่าน child AbortController ที่ compose
-              // มาจาก outer signal (barge-in) — barge-in ยังฆ่าทั้งคู่ได้เสมอ แต่ watchdog ฆ่าได้แค่ chunked attempt
-              // นี้เท่านั้น ไม่แตะ outer signal เลย เพื่อให้ fallback ด้านล่าง (ที่ใช้ outer signal) ยังทำงานได้จริง
+              // C4b: race runChunkedTurn ต่อ watchdog สองวงเรียงกัน (Watchdog A → B) ผ่าน child AbortController
+              // เดียวที่ compose มาจาก outer signal (barge-in) — barge-in ยังฆ่าทั้งคู่ได้เสมอ แต่ watchdog ฆ่าได้แค่
+              // chunked attempt นี้เท่านั้น ไม่แตะ outer signal เลย เพื่อให้ fallback ด้านล่าง (ที่ใช้ outer signal)
+              // ยังทำงานได้จริง — arm() วงแรก (CLAUDE_FIRST_DELTA_TIMEOUT) ตั้งไว้ก่อนเริ่ม แล้ว rearm เป็นวงที่สอง
+              // (CHUNK_READY_TIMEOUT) ตอน t3 เกิดจริง ไม่ใช่เริ่มพร้อมกันตั้งแต่ t2
               const attempt = await runAttemptWithWatchdog({
                 signal,
                 timeoutMs: CLAUDE_FIRST_DELTA_TIMEOUT_MS,
                 reason: 'CLAUDE_FIRST_DELTA_TIMEOUT',
-                run: (childSignal, clearWatchdog) => runChunkedTurn({
+                run: (childSignal, armWatchdog) => runChunkedTurn({
                   session: currentSession,
                   signal: childSignal,
                   socket,
@@ -469,7 +476,8 @@ function registerWebSocket(fastify) {
                   callState,
                   generationId,
                   onControl: (control) => { if (control?.type === 'end_call') endCallRequested = true },
-                  onFirstDelta: clearWatchdog,
+                  onFirstDelta: () => armWatchdog(CHUNK_READY_TIMEOUT_MS, 'CHUNK_READY_TIMEOUT'),
+                  onFirstChunk: () => armWatchdog(),
                 }),
               })
 

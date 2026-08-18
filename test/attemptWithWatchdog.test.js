@@ -137,6 +137,74 @@ test('late rejection ของ run() หลังแพ้ race (timeout ชน�
   assert.equal(unhandled, null, 'ต้องไม่มี unhandledRejection หลุดออกมาแม้ run() จะ reject ช้าหลังแพ้ race')
 })
 
+// ---------------------------------------------------------------------------
+// rearm — วง watchdog หลายขั้นต่อเนื่องบน attempt เดียว (Watchdog A → B ของ C4b)
+// ---------------------------------------------------------------------------
+
+test('arm(ms, reason) เรียกซ้ำจาก run() → ยกเลิกวงเดิม ตั้งวงใหม่ด้วย reason ใหม่ ถ้าวงใหม่ timeout ก่อน run() เสร็จ', async () => {
+  const outcome = await runAttemptWithWatchdog({
+    signal: new AbortController().signal,
+    timeoutMs: 200, // วงแรกยาวมาก ไม่มีทาง timeout ก่อน rearm
+    reason: 'STAGE_A_TIMEOUT',
+    run: async (childSignal, arm) => {
+      await delay(5)
+      arm(15, 'STAGE_B_TIMEOUT') // ตั้งวงใหม่สั้นกว่าเดิมมาก
+      await delay(100) // ช้ากว่าวง B แน่นอน
+      return 'too late'
+    },
+  })
+  assert.equal(outcome.outcome, 'timeout')
+  assert.equal(outcome.reason, 'STAGE_B_TIMEOUT', 'ต้องได้ reason ของวงที่ timeout จริง (วง B) ไม่ใช่วง A เดิม')
+})
+
+test('arm(ms, reason) rearm แล้ว run() เสร็จก่อนวงใหม่ timeout → success ปกติ ไม่ถูกวงเดิม (ที่ถูกยกเลิกไปแล้ว) รบกวน', async () => {
+  const outcome = await runAttemptWithWatchdog({
+    signal: new AbortController().signal,
+    timeoutMs: 5, // วงแรกสั้นมาก ถ้าไม่ถูกยกเลิกจะ timeout ก่อน run() เสร็จแน่ๆ
+    reason: 'STAGE_A_TIMEOUT',
+    run: async (childSignal, arm) => {
+      arm(200, 'STAGE_B_TIMEOUT') // rearm เป็นวงยาวทันที ก่อนวง A จะทัน timeout
+      await delay(10) // นานกว่าวง A เดิม (5ms) แต่สั้นกว่าวง B (200ms) มาก
+      return 'done in time'
+    },
+  })
+  assert.deepEqual(outcome, { outcome: 'success', result: 'done in time' })
+})
+
+test('arm() ไม่มี argument (contract เดิม) ยังทำงานเหมือนเดิมทุกประการหลัง redesign', async () => {
+  const outcome = await runAttemptWithWatchdog({
+    signal: new AbortController().signal,
+    timeoutMs: 15,
+    reason: 'TEST_TIMEOUT',
+    run: async (childSignal, arm) => {
+      await delay(5)
+      arm() // แค่เคลียร์ ไม่ตั้งวงใหม่ — เหมือนพฤติกรรม clearWatchdog เดิมทุกประการ
+      await delay(100)
+      return 'finished after clearing'
+    },
+  })
+  assert.deepEqual(outcome, { outcome: 'success', result: 'finished after clearing' })
+})
+
+test('watchdog สองวงเรียงกัน จำลอง Watchdog A → B จริง: A ไม่ทัน timeout, B ทัน timeout → outcome timeout ของ B, child ถูก abort', async () => {
+  let childSignalAtFailure = null
+  const outcome = await runAttemptWithWatchdog({
+    signal: new AbortController().signal,
+    timeoutMs: 100, // "CLAUDE_FIRST_DELTA_TIMEOUT" จำลอง
+    reason: 'CLAUDE_FIRST_DELTA_TIMEOUT',
+    run: async (childSignal, arm) => {
+      await delay(5) // "t3" มาเร็ว ทันวง A แน่นอน
+      arm(15, 'CHUNK_READY_TIMEOUT') // "t4" ไม่เคยมา — ไม่มีการ clear ครั้งที่สอง
+      childSignalAtFailure = childSignal
+      await delay(200) // ไม่มีทางถึง — ควรถูก race แพ้ไปก่อนโดยวง B
+      return 'unreachable'
+    },
+  })
+  assert.equal(outcome.outcome, 'timeout')
+  assert.equal(outcome.reason, 'CHUNK_READY_TIMEOUT')
+  assert.equal(childSignalAtFailure.aborted, true)
+})
+
 test('claimFallback-style caller: หลัง timeout ต้อง detach listener แล้ว ไม่ throw ถ้า outer abort ซ้ำอีกทีหลังจบไปแล้ว', async () => {
   const outer = new AbortController()
   await runAttemptWithWatchdog({

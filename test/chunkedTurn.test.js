@@ -266,6 +266,26 @@ test('onFirstDelta ถูกเรียกครั้งเดียวตอ�
   assert.equal(calls, 1)
 })
 
+test('onFirstChunk ถูกเรียกครั้งเดียวตอน speech chunk แรกพร้อม ไม่ว่าจะเจอ boundary กลางลูปหรือจาก final flush (C4b — hook ให้ Watchdog B เคลียร์ timer)', async () => {
+  state.claudeImpl = fakeClaude(['Hello world. ', 'Second sentence.'])
+  state.ttsImpl = async function* () { yield Buffer.from('a') }
+  const socket = makeSocket()
+  const { turnMetrics, turnState, callState, generationId } = makeMetricsAndState()
+  let calls = 0
+  await runChunkedTurn({ session: {}, signal: null, socket, streamSid: 'SS1', voiceId: 'v1', turnMetrics, turnState, callState, generationId, onFirstChunk: () => { calls++ } })
+  assert.equal(calls, 1)
+})
+
+test('onFirstChunk ถูกเรียกจาก final-flush path ด้วย (ไม่มี boundary เจอเลยระหว่างทาง มีแต่ก้อนสุดท้ายตอน stream จบ)', async () => {
+  state.claudeImpl = fakeClaude(['no punctuation at all in this text'])
+  state.ttsImpl = async function* () { yield Buffer.from('a') }
+  const socket = makeSocket()
+  const { turnMetrics, turnState, callState, generationId } = makeMetricsAndState()
+  let calls = 0
+  await runChunkedTurn({ session: {}, signal: null, socket, streamSid: 'SS1', voiceId: 'v1', turnMetrics, turnState, callState, generationId, onFirstChunk: () => { calls++ } })
+  assert.equal(calls, 1)
+})
+
 // ---------------------------------------------------------------------------
 // Checkpoint C3b — isCurrentGeneration() guards ที่ 5 boundary
 // ---------------------------------------------------------------------------

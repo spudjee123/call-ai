@@ -79,7 +79,7 @@ async function speakFixedText({ text, signal, socket, streamSid, voiceId, turnMe
   return { sentCount }
 }
 
-async function runChunkedTurn({ session, signal, socket, streamSid, voiceId, turnMetrics, turnState, callState, generationId, onControl, onFirstAudioSent, onFirstDelta }) {
+async function runChunkedTurn({ session, signal, socket, streamSid, voiceId, turnMetrics, turnState, callState, generationId, onControl, onFirstAudioSent, onFirstDelta, onFirstChunk }) {
   const isCurrent = () => isCurrentGeneration(callState, generationId)
   const queue = []
   let producerDone = false
@@ -127,7 +127,9 @@ async function runChunkedTurn({ session, signal, socket, streamSid, voiceId, tur
           const result = findChunkBoundary(buffer, elapsedMs)
           if (!result) break
           if (!isCurrent()) break // boundary 2: chunker output/enqueue — stale ต้องไม่ markOnce(t4)/enqueue
+          const isFirstChunk = turnMetrics.t4 == null
           markOnce(turnMetrics, 't4')
+          if (isFirstChunk) onFirstChunk?.() // C4b: hook ให้ Watchdog B (CHUNK_READY_TIMEOUT) เคลียร์ timer ของมันเอง
           enqueue(result.chunk)
           buffer = result.remainder
           // remainder ไม่ว่าง = ตัวอักษรพวกนี้ค้างมาตั้งแต่ก่อนหน้านี้แล้ว ไม่ใช่ "เพิ่งมาถึง" — ห้าม reset segmentStartMs
@@ -139,7 +141,9 @@ async function runChunkedTurn({ session, signal, socket, streamSid, voiceId, tur
       // ปิดท้าย (ล็อกไว้ตั้งแต่ B1/B4: ประโยคจริงอาจจบโดยไม่มี . ? ! ตัวสุดท้ายเลย)
       const finalText = buffer.trim()
       if (finalText && !signal?.aborted && isCurrent()) {
+        const isFirstChunk = turnMetrics.t4 == null
         markOnce(turnMetrics, 't4')
+        if (isFirstChunk) onFirstChunk?.()
         enqueue(finalText)
       }
     } catch (err) {

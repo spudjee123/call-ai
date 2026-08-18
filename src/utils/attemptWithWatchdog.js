@@ -17,26 +17,36 @@ function attachChildAbort(signal) {
   return { child, detach: () => signal.removeEventListener('abort', propagate) }
 }
 
-// run(childSignal, clearWatchdog) — the caller's attempt. It MUST call clearWatchdog() itself once
-// its own milestone has passed (e.g. chunkedTurn.js's onFirstDelta hook calling straight through to
-// this), or the watchdog fires regardless of how far the attempt actually progressed.
+// run(childSignal, arm) — the caller's attempt. `arm(ms, reason)` (re)arms the watchdog with a new
+// window and reason, cancelling whatever window was running before — this lets a caller chain
+// sequential milestone timeouts over a single attempt (e.g. "Claude first delta" window handing off
+// to "chunk ready" window the moment the first delta lands, per C4b's Watchdog A → B design). Calling
+// arm() with no arguments just disarms — the original single-milestone contract still works unchanged.
+// If nothing ever re-arms, the attempt runs to completion with no watchdog once the first arm() fires.
 //
 // คืนค่าอย่างใดอย่างหนึ่ง:
-//   { outcome: 'success', result }   — run() ชนะ race ก่อน watchdog จะ timeout
-//   { outcome: 'timeout', reason }   — watchdog ชนะ; child ถูก abort ไปแล้วก่อน return
+//   { outcome: 'success', result }   — run() ชนะ race ก่อน watchdog (วงไหนก็ตามที่กำลัง arm อยู่) จะ timeout
+//   { outcome: 'timeout', reason }   — watchdog ชนะ (reason ของวงที่กำลัง arm อยู่ ณ ตอนนั้น); child ถูก abort ไปแล้วก่อน return
 //   { outcome: 'error', error }      — run() reject ด้วย error จริง (ไม่ใช่ watchdog); child ถูก abort ไปแล้วก่อน return
 async function runAttemptWithWatchdog({ signal, timeoutMs, reason, run }) {
   const { child, detach } = attachChildAbort(signal)
 
-  let clearWatchdogTimer = () => {}
-  const watchdogPromise = new Promise((_, reject) => {
-    const timer = setTimeout(() => {
-      reject(Object.assign(new Error(reason), { code: 'WATCHDOG_TIMEOUT', reason }))
-    }, timeoutMs)
-    clearWatchdogTimer = () => clearTimeout(timer)
-  })
+  let currentTimer = null
+  let rejectWatchdog = null
+  const watchdogPromise = new Promise((_, reject) => { rejectWatchdog = reject })
 
-  const attemptPromise = run(child.signal, clearWatchdogTimer)
+  // arm(ms, r): เคลียร์ timer เดิม (ถ้ามี) แล้วตั้งวงใหม่ด้วย ms/r ที่ให้มา — เรียกแบบไม่มี argument (arm())
+  // เพื่อแค่เคลียร์เฉยๆ ไม่ตั้งวงใหม่ (คือ contract เดิมของ clearWatchdog ก่อนหน้านี้ ไม่มีอะไรเปลี่ยนสำหรับ caller เดิม)
+  function arm(ms, r) {
+    if (currentTimer) { clearTimeout(currentTimer); currentTimer = null }
+    if (ms == null) return
+    currentTimer = setTimeout(() => {
+      rejectWatchdog(Object.assign(new Error(r), { code: 'WATCHDOG_TIMEOUT', reason: r }))
+    }, ms)
+  }
+  arm(timeoutMs, reason) // arm วงแรกก่อนเริ่ม run()
+
+  const attemptPromise = run(child.signal, arm)
   // ติด handler ทันที กันไม่ให้เกิด unhandled rejection ถ้า watchdog ชนะ race ไปแล้ว attemptPromise มา reject
   // ทีหลังด้วยเหตุผลอื่นที่ไม่เกี่ยวกับ abort เลย
   //
@@ -53,11 +63,11 @@ async function runAttemptWithWatchdog({ signal, timeoutMs, reason, run }) {
 
   try {
     const result = await Promise.race([attemptPromise, watchdogPromise])
-    clearWatchdogTimer()
+    arm() // เคลียร์วงที่เหลืออยู่ (ถ้ามี) ให้หมด
     settled = true
     return { outcome: 'success', result }
   } catch (err) {
-    clearWatchdogTimer()
+    arm()
     child.abort() // ฆ่า loser ก่อนเสมอ ไม่ว่าจะแพ้ด้วย watchdog หรือ error จริง — ก่อน caller จะไปทำอะไรต่อ (เช่น claimFallback)
     settled = true
     if (err?.code === 'WATCHDOG_TIMEOUT') {
