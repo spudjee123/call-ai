@@ -256,6 +256,16 @@ test('onFirstAudioSent callback ถูกเรียกครั้งเดี
   assert.equal(calls, 1)
 })
 
+test('onFirstDelta ถูกเรียกครั้งเดียวตอน delta ที่ไม่ว่างก้อนแรกมาถึง (C4b — hook ให้ watchdog ภายนอกเคลียร์ timer)', async () => {
+  state.claudeImpl = fakeClaude(['', 'First real. ', 'Second delta.'])
+  state.ttsImpl = async function* () { yield Buffer.from('a') }
+  const socket = makeSocket()
+  const { turnMetrics, turnState, callState, generationId } = makeMetricsAndState()
+  let calls = 0
+  await runChunkedTurn({ session: {}, signal: null, socket, streamSid: 'SS1', voiceId: 'v1', turnMetrics, turnState, callState, generationId, onFirstDelta: () => { calls++ } })
+  assert.equal(calls, 1)
+})
+
 // ---------------------------------------------------------------------------
 // Checkpoint C3b — isCurrentGeneration() guards ที่ 5 boundary
 // ---------------------------------------------------------------------------

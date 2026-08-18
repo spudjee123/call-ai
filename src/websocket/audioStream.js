@@ -8,6 +8,7 @@ const { decideRollout } = require('../utils/rolloutBucket')
 const { createTurnMetrics, markOnce, computeDerivedMetrics } = require('../utils/turnMetrics')
 const { createTurnState, markTtsPending, markAudioCommitted, markDone, claimFallback } = require('../utils/turnState')
 const { runChunkedTurn, speakFixedText } = require('./chunkedTurn')
+const { runAttemptWithWatchdog } = require('../utils/attemptWithWatchdog')
 const { performance } = require('perf_hooks')
 
 const MAX_CALL_DURATION_MS = (parseInt(process.env.MAX_CALL_DURATION_SECONDS) || 300) * 1000
@@ -15,6 +16,10 @@ const MAX_CALL_DURATION_MS = (parseInt(process.env.MAX_CALL_DURATION_SECONDS) ||
 // Checkpoint C0: หาร้อยเปอร์เซ็นต์ chunked-streaming path ใหม่ตายตัวที่ 0% ก่อน — ยังไม่ให้สายไหนเข้าเลย
 // จะย้ายไปอ่านค่าจาก Google Sheets ใน Checkpoint C5 (พร้อม cache + last-known-good fallback)
 const CHUNKED_ROLLOUT_PERCENT = 0
+
+// Checkpoint C4b — เวลาสูงสุดที่ยอมรอ Claude ส่ง delta แรกของ chunked path มา ก่อนจะเลิกรอแล้ว fallback ไป
+// legacy แทน ตั้งไว้เผื่อเหนือ TTFT ปกติของ Claude พอสมควร (ปกติต่ำกว่า 1-2s มาก) แต่ไม่นานจนลูกค้ารอเงียบเกินไป
+const CLAUDE_FIRST_DELTA_TIMEOUT_MS = 3000
 
 function shouldBlockEndCall(session, aiResponse) {
   const userMessages = session.messages.filter(m => m.role === 'user')
@@ -446,65 +451,86 @@ function registerWebSocket(fastify) {
           // rollout ยัง 0% เสมอตอนนี้ จึงยังไม่มีสายไหนเข้า branch นี้จริงในโปรดักชัน (ดู C0/decideRollout)
           if (rollout.useChunkedStreaming) {
             try {
-              const result = await runChunkedTurn({
-                session: currentSession,
+              // C4b: race runChunkedTurn ต่อ Claude-first-delta watchdog ผ่าน child AbortController ที่ compose
+              // มาจาก outer signal (barge-in) — barge-in ยังฆ่าทั้งคู่ได้เสมอ แต่ watchdog ฆ่าได้แค่ chunked attempt
+              // นี้เท่านั้น ไม่แตะ outer signal เลย เพื่อให้ fallback ด้านล่าง (ที่ใช้ outer signal) ยังทำงานได้จริง
+              const attempt = await runAttemptWithWatchdog({
                 signal,
-                socket,
-                streamSid,
-                voiceId: currentSession.campaign.voice_id,
-                turnMetrics,
-                turnState,
-                callState,
-                generationId,
-                onControl: (control) => { if (control?.type === 'end_call') endCallRequested = true },
+                timeoutMs: CLAUDE_FIRST_DELTA_TIMEOUT_MS,
+                reason: 'CLAUDE_FIRST_DELTA_TIMEOUT',
+                run: (childSignal, clearWatchdog) => runChunkedTurn({
+                  session: currentSession,
+                  signal: childSignal,
+                  socket,
+                  streamSid,
+                  voiceId: currentSession.campaign.voice_id,
+                  turnMetrics,
+                  turnState,
+                  callState,
+                  generationId,
+                  onControl: (control) => { if (control?.type === 'end_call') endCallRequested = true },
+                  onFirstDelta: clearWatchdog,
+                }),
               })
-              fullText = result.fullText
-              totalSent = result.totalSent
 
-              // C3c/C4a: parity กับ legacy's shouldBlockEndCall guard — ใช้ helper เดียวกันไม่ว่า endCallRequested
-              // จะมาจาก chunked path ปกติ (ตรงนี้) หรือจาก legacy fallback ด้านล่าง (normalize มาแล้วเหมือนกัน)
-              const guarded = await applyChunkedEndCallGuard({
-                endCallRequested, fullText, totalSent, currentSession, signal, socket, streamSid,
-                voiceId: currentSession.campaign.voice_id, turnMetrics, turnState, callState, generationId,
-              })
-              fullText = guarded.fullText
-              endCallRequested = guarded.endCallRequested
-              totalSent = guarded.totalSent
+              if (attempt.outcome === 'success') {
+                fullText = attempt.result.fullText
+                totalSent = attempt.result.totalSent
+
+                // C3c/C4a: parity กับ legacy's shouldBlockEndCall guard — ใช้ helper เดียวกันไม่ว่า endCallRequested
+                // จะมาจาก chunked path ปกติ (ตรงนี้) หรือจาก legacy fallback ด้านล่าง (normalize มาแล้วเหมือนกัน)
+                const guarded = await applyChunkedEndCallGuard({
+                  endCallRequested, fullText, totalSent, currentSession, signal, socket, streamSid,
+                  voiceId: currentSession.campaign.voice_id, turnMetrics, turnState, callState, generationId,
+                })
+                fullText = guarded.fullText
+                endCallRequested = guarded.endCallRequested
+                totalSent = guarded.totalSent
+              } else {
+                // outcome: 'timeout' (watchdog) หรือ 'error' (Claude/TTS จริง) — ทั้งสองทางวิ่งเข้า fallback gate เดียวกัน
+                // runAttemptWithWatchdog abort child ไปให้แล้วก่อน return ในทั้งสองกรณี ไม่ต้อง abort เพิ่มที่นี่
+                if (attempt.outcome === 'timeout') {
+                  console.log(`[Watchdog] ${attempt.reason} — chunked attempt aborted, considering fallback`)
+                } else {
+                  console.error('[AI/TTS error]', attempt.error.message)
+                  healthMonitor.reportError('ai_tts', attempt.error.message)
+                }
+
+                // C4a/C4b: chunked พังหรือหมดเวลาก่อน commit เสียง → ลอง fallback ไปใช้ legacy Claude/TTS สำหรับ
+                // เทิร์นนี้แทน ปล่อยลูกค้าเงียบไปเฉยๆ ไม่ bump generation เพราะนี่คือการกู้ turn เดิม ไม่ใช่ turn ใหม่
+                if (isCurrentGeneration(callState, generationId) && claimFallback(turnState)) {
+                  turnMetrics.fallbackTriggered = true
+                  turnMetrics.fallbackReason = attempt.outcome === 'timeout' ? attempt.reason : 'CLAUDE_OR_TTS_ERROR'
+                  turnMetrics.fallbackStartedAt = performance.now()
+                  console.log('[Fallback] Falling back to legacy Claude/TTS for this turn')
+                  try {
+                    const fb = await runLegacyFallback({
+                      session: currentSession, signal, socket, streamSid,
+                      voiceId: currentSession.campaign.voice_id, turnMetrics, turnState, callState, generationId,
+                    })
+                    // เช็คซ้ำหลัง await ยาว (askClaudeStream) — ห้ามเอาผลลัพธ์ของ generation ที่ stale ไปแล้วมาใช้
+                    // ต่อ ไม่งั้น [END_CALL] เก่าอาจไปสั่ง hangup ทั้งที่ลูกค้ากำลังคุยกับ generation ใหม่อยู่
+                    if (isCurrentGeneration(callState, generationId)) {
+                      const guarded = await applyChunkedEndCallGuard({
+                        endCallRequested: fb.endCallRequested, fullText: fb.fullText, totalSent: fb.totalSent,
+                        currentSession, signal, socket, streamSid, voiceId: currentSession.campaign.voice_id,
+                        turnMetrics, turnState, callState, generationId,
+                      })
+                      fullText = guarded.fullText
+                      endCallRequested = guarded.endCallRequested
+                      totalSent = guarded.totalSent
+                    } else {
+                      console.log('[Fallback] Generation went stale while legacy fallback was in flight — discarding its result')
+                    }
+                  } catch (fallbackErr) {
+                    console.error('[Fallback error]', fallbackErr.message)
+                    healthMonitor.reportError('ai_tts_fallback', fallbackErr.message)
+                  }
+                }
+              }
             } catch (err) {
               console.error('[AI/TTS error]', err.message)
               healthMonitor.reportError('ai_tts', err.message)
-
-              // C4a: chunked พังก่อน commit เสียง → ลอง fallback ไปใช้ legacy Claude/TTS สำหรับเทิร์นนี้แทน
-              // ปล่อยลูกค้าเงียบไปเฉยๆ ไม่ bump generation เพราะนี่คือการกู้ turn เดิม ไม่ใช่ turn ใหม่
-              if (isCurrentGeneration(callState, generationId) && claimFallback(turnState)) {
-                turnMetrics.fallbackTriggered = true
-                turnMetrics.fallbackReason = 'CLAUDE_OR_TTS_ERROR' // C4a ยังไม่แยกเหตุผลละเอียดกว่านี้ — รอ C4b
-                turnMetrics.fallbackStartedAt = performance.now()
-                console.log('[Fallback] Chunked path failed before audio committed — falling back to legacy Claude/TTS')
-                try {
-                  const fb = await runLegacyFallback({
-                    session: currentSession, signal, socket, streamSid,
-                    voiceId: currentSession.campaign.voice_id, turnMetrics, turnState, callState, generationId,
-                  })
-                  // เช็คซ้ำหลัง await ยาว (askClaudeStream) — ห้ามเอาผลลัพธ์ของ generation ที่ stale ไปแล้วมาใช้
-                  // ต่อ ไม่งั้น [END_CALL] เก่าอาจไปสั่ง hangup ทั้งที่ลูกค้ากำลังคุยกับ generation ใหม่อยู่
-                  if (isCurrentGeneration(callState, generationId)) {
-                    const guarded = await applyChunkedEndCallGuard({
-                      endCallRequested: fb.endCallRequested, fullText: fb.fullText, totalSent: fb.totalSent,
-                      currentSession, signal, socket, streamSid, voiceId: currentSession.campaign.voice_id,
-                      turnMetrics, turnState, callState, generationId,
-                    })
-                    fullText = guarded.fullText
-                    endCallRequested = guarded.endCallRequested
-                    totalSent = guarded.totalSent
-                  } else {
-                    console.log('[Fallback] Generation went stale while legacy fallback was in flight — discarding its result')
-                  }
-                } catch (fallbackErr) {
-                  console.error('[Fallback error]', fallbackErr.message)
-                  healthMonitor.reportError('ai_tts_fallback', fallbackErr.message)
-                }
-              }
             } finally {
               clearTimeout(processingGuard)
               if (prewarmPromise === myPrewarm) clearPrewarm()

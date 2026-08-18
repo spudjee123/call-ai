@@ -79,7 +79,7 @@ async function speakFixedText({ text, signal, socket, streamSid, voiceId, turnMe
   return { sentCount }
 }
 
-async function runChunkedTurn({ session, signal, socket, streamSid, voiceId, turnMetrics, turnState, callState, generationId, onControl, onFirstAudioSent }) {
+async function runChunkedTurn({ session, signal, socket, streamSid, voiceId, turnMetrics, turnState, callState, generationId, onControl, onFirstAudioSent, onFirstDelta }) {
   const isCurrent = () => isCurrentGeneration(callState, generationId)
   const queue = []
   let producerDone = false
@@ -109,7 +109,9 @@ async function runChunkedTurn({ session, signal, socket, streamSid, voiceId, tur
         if (!isCurrent()) break // boundary 1: Claude delta — stale generation ต้องไม่แม้แต่ markOnce(t3)
         if (!delta) continue // empty delta → ไม่มีอะไรให้พูด ข้ามไปเฉยๆ
 
+        const isFirstDelta = turnMetrics.t3 == null
         markOnce(turnMetrics, 't3')
+        if (isFirstDelta) onFirstDelta?.() // C4b: hook ให้ watchdog ภายนอก (CLAUDE_FIRST_DELTA_TIMEOUT) เคลียร์ timer ของมันเอง
         fullTextAccum += delta
 
         const wasEmpty = buffer.length === 0
