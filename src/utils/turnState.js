@@ -34,14 +34,22 @@ function canFallback(turnState) {
   return !turnState.audioCommitted
 }
 
-// ห่อ fallback ไว้ให้ยิงได้แค่ครั้งเดียวต่อเทิร์น แม้ error callback จะยิงซ้ำมาหลายรอบก่อนถึงจุด commit ก็ตาม
-// คืนค่า true ถ้า fallback ถูกเรียกจริงรอบนี้ / false ถ้าไม่เข้าเงื่อนไข (commit ไปแล้ว หรือ fallback ไปแล้ว)
-function attemptFallback(turnState, doFallback) {
+// จองสิทธิ์ทำ fallback แบบ single-fire ต่อเทิร์น (C4a) — แยกจาก attemptFallback ด้านล่างเพราะ caller บางที่
+// (เช่น chunked→legacy fallback ใน audioStream.js) ต้อง await งานจริงเอง ไม่ใช่ยัด async ผ่าน callback แบบเดิม
+// คืน true ถ้าจองสิทธิ์ได้ (ยังไม่เคย fallback มาก่อน และยังไม่ commit เสียง) / false ถ้าจองไม่ได้
+function claimFallback(turnState) {
   if (!canFallback(turnState)) return false
   if (turnState.fallbackTriggered) return false
   turnState.fallbackTriggered = true
+  return true
+}
+
+// ห่อ fallback ไว้ให้ยิงได้แค่ครั้งเดียวต่อเทิร์น แม้ error callback จะยิงซ้ำมาหลายรอบก่อนถึงจุด commit ก็ตาม
+// คืนค่า true ถ้า fallback ถูกเรียกจริงรอบนี้ / false ถ้าไม่เข้าเงื่อนไข (commit ไปแล้ว หรือ fallback ไปแล้ว)
+function attemptFallback(turnState, doFallback) {
+  if (!claimFallback(turnState)) return false
   doFallback()
   return true
 }
 
-module.exports = { createTurnState, markTtsPending, markAudioCommitted, markDone, canFallback, attemptFallback }
+module.exports = { createTurnState, markTtsPending, markAudioCommitted, markDone, canFallback, claimFallback, attemptFallback }

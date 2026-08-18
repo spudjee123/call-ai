@@ -21,6 +21,7 @@ function createTurnMetrics({ callSid, generationId, path, rolloutBucket, rollout
     t7: null, // first audio chunk sent to Twilio
     fallbackTriggered: false,
     fallbackReason: null,
+    fallbackStartedAt: null, // C4a — performance.now() ตอนเริ่มพยายาม fallback (ถ้ามี) ใช้แยกวิเคราะห์ turn ที่ fallback ออกจาก pure-chunked latency percentile
     audioCommitted: false,
   }
 }

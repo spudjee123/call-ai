@@ -6,6 +6,7 @@ const {
   markAudioCommitted,
   markDone,
   canFallback,
+  claimFallback,
   attemptFallback,
 } = require('../src/utils/turnState')
 
@@ -91,4 +92,38 @@ test('attemptFallback: หลัง commit แล้ว ต้องไม่ย
   const ok = attemptFallback(t, () => { calls++ })
   assert.equal(ok, false)
   assert.equal(calls, 0)
+})
+
+// C4a — claimFallback: เหมือน attemptFallback แต่ไม่รับ callback (caller await งานจริงเองแยกต่างหาก)
+test('claimFallback: จองสิทธิ์ครั้งแรกได้ → true, ตั้ง fallbackTriggered', () => {
+  const t = createTurnState(1)
+  const ok = claimFallback(t)
+  assert.equal(ok, true)
+  assert.equal(t.fallbackTriggered, true)
+})
+
+test('claimFallback: จองซ้ำครั้งที่สอง → false เสมอ แม้ยังไม่ commit เสียง', () => {
+  const t = createTurnState(1)
+  claimFallback(t)
+  const second = claimFallback(t)
+  assert.equal(second, false)
+})
+
+test('claimFallback: หลัง AUDIO_COMMITTED แล้ว → false เสมอ ไม่ว่าจะจองครั้งแรกหรือไม่', () => {
+  const t = createTurnState(1)
+  markAudioCommitted(t)
+  const ok = claimFallback(t)
+  assert.equal(ok, false)
+  assert.equal(t.fallbackTriggered, false, 'ไม่ควรถูกตั้งเป็น true เพราะไม่เคยจองสำเร็จเลย')
+})
+
+test('attemptFallback (ของเดิม): behavior ไม่เปลี่ยนหลัง refactor ให้ใช้ claimFallback ภายใน', () => {
+  const t = createTurnState(1)
+  let calls = 0
+  const first = attemptFallback(t, () => { calls++ })
+  const second = attemptFallback(t, () => { calls++ })
+  assert.equal(first, true)
+  assert.equal(second, false)
+  assert.equal(calls, 1)
+  assert.equal(t.fallbackTriggered, true)
 })

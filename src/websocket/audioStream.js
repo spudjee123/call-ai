@@ -3,11 +3,12 @@ const { transcribeStream } = require('../services/googleSTT')
 const { askClaude, askClaudeStream } = require('../services/claude')
 const { synthesizeSpeechStream } = require('../services/tts')
 const healthMonitor = require('../utils/healthMonitor')
-const { createCallState, bumpGeneration, endCall } = require('../utils/generationGuard')
+const { createCallState, bumpGeneration, isCurrentGeneration, endCall } = require('../utils/generationGuard')
 const { decideRollout } = require('../utils/rolloutBucket')
 const { createTurnMetrics, markOnce, computeDerivedMetrics } = require('../utils/turnMetrics')
-const { createTurnState, markTtsPending, markAudioCommitted, markDone } = require('../utils/turnState')
+const { createTurnState, markTtsPending, markAudioCommitted, markDone, claimFallback } = require('../utils/turnState')
 const { runChunkedTurn, speakFixedText } = require('./chunkedTurn')
+const { performance } = require('perf_hooks')
 
 const MAX_CALL_DURATION_MS = (parseInt(process.env.MAX_CALL_DURATION_SECONDS) || 300) * 1000
 
@@ -22,6 +23,50 @@ function shouldBlockEndCall(session, aiResponse) {
   const hasInterest = ['สนใจ', 'อยากลอง', 'อยากสมัคร', 'สมัครเลย'].some(k => lastUserMsg.includes(k))
   if (!hasInterest || hasNegation) return false
   return !aiResponse.includes('เพิ่มเติม')
+}
+
+// Checkpoint C4a — เมื่อ chunked path พังก่อน commit เสียง ลอง fallback ไปใช้ Claude/TTS เดิม (legacy)
+// สำหรับเทิร์นเดียวกันนี้ แทนที่จะปล่อยให้ลูกค้าเงียบไปเฉยๆ ไม่ bump generation เพราะนี่คือการกู้ turn เดิม
+// ไม่ใช่ turn ใหม่ — เป็น adapter ระหว่าง legacy transport ([END_CALL] string marker) กับรูปแบบที่ chunked
+// branch ใช้อยู่แล้ว (endCallRequested boolean) ก่อน TTS เสมอ กัน marker หลุดเข้าไปให้ speakFixedText() พูดออกไปจริง
+async function runLegacyFallback({ session, signal, socket, streamSid, voiceId, turnMetrics, turnState, callState, generationId }) {
+  let rawText = null
+  for await (const chunk of askClaudeStream(session, false, signal)) {
+    if (signal.aborted) break
+    rawText = (rawText ? rawText + ' ' : '') + chunk
+  }
+  if (!rawText || signal.aborted) return { fullText: '', endCallRequested: false, totalSent: 0 }
+
+  const legacyEndCallRequested = rawText.includes('[END_CALL]')
+  const spokenText = rawText.replace(/\[END_CALL\]/g, '').trim()
+
+  if (!spokenText || !isCurrentGeneration(callState, generationId)) {
+    return { fullText: spokenText, endCallRequested: legacyEndCallRequested, totalSent: 0 }
+  }
+
+  const result = await speakFixedText({ text: spokenText, signal, socket, streamSid, voiceId, turnMetrics, turnState, callState, generationId, startingSentCount: 0 })
+  return { fullText: spokenText, endCallRequested: legacyEndCallRequested, totalSent: result.sentCount }
+}
+
+// ใช้ policy เดียวกันไม่ว่า end_call intent จะมาจาก tool call ปกติของ chunked path หรือจาก [END_CALL] marker
+// ที่ normalize มาจาก legacy fallback แล้ว — ทั้งสองทางเข้าที่นี่ในรูป endCallRequested boolean เดียวกันเสมอ
+async function applyChunkedEndCallGuard({ endCallRequested, fullText, totalSent, currentSession, signal, socket, streamSid, voiceId, turnMetrics, turnState, callState, generationId }) {
+  if (!endCallRequested || !shouldBlockEndCall(currentSession, fullText)) {
+    return { fullText, endCallRequested, totalSent }
+  }
+  console.log('[Guard] Premature END_CALL blocked — injecting follow-up question (chunked)')
+  const followUp = 'มีอะไรสอบถามเพิ่มเติมไหมคะ'
+  let newTotalSent = totalSent
+  try {
+    const followUpResult = await speakFixedText({ text: followUp, signal, socket, streamSid, voiceId, turnMetrics, turnState, callState, generationId, startingSentCount: totalSent })
+    newTotalSent += followUpResult.sentCount
+  } catch (err) {
+    if (err.code !== 'ERR_CANCELED' && err.name !== 'CanceledError') {
+      console.error('[Guard TTS error]', err.message)
+      healthMonitor.reportError('tts', err.message)
+    }
+  }
+  return { fullText: fullText.trim() + ' ' + followUp, endCallRequested: false, totalSent: newTotalSent }
 }
 
 function registerWebSocket(fastify) {
@@ -416,37 +461,50 @@ function registerWebSocket(fastify) {
               fullText = result.fullText
               totalSent = result.totalSent
 
-              // C3c: parity กับ legacy's shouldBlockEndCall guard — shouldBlockEndCall() เป็น policy ล้วนๆ
-              // ไม่ขึ้นกับ transport ([END_CALL] marker vs end_call tool) จึงใช้ฟังก์ชันเดิมได้ตรงๆ ไม่ต้องแก้
-              if (endCallRequested && shouldBlockEndCall(currentSession, fullText)) {
-                console.log('[Guard] Premature END_CALL blocked — injecting follow-up question (chunked)')
-                const followUp = 'มีอะไรสอบถามเพิ่มเติมไหมคะ'
-                fullText = fullText.trim() + ' ' + followUp
-                endCallRequested = false // ยกเลิก hangup ของเทิร์นนี้ — ให้ shared tail ด้านล่างไม่เห็นสัญญาณ end_call แล้ว
-                try {
-                  const followUpResult = await speakFixedText({
-                    text: followUp,
-                    signal,
-                    socket,
-                    streamSid,
-                    voiceId: currentSession.campaign.voice_id,
-                    turnMetrics,
-                    turnState,
-                    callState,
-                    generationId,
-                    startingSentCount: totalSent,
-                  })
-                  totalSent += followUpResult.sentCount
-                } catch (err) {
-                  if (err.code !== 'ERR_CANCELED' && err.name !== 'CanceledError') {
-                    console.error('[Guard TTS error]', err.message)
-                    healthMonitor.reportError('tts', err.message)
-                  }
-                }
-              }
+              // C3c/C4a: parity กับ legacy's shouldBlockEndCall guard — ใช้ helper เดียวกันไม่ว่า endCallRequested
+              // จะมาจาก chunked path ปกติ (ตรงนี้) หรือจาก legacy fallback ด้านล่าง (normalize มาแล้วเหมือนกัน)
+              const guarded = await applyChunkedEndCallGuard({
+                endCallRequested, fullText, totalSent, currentSession, signal, socket, streamSid,
+                voiceId: currentSession.campaign.voice_id, turnMetrics, turnState, callState, generationId,
+              })
+              fullText = guarded.fullText
+              endCallRequested = guarded.endCallRequested
+              totalSent = guarded.totalSent
             } catch (err) {
               console.error('[AI/TTS error]', err.message)
               healthMonitor.reportError('ai_tts', err.message)
+
+              // C4a: chunked พังก่อน commit เสียง → ลอง fallback ไปใช้ legacy Claude/TTS สำหรับเทิร์นนี้แทน
+              // ปล่อยลูกค้าเงียบไปเฉยๆ ไม่ bump generation เพราะนี่คือการกู้ turn เดิม ไม่ใช่ turn ใหม่
+              if (isCurrentGeneration(callState, generationId) && claimFallback(turnState)) {
+                turnMetrics.fallbackTriggered = true
+                turnMetrics.fallbackReason = 'CLAUDE_OR_TTS_ERROR' // C4a ยังไม่แยกเหตุผลละเอียดกว่านี้ — รอ C4b
+                turnMetrics.fallbackStartedAt = performance.now()
+                console.log('[Fallback] Chunked path failed before audio committed — falling back to legacy Claude/TTS')
+                try {
+                  const fb = await runLegacyFallback({
+                    session: currentSession, signal, socket, streamSid,
+                    voiceId: currentSession.campaign.voice_id, turnMetrics, turnState, callState, generationId,
+                  })
+                  // เช็คซ้ำหลัง await ยาว (askClaudeStream) — ห้ามเอาผลลัพธ์ของ generation ที่ stale ไปแล้วมาใช้
+                  // ต่อ ไม่งั้น [END_CALL] เก่าอาจไปสั่ง hangup ทั้งที่ลูกค้ากำลังคุยกับ generation ใหม่อยู่
+                  if (isCurrentGeneration(callState, generationId)) {
+                    const guarded = await applyChunkedEndCallGuard({
+                      endCallRequested: fb.endCallRequested, fullText: fb.fullText, totalSent: fb.totalSent,
+                      currentSession, signal, socket, streamSid, voiceId: currentSession.campaign.voice_id,
+                      turnMetrics, turnState, callState, generationId,
+                    })
+                    fullText = guarded.fullText
+                    endCallRequested = guarded.endCallRequested
+                    totalSent = guarded.totalSent
+                  } else {
+                    console.log('[Fallback] Generation went stale while legacy fallback was in flight — discarding its result')
+                  }
+                } catch (fallbackErr) {
+                  console.error('[Fallback error]', fallbackErr.message)
+                  healthMonitor.reportError('ai_tts_fallback', fallbackErr.message)
+                }
+              }
             } finally {
               clearTimeout(processingGuard)
               if (prewarmPromise === myPrewarm) clearPrewarm()

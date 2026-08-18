@@ -14,6 +14,7 @@ test('createTurnMetrics: field ที่ให้มาถูกเก็บค�
   }
   assert.equal(m.fallbackTriggered, false)
   assert.equal(m.fallbackReason, null)
+  assert.equal(m.fallbackStartedAt, null)
   assert.equal(m.audioCommitted, false)
 })
 
