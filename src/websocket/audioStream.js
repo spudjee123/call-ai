@@ -41,7 +41,8 @@ function registerWebSocket(fastify) {
     let prewarmPromise = null    // pre-warmed Claude response Promise<string|null>
     let prewarmStartText = null  // interim text that triggered prewarm
     let prewarmAbort = null      // AbortController for prewarm call
-    let prewarmRetriggerAt = 0   // เวลาต่ำสุดที่อนุญาตเดาใหม่รอบถัดไป (throttle กันยิง Claude ถี่เกิน)
+    let prewarmDebounceTimer = null  // debounce: รอ interim นิ่งก่อนค่อยยิง Claude จริง
+    let lastInterimSeen = null       // interim ล่าสุดที่เห็น — กันรีเซ็ต debounce ถ้า STT ส่งข้อความซ้ำเดิม
 
     console.log(`[WS] Connected callSid=${callSid}`)
 
@@ -109,24 +110,29 @@ function registerWebSocket(fastify) {
       return n >= 2 && a.substring(0, n) === b.substring(0, n)
     }
 
-    // Adaptive re-trigger: ถ้าลูกค้าพูดยาวกว่าที่เดาไว้พอสมควร ยกเลิกคำเดาเก่าแล้วเดาใหม่จากข้อความล่าสุด
-    // เดาแค่ครั้งเดียวตอนแรกมักพลาดเวลาลูกค้าพูดยาวกว่านั้น (isPrewarmUsable ปฏิเสธ ต้องเริ่มนับ latency ใหม่ทั้งหมด)
-    function shouldRetriggerPrewarm(oldText, newText) {
-      const oldLen = (oldText || '').trim().length
-      const newLen = (newText || '').trim().length
-      if (newLen - oldLen < 4) return false // เพิ่มขึ้นน้อยไป ไม่คุ้มยิงใหม่ (แค่ STT ขยับคำเล็กน้อย)
-      if (Date.now() < prewarmRetriggerAt) return false // กันยิง Claude รัวๆ ระหว่างลูกค้าพูดยาว
-      return true
-    }
+    // Debounce: ยิง Claude ก็ต่อเมื่อ interim "นิ่ง" ไม่ขยับอีกเลยติดต่อกัน PREWARM_DEBOUNCE_MS
+    // (แทนที่การยิงทันทีที่ขยับ ≥4 ตัวอักษรแบบเดิม ซึ่งเจอปัญหาจริงจาก log ว่ารอบสุดท้ายมักยิงออกไปใกล้ๆ
+    // ตอนลูกค้าพูดจบพอดี ทำให้ Claude ยังคิดไม่เสร็จตอน STT ยืนยันว่าจบ — วัด "Hit" ได้ก็จริงแต่ก็ยังต้องรออยู่ดี)
+    // debounce สั้นกว่า STT เอง (900ms เงียบถึงจะ finalize) เสมอ การันตี head start ~(900-PREWARM_DEBOUNCE_MS)ms ให้รอบสุดท้ายก่อนลูกค้าพูดจบจริงทุกครั้ง
+    const PREWARM_DEBOUNCE_MS = 350
 
     function startPrewarm(session, interimText) {
       if (isSpeaking || sttProcessing) return
+      if (interimText === lastInterimSeen) return // STT ส่ง interim ซ้ำเดิม ไม่ถือว่าเปลี่ยน ไม่ต้อง reset timer
+      lastInterimSeen = interimText
+      if (prewarmDebounceTimer) clearTimeout(prewarmDebounceTimer)
+      prewarmDebounceTimer = setTimeout(() => {
+        prewarmDebounceTimer = null
+        firePrewarm(session, interimText)
+      }, PREWARM_DEBOUNCE_MS)
+    }
+
+    function firePrewarm(session, interimText) {
+      if (!callActive || isSpeaking || sttProcessing) return
       if (prewarmPromise) {
-        if (!shouldRetriggerPrewarm(prewarmStartText, interimText)) return
-        console.log(`[Prewarm] Re-trigger — interim grew: "${prewarmStartText}" → "${interimText}"`)
+        console.log(`[Prewarm] Re-trigger — interim นิ่งใหม่: "${prewarmStartText}" → "${interimText}"`)
         clearPrewarm()
       }
-      prewarmRetriggerAt = Date.now() + 700
       prewarmStartText = interimText
       prewarmAbort = new AbortController()
       const signal = prewarmAbort.signal
@@ -149,9 +155,11 @@ function registerWebSocket(fastify) {
     }
 
     function clearPrewarm() {
+      if (prewarmDebounceTimer) { clearTimeout(prewarmDebounceTimer); prewarmDebounceTimer = null }
       if (prewarmAbort) { prewarmAbort.abort(); prewarmAbort = null }
       prewarmPromise = null
       prewarmStartText = null
+      lastInterimSeen = null
     }
 
     async function handleSilence() {
@@ -541,6 +549,7 @@ function registerWebSocket(fastify) {
         callActive = false
         clearSilenceTimer()
         clearDurationTimer()
+        clearPrewarm()
         if (sttStream) { sttStream.end(); sttStream = null }
       }
     })
@@ -548,6 +557,7 @@ function registerWebSocket(fastify) {
     socket.on('close', () => {
       console.log(`[WS] Disconnected: ${callSid}`)
       callActive = false
+      clearPrewarm()
       clearSilenceTimer()
       clearDurationTimer()
       if (sttStream) { sttStream.end(); sttStream = null }
