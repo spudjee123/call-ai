@@ -706,9 +706,9 @@ test('21) L1a: legacy (rollout=0%) ต้องส่ง interimFinalizeMs=900 (
   harness.disconnect(socket)
 })
 
-test('22) L1a: chunked (rollout=100%) ต้องส่ง interimFinalizeMs=600 (ค่าทดลอง) เข้า transcribeStream()', async () => {
+test('22) L1a: chunked (rollout=100%) ต้องส่ง interimFinalizeMs=900 เข้า transcribeStream() (600ms ถูก REJECT จาก production evidence แล้ว — กลับมาใช้ 900 เหมือน legacy)', async () => {
   const callSid = nextCallSid()
   const { socket, state } = await connectPastGreeting(callSid) // rolloutPercent=100 default
-  assert.equal(state.lastSttOptions?.interimFinalizeMs, 600, 'chunked ต้องได้ค่าทดลอง 600ms ตาม L1a')
+  assert.equal(state.lastSttOptions?.interimFinalizeMs, 900, 'chunked ต้องได้ 900ms เหมือน legacy หลัง 600ms ถูก reject — mechanism/wiring ยังอยู่ครบ เผื่อทดลองค่าอื่นทีหลัง')
   harness.disconnect(socket)
 })

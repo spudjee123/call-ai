@@ -18,8 +18,14 @@ const MAX_CALL_DURATION_MS = (parseInt(process.env.MAX_CALL_DURATION_SECONDS) ||
 // INTERIM_FINALIZE_MS (900ms) เป็นค่าเดียวที่ legacy และ chunked path ใช้ร่วมกันมาตลอด ห้ามแก้ default ตรงๆ
 // เพราะจะกระทบ legacy production ทุกสายทันทีโดยไม่ผูกกับ chunked rollout เลย (rollout=0% จะไม่ป้องกันอะไรเลย)
 // ต้องคำนวณค่านี้ "หลัง" rollout ถูก freeze ต่อสายแล้วเท่านั้น (จุดเดียวกับที่ rollout เองถูก freeze — ดู 'start')
-// legacy ยังคง 900ms เดิม 100% เสมอ, chunked ได้ค่าทดลอง 600ms เฉพาะตอน controlled exposure เท่านั้น
-const STT_INTERIM_FINALIZE_MS_CHUNKED = 600
+//
+// ผลการทดลอง 600ms (controlled production test, 2026-08-19): REJECT — natural thinking pause ของลูกค้าถูกตัด
+// เป็น utterance แยกกัน 2 ครั้งภายในประโยคเดียวกัน ทำให้ Claude generation เริ่มก่อนลูกค้าพูดจบจริง (ลูกค้าพูดต่อ
+// เนื่องจึง trigger barge-in ก่อนถึง TTS เลยทั้งคู่ — t5/t6/t7 เป็น null ไม่มีเสียงหลุดออกไปจริง safety guard
+// กันไว้ได้ แต่เสีย Claude+watchdog cycle ไปฟรี 2 รอบ และ conversation history ถูกแบ่งผิดธรรมชาติ) — fail
+// acceptance criterion ที่ตั้งไว้ตั้งแต่ต้น ("ต้องไม่ตัด natural thinking pause") กลับมาใช้ 900ms เหมือน legacy
+// ไปก่อน แต่ยังคง mechanism/wiring/log ทั้งหมดไว้ เผื่อวันหลังอยากทดลองค่าอื่น (เช่น 750-800ms) ใหม่
+const STT_INTERIM_FINALIZE_MS_CHUNKED = 900
 
 // Checkpoint C5: % rollout ของ chunked-streaming path มาจาก Google Sheets แล้ว (แท็บ "Streaming Config")
 // ผ่าน background polling ของตัวเอง ไม่ใช่ hardcoded คงที่แบบ C0 อีกต่อไป — start() ครั้งเดียวตอน module load
