@@ -583,3 +583,114 @@ test('17) DoD B+F: barge-in ระหว่าง fallback ที่ audioCommit
 
   harness.disconnect(socket)
 })
+
+// ===== C6c follow-up — STT listening: interim ระหว่าง isSpeaking=true เป็น interrupt-control signal =====
+// googleSTT.js ตอนนี้ rotate stream ให้ฟังต่อเนื่องทันทีหลัง utterance ก่อนหน้า deliver ไม่รอ Twilio mark อีกแล้ว
+// (พิสูจน์แยกใน test/googleSTT.test.js) — เทสชุดนี้พิสูจน์ฝั่ง audioStream.js: onInterim ต้อง trigger bargeIn()
+// ทันทีตอน isSpeaking=true (เร็วกว่ารอ final ที่มี debounce 900ms ในตัว) แต่ final ของประโยคเดียวกันที่ตามมาต้อง
+// ไม่หาย ต้องไหลผ่าน bargeInPendingFinal → pendingTranscript/latest-wins เดียวกับที่พิสูจน์ไปแล้วในชุด 15-17
+
+test('18) DoD B+C+E+F (STT listening): interim ระหว่าง isSpeaking=true trigger bargeIn ทันที final ที่ตามมาไม่หาย ประมวลผลเป็นเทิร์นใหม่พอดี 1 ครั้ง', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 }) // legacy path — เรียบง่ายสุดสำหรับพิสูจน์กลไก gate เอง
+
+  let resumeOldTurn
+  const oldTurnGate = new Promise(resolve => { resumeOldTurn = resolve })
+  state.claudeStreamImpl = async function* () { yield 'กำลังตอบคำถามแรก'; await oldTurnGate }
+
+  const oldTurnPromise = harness.sendFinalTranscript('คำถามแรกครับ')
+  await delay(30) // เทิร์นแรกเข้าสู่ isSpeaking=true, sttProcessing=true และเริ่ม await Claude ค้างอยู่แล้ว
+
+  // ลูกค้าเริ่มพูดแทรก — STT ส่ง interim มาก่อน final เสมอ (ยาวพอ ไม่ใช่ fragment สั้น)
+  harness.sendInterim('เดี๋ยวก่อนครับ ขอถามเรื่องถอนเงินก่อน')
+
+  const clearEvents = socket.sent.filter(e => e.event === 'clear')
+  assert.equal(clearEvents.length, 1, 'interim ต้อง trigger bargeIn ทันทีครั้งเดียว ไม่ต้องรอ final')
+
+  let newTurnCalls = 0
+  state.claudeStreamImpl = async function* () { newTurnCalls++; yield 'ตอบเรื่องถอนเงิน' }
+
+  // final ของประโยคเดียวกันมาถึงทีหลัง (STT debounce 900ms ตามจริง แต่เทสส่งตรงๆ ได้เลย)
+  await harness.sendFinalTranscript('เดี๋ยวก่อนครับ ขอถามเรื่องถอนเงินก่อน')
+  assert.equal(newTurnCalls, 0, 'final ที่มาระหว่างเทิร์นเดิมยัง sttProcessing=true ต้องถูก queue ไว้ก่อน ไม่ใช่ประมวลผลทันที')
+
+  resumeOldTurn()
+  await oldTurnPromise
+
+  assert.equal(newTurnCalls, 1, 'ต้องมีเทิร์นใหม่พอดี 1 ครั้งจาก final ที่ถูก queue ไว้ (bargeInPendingFinal)')
+  const lastUserMsg = session.messages.filter(m => m.role === 'user').at(-1)
+  assert.equal(lastUserMsg.content, 'เดี๋ยวก่อนครับ ขอถามเรื่องถอนเงินก่อน', 'ข้อความที่พูดแทรกต้องไม่หาย')
+
+  const mediaEvents = socket.sent.filter(e => e.event === 'media')
+  assert.ok(mediaEvents.length > 0, 'เทิร์นใหม่ต้องพูดออกมาจริง')
+
+  harness.disconnect(socket)
+})
+
+test('19) DoD G: interim สั้น (fragment/echo) ระหว่าง isSpeaking=true ต้องไม่ trigger bargeIn เลย', async () => {
+  const callSid = nextCallSid()
+  const { socket, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+
+  let resumeOldTurn
+  const oldTurnGate = new Promise(resolve => { resumeOldTurn = resolve })
+  state.claudeStreamImpl = async function* () { yield 'กำลังตอบ'; await oldTurnGate }
+
+  const oldTurnPromise = harness.sendFinalTranscript('คำถามแรก')
+  await delay(30)
+
+  harness.sendInterim('เอ่อ') // สั้น < 2 คำ, < 8 ตัวอักษร — echo/noise ตาม filter เดียวกับ final-transcript path
+
+  const clearEvents = socket.sent.filter(e => e.event === 'clear')
+  assert.equal(clearEvents.length, 0, 'interim สั้นต้องไม่ trigger bargeIn เลย')
+
+  resumeOldTurn()
+  await oldTurnPromise
+  harness.disconnect(socket)
+})
+
+test('20) DoD D: interim trigger bargeIn ระหว่าง fallback ที่ audioCommitted=true → ไม่มี ghost audio เทิร์นใหม่ตอบได้ปกติ', { timeout: 15000 }, async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid) // rolloutPercent=100 default — chunked+fallback
+  state.claudeStreamChunkedImpl = async function* () { throw new Error('chunked boom') }
+  state.claudeStreamImpl = async function* () { yield 'คำตอบจาก fallback ที่กำลังพูดอยู่' }
+
+  let resumeStall
+  const stallGate = new Promise(resolve => { resumeStall = resolve })
+  state.ttsImpl = async function* () {
+    yield Buffer.from('chunk1') // คอมมิตทันที
+    await stallGate
+    yield Buffer.from('GHOST_AUDIO_old_gen_chunk2') // ต้องไม่ถูกส่งออกไปเลยหลัง barge-in
+  }
+
+  const oldTurnPromise = captureMetrics(() => harness.sendFinalTranscript('ขอสอบถามโปรโมชั่นหน่อยครับ'))
+  await delay(30)
+
+  const sentBeforeBargeIn = socket.sent.filter(e => e.event === 'media').length
+  assert.ok(sentBeforeBargeIn > 0, 'ต้องมีเสียง fallback คอมมิตไปแล้วก่อน barge-in')
+
+  harness.sendInterim('เดี๋ยวก่อนครับ ขอถามเรื่องถอนเงินก่อน') // trigger bargeIn ผ่าน interim แทนที่จะรอ final
+
+  const clearEvents = socket.sent.filter(e => e.event === 'clear')
+  assert.ok(clearEvents.length > 0, 'interim ต้อง trigger bargeIn ได้แม้ fallback เดิมยัง sttProcessing=true อยู่')
+
+  let newTurnCalls = 0
+  state.claudeStreamChunkedImpl = async function* () { newTurnCalls++; yield 'ตอบคำถามใหม่หลัง barge-in' }
+  state.ttsImpl = async function* () { yield Buffer.from('clean-new-turn-chunk') } // reset กัน stub เดิมที่ยังมี GHOST_AUDIO ค้างอยู่ปนกับเทิร์นใหม่
+
+  await harness.sendFinalTranscript('เดี๋ยวก่อนครับ ขอถามเรื่องถอนเงินก่อน')
+  assert.equal(newTurnCalls, 0, 'final ต้องถูก queue ไว้ก่อน — fallback เดิมยังไม่ปล่อย sttProcessing')
+
+  resumeStall()
+  const metrics = await oldTurnPromise
+
+  assert.equal(metrics.fallbackOutcome, 'STALE', 'fallback เดิมต้องรู้ตัวว่า generation เก่าแล้ว ไม่พยายาม recovery ซ้ำ')
+  const leaked = socket.sent.filter(e => e.event === 'media')
+    .some(e => Buffer.from(e.media.payload, 'base64').toString().includes('GHOST_AUDIO'))
+  assert.equal(leaked, false, 'ห้ามมี audio ของ generation เก่าหลุดออกไปเด็ดขาด (ไม่มี ghost audio)')
+  assert.equal(newTurnCalls, 1, 'ต้องมีเทิร์นใหม่พอดี 1 ครั้งจาก final ที่ถูก queue ไว้')
+
+  const lastUserMsg = session.messages.filter(m => m.role === 'user').at(-1)
+  assert.equal(lastUserMsg.content, 'เดี๋ยวก่อนครับ ขอถามเรื่องถอนเงินก่อน')
+
+  harness.disconnect(socket)
+})

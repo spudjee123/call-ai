@@ -62,6 +62,34 @@ function transcribeStream(onTranscript, onInterim) {
     coldStreamMuteUntil = 0 // stream ที่ prewarm ไว้ฟังมาสักพักแล้ว ไม่ใช่ cold start ไม่ต้อง mute
   }
 
+  // C6c follow-up (production discovery 2026-08-19): singleUtterance:true ทำให้ Google หยุดฟังทันทีที่จับ
+  // utterance จบ — เดิมพึ่ง audioStream.js เรียก reset() ตอนได้รับ Twilio 'mark' (ยืนยันเสียง AI เล่นจบสมบูรณ์)
+  // ถึงจะเปิดฟังใหม่ ทำให้ตลอดช่วงที่ AI กำลังพูด (หลายวินาที) ไม่มี stream ไหนฟังอยู่เลย พิสูจน์จาก production call
+  // จริงที่ลูกค้าพูดแทรกแล้วไม่มี STT event ใดๆ เกิดขึ้นเลย ไม่ใช่แค่ barge-in ไม่ทำงาน — ไม่มีจุดไหนแม้แต่ได้ยิน
+  //
+  // แก้โดยเปิดฟัง utterance ถัดไปทันทีที่ onTranscript() ของ utterance ปัจจุบัน deliver ออกไปแล้ว (ไม่ต้องรอ mark
+  // เลย) — ต้องเรียกจากจุดที่ transcript deliver ไปแล้วเท่านั้น (ไม่ใช่แค่เห็น END_OF_SINGLE_UTTERANCE event) กัน
+  // final ตัวจริงของ utterance เดิมหายไปก่อนถูกส่งออก และต้องเป็นคำสั่งสุดท้ายที่ caller เรียกเสมอ (หลัง
+  // interimText/utteranceClosed ของ utterance เดิมถูกจัดการเสร็จแล้ว) ไม่งั้น resetUtteranceState() ข้างในนี้
+  // (ที่ต้องเป็นคนกำหนด state เริ่มต้นของ stream ใหม่) จะถูกทับด้วย utteranceClosed=true ของ utterance เดิมทีหลัง
+  // ทำให้ stream ใหม่โดน mark ว่า closed ทั้งที่ยังไม่เคยเริ่มฟังอะไรเลย บล็อก interim ของ barge-in ตั้งแต่ต้น
+  function rotateForNextUtterance() {
+    if (destroyed) return
+    const draining = currentStream
+    if (nextStream) {
+      activatePrewarm()
+      console.log('[STT] Rotated to pre-warmed stream — listening continues through AI playback')
+    } else {
+      currentStream = null
+      resetUtteranceState()
+      createStream(false)
+      console.log('[STT] No pre-warm ready — creating fresh stream immediately (no wait for mark)')
+    }
+    // ปิด stream เก่าอย่างสุภาพเพื่อคืน resource — trailing event ของมันถูกกันด้วย `stream !== currentStream`
+    // ที่ต้นทาง .on('data') อยู่แล้วไม่ว่าจะปิดตรงนี้หรือไม่ ไม่มีความเสี่ยงเรื่อง final หายซ้ำ
+    if (draining) { try { draining.end() } catch (_) {} }
+  }
+
   function createStream(isPrewarm = false) {
     if (destroyed) return
     if (!isPrewarm && currentStream) return
@@ -127,9 +155,11 @@ function transcribeStream(onTranscript, onInterim) {
         interimTimer = setTimeout(() => {
           if (interimText && !destroyed) {
             console.log(`[STT] Interim→Final (${INTERIM_FINALIZE_MS}ms silence): "${interimText}"`)
-            onTranscript(interimText)
+            const deliveredText = interimText
             interimText = ''
             utteranceClosed = true
+            onTranscript(deliveredText)
+            rotateForNextUtterance() // ต้องอยู่ท้ายสุดเสมอ (ดูหมายเหตุที่ rotateForNextUtterance ด้านบน)
           }
         }, INTERIM_FINALIZE_MS)
         return
@@ -139,15 +169,17 @@ function transcribeStream(onTranscript, onInterim) {
       clearTimeout(interimTimer)
       interimTimer = null
       const finalText = text.trim()
-      if (!utteranceClosed) {
+      const shouldDeliver = !utteranceClosed
+      interimText = ''
+      utteranceClosed = false
+      if (shouldDeliver) {
         if (finalText) {
           onTranscript(finalText)
         } else {
           console.log('[STT] Final result but empty transcript')
         }
+        rotateForNextUtterance() // utterance นี้จบแล้วจริงไม่ว่าจะมี text หรือไม่ — เปิดฟังต่อทันที ไม่รอ mark
       }
-      interimText = ''
-      utteranceClosed = false
     })
     .on('end', () => {
       if (destroyed) return
@@ -202,17 +234,6 @@ function transcribeStream(onTranscript, onInterim) {
           setTimeout(() => createStream(false), 100)
         }
       }
-    },
-    reset() {
-      if (destroyed) return
-      errorRetryCount = 0
-      console.log('[STT] Resetting stream (AI done)')
-      try { currentStream?.end() } catch (_) {}
-      try { nextStream?.end() } catch (_) {}
-      currentStream = null
-      nextStream = null
-      resetUtteranceState()
-      createStream(false)
     },
     end() {
       if (destroyed) return

@@ -129,6 +129,7 @@ function registerWebSocket(fastify) {
     let lastMarkTime = 0
     let pendingEndCall = false
     let pendingTranscript = null  // C6c follow-up: barge-in ที่มาถึงตอนเทิร์นเดิมยังไม่ปล่อย sttProcessing — ช่องเดียว, latest-wins (ดูหมายเหตุที่ processTranscript())
+    let bargeInPendingFinal = false  // C6c follow-up (STT listening): true หลัง interim trigger bargeIn() ไปแล้ว — บอก onTranscript ว่า final ตัวถัดไปคือประโยคที่พูดแทรกจริง (ดูหมายเหตุที่ onTranscript ด้านล่าง)
     let activePipelineId = 0
     let prewarmPromise = null    // pre-warmed Claude response Promise<string|null>
     let prewarmStartText = null  // interim text that triggered prewarm
@@ -751,7 +752,11 @@ function registerWebSocket(fastify) {
           if (!transcript || !callActive) return
           if (pendingEndCall) return
           if (socket.readyState !== socket.OPEN) return
-          if (bargeInCooldown) {
+          // C6c follow-up (STT listening): ยกเว้น cooldown ให้ transcript ที่กำลังรออยู่ (bargeInPendingFinal) —
+          // นี่คือ final ตัวจริงของ utterance ที่ interim ของมันเองเพิ่งผ่าน echo/fragment filter มาแล้วจน trigger
+          // bargeIn() สำเร็จ ไม่ใช่สัญญาณใหม่ที่ยังไม่ผ่านการตรวจสอบ ถ้าปล่อยให้ cooldown (กันเสียงสะท้อนของ AI เอง
+          // ช่วงสั้นๆ 400ms) กลืนมันไปด้วย ประโยคที่ลูกค้าเพิ่งพูดแทรกจะหายไปทั้งที่ bargeIn() ทำงานถูกต้องแล้ว
+          if (bargeInCooldown && !bargeInPendingFinal) {
             console.log(`[STT] Transcript dropped (barge-in cooldown): "${transcript.substring(0, 40)}"`)
             return
           }
@@ -793,6 +798,18 @@ function registerWebSocket(fastify) {
             }
             await new Promise(r => setTimeout(r, 200))
             if (sttProcessing) return // เผื่อมี turn อื่นแทรกเข้ามาระหว่าง 200ms นี้
+          } else if (bargeInPendingFinal) {
+            // C6c follow-up (STT listening): interim ระหว่าง isSpeaking=true เพิ่ง trigger bargeIn() ไปแล้ว (ดู
+            // onInterim ด้านล่าง) — isSpeaking ถูก bargeIn() ตั้งเป็น false ไปแล้วตั้งแต่ตอนนั้น final ตัวนี้จึงไม่
+            // เข้า `if (isSpeaking)` ด้านบนอีก แต่คือประโยคที่พูดแทรกจริงที่รอมาส่งต่อ ไม่ใช่ transcript ทั่วไปที่ยัง
+            // ไม่เคย trigger อะไรเลย — ต้องใช้ path เดียวกับ queueing/pendingTranscript ไม่ใช่ปล่อยผ่านไป busy-drop
+            bargeInPendingFinal = false
+            if (sttProcessing) {
+              pendingTranscript = { session: currentSession, text: transcript }
+              console.log('[Barge-in] Final transcript after interim-triggered barge-in — queued (latest-wins)')
+              return
+            }
+            // sttProcessing ว่างแล้ว (เทิร์นเดิมจบไปแล้วจริงตั้งแต่ก่อน final นี้มาถึง) — ไปต่อด้านล่างได้เลยตามปกติ
           }
 
           if (sttProcessing) {
@@ -814,7 +831,27 @@ function registerWebSocket(fastify) {
 
           await processTranscript(currentSession, transcript)
         }, (interimText) => {
-          if (!callActive || isSpeaking || sttProcessing || bargeInCooldown) return
+          if (!callActive || bargeInCooldown) return
+
+          if (isSpeaking) {
+            // C6c follow-up (STT listening): STT ตอนนี้ฟังต่อเนื่องระหว่าง AI พูดจริงแล้ว (googleSTT.js rotate
+            // ทันทีหลัง utterance ก่อนหน้า deliver ไม่รอ Twilio mark อีกต่อไป) — interim ระหว่าง isSpeaking=true
+            // คือสัญญาณ interrupt-control เท่านั้น ต้อง trigger bargeIn() ทันทีไม่ว่า sttProcessing จะเป็นอะไร
+            // (เช็คก่อน sttProcessing เสมอ เหมือนที่แก้ไปแล้วใน onTranscript — sttProcessing ไม่มีสิทธิ์ขวาง
+            // interrupt control อีกต่อไป) เร็วกว่ารอ final ซึ่งมี debounce 900ms ในตัว แต่ห้ามส่ง text นี้เข้า
+            // Claude ตรงๆ เด็ดขาด — ต้องรอ final ของประโยคเดียวกันเสมอ (ดู bargeInPendingFinal ใน onTranscript ด้านบน)
+            // เพื่อไม่ให้ Claude เห็นประโยคที่พูดยังไม่จบ
+            const wordCount = interimText.trim().split(/\s+/).length
+            if (wordCount < 2 && interimText.length < 8) return // fragment สั้น = echo/noise เหมือน filter ของ final-transcript path
+            bargeIn()
+            bargeInPendingFinal = true // ตั้งเฉพาะตอน trigger จาก interim เท่านั้น — บอก onTranscript ว่า final ตัวถัดไปคือประโยคที่พูดแทรกจริง
+            bargeInCooldown = true
+            setTimeout(() => { bargeInCooldown = false }, 400)
+            return
+          }
+
+          if (sttProcessing) return // ไม่ trigger prewarm ระหว่างกำลัง process เทิร์นอื่นอยู่ (isSpeaking=false แต่ sttProcessing=true) — พฤติกรรมเดิม
+
           clearSilenceTimer()
           silencePromptCount = 0
           // C3c: prewarm ยิง askClaudeStream เดิมเสมอ ไม่เกี่ยวกับ chunked path เลย — สายที่ freeze เป็น chunked
@@ -889,7 +926,9 @@ function registerWebSocket(fastify) {
           setTimeout(() => { if (socket.readyState === socket.OPEN) socket.close() }, 1000)
           return
         }
-        if (!bargeInCooldown && !sttProcessing) sttStream?.reset()
+        // C6c follow-up (STT listening): ไม่ reset() STT stream ที่นี่อีกต่อไป — googleSTT.js rotate stream ให้
+        // ฟัง utterance ถัดไปทันทีตั้งแต่ตอน utterance ก่อนหน้า deliver แล้ว (ไม่รอ mark) ถ้า reset() ซ้ำตรงนี้อีก
+        // จะเสี่ยงทำลาย stream ที่กำลังฟังลูกค้าพูดอยู่จริง (เช่น ลูกค้าเริ่มพูดพอดีตอน mark มาถึง) โดยไม่จำเป็น
         startSilenceTimer()
       }
 
@@ -901,6 +940,7 @@ function registerWebSocket(fastify) {
         clearPrewarm()
         endCall(callState)
         pendingTranscript = null // C6c follow-up: กัน pending transcript ของสายที่จบไปแล้วถูก drain ทีหลัง (แม้ processTranscript() จะเช็ค callActive ป้องกันไว้อีกชั้นอยู่แล้วก็ตาม)
+        bargeInPendingFinal = false
         if (sttStream) { sttStream.end(); sttStream = null }
       }
     })
@@ -913,6 +953,7 @@ function registerWebSocket(fastify) {
       clearDurationTimer()
       endCall(callState)
       pendingTranscript = null // C6c follow-up: เช่นเดียวกับ 'stop' — กัน reference ค้างถ้าปิดสายจาก close โดยไม่มี stop event มาก่อน
+      bargeInPendingFinal = false
       if (sttStream) { sttStream.end(); sttStream = null }
       // ถ้ายังไม่มีเหตุผลปิดสายถูก tag ไว้เลย (ไม่ใช่ AI ปิดปกติ/หมดเวลาเงียบ) แปลว่าอีกฝั่งวางสายเอง
       const endedSession = callSessions.get(callSid)
