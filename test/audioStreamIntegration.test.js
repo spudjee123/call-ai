@@ -694,3 +694,21 @@ test('20) DoD D: interim trigger bargeIn ระหว่าง fallback ที�
 
   harness.disconnect(socket)
 })
+
+// ===== L1a — rollout-scoped STT endpoint experiment: audioStream.js ต้องเลือก interimFinalizeMs ถูก branch =====
+// mechanism ของ googleSTT.js เองพิสูจน์แยกไว้แล้วใน test/googleSTT.test.js — เทสชุดนี้พิสูจน์แค่ฝั่ง wiring:
+// audioStream.js ต้องส่งค่าที่ "ตรงกับ rollout ที่ freeze แล้วของสายนั้น" เข้า transcribeStream() จริง ไม่ใช่ค่าคงที่
+
+test('21) L1a: legacy (rollout=0%) ต้องส่ง interimFinalizeMs=900 (ค่า default เดิม) เข้า transcribeStream()', async () => {
+  const callSid = nextCallSid()
+  const { socket, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+  assert.equal(state.lastSttOptions?.interimFinalizeMs, 900, 'legacy ต้องไม่ถูกกระทบจาก experiment เลย ต้องได้ 900ms เดิมเป๊ะ')
+  harness.disconnect(socket)
+})
+
+test('22) L1a: chunked (rollout=100%) ต้องส่ง interimFinalizeMs=600 (ค่าทดลอง) เข้า transcribeStream()', async () => {
+  const callSid = nextCallSid()
+  const { socket, state } = await connectPastGreeting(callSid) // rolloutPercent=100 default
+  assert.equal(state.lastSttOptions?.interimFinalizeMs, 600, 'chunked ต้องได้ค่าทดลอง 600ms ตาม L1a')
+  harness.disconnect(socket)
+})

@@ -26,7 +26,11 @@ const STT_CONFIG = {
   enableAutomaticPunctuation: true,
 }
 
-function transcribeStream(onTranscript, onInterim) {
+// L1a (latency optimization, rollout-scoped STT endpoint experiment): interimFinalizeMs รับจากภายนอกได้แล้ว
+// default 900ms เดิมทุกประการถ้า caller ไม่ส่งอะไรมา — googleSTT.js เป็น STT ตัวเดียวที่ legacy และ chunked
+// path ใช้ร่วมกัน เปลี่ยนค่า default ตรงๆ จะกระทบ legacy production ทุกสายทันทีโดยไม่ผูกกับ chunked rollout เลย
+// ต้องให้ audioStream.js เป็นคนตัดสินใจค่าต่อสาย (ตาม rollout ที่ freeze แล้วตอน 'start') แล้วส่งเข้ามาแทน
+function transcribeStream(onTranscript, onInterim, { interimFinalizeMs = 900 } = {}) {
   let destroyed = false
   let currentStream = null
   let nextStream = null
@@ -40,7 +44,7 @@ function transcribeStream(onTranscript, onInterim) {
   let utteranceClosed = false  // true after timer delivers transcript — blocks trailing interims and isFinal duplicate
   // เดิม 1500ms — วัดจาก log จริงพบว่า Google isFinal แทบไม่เคยมาทัน ต้องพึ่ง timer นี้ตัดสินใจแทบทุกครั้ง
   // ทำให้ลูกค้าต้องรอเงียบเต็ม 1.5 วิทุกรอบก่อน AI จะเริ่มคิดคำตอบด้วยซ้ำ ลดลงมาก่อนเป็นค่าที่ยังกันลูกค้าหยุดคิดกลางประโยคได้
-  const INTERIM_FINALIZE_MS = 900
+  const INTERIM_FINALIZE_MS = interimFinalizeMs
 
   // จากสายจริงหลายสาย เจอคำหลอน ("สงคราม", "โทรศัพท์", "โลตัส") ที่ไม่เกี่ยวกับที่ลูกค้าพูดเลย
   // เกิดเป็นคำแรกทันทีหลัง "Creating new stream" ทุกครั้ง — คาดว่าเป็นเสียงสะท้อน/สัญญาณตกค้างตรงรอยต่อสาย
@@ -210,6 +214,7 @@ function transcribeStream(onTranscript, onInterim) {
     }
   }
 
+  console.log(`[STT Config] interimFinalizeMs=${interimFinalizeMs}`) // ยืนยันได้จาก production log ว่าสายนี้เข้า branch ไหนจริง (legacy 900 / chunked experiment 600)
   createStream(false)
 
   return {

@@ -14,6 +14,13 @@ const { performance } = require('perf_hooks')
 
 const MAX_CALL_DURATION_MS = (parseInt(process.env.MAX_CALL_DURATION_SECONDS) || 300) * 1000
 
+// L1a (latency optimization, rollout-scoped STT endpoint experiment) — googleSTT.js's default
+// INTERIM_FINALIZE_MS (900ms) เป็นค่าเดียวที่ legacy และ chunked path ใช้ร่วมกันมาตลอด ห้ามแก้ default ตรงๆ
+// เพราะจะกระทบ legacy production ทุกสายทันทีโดยไม่ผูกกับ chunked rollout เลย (rollout=0% จะไม่ป้องกันอะไรเลย)
+// ต้องคำนวณค่านี้ "หลัง" rollout ถูก freeze ต่อสายแล้วเท่านั้น (จุดเดียวกับที่ rollout เองถูก freeze — ดู 'start')
+// legacy ยังคง 900ms เดิม 100% เสมอ, chunked ได้ค่าทดลอง 600ms เฉพาะตอน controlled exposure เท่านั้น
+const STT_INTERIM_FINALIZE_MS_CHUNKED = 600
+
 // Checkpoint C5: % rollout ของ chunked-streaming path มาจาก Google Sheets แล้ว (แท็บ "Streaming Config")
 // ผ่าน background polling ของตัวเอง ไม่ใช่ hardcoded คงที่แบบ C0 อีกต่อไป — start() ครั้งเดียวตอน module load
 // (เท่ากับตอน process bootstrap เพราะไฟล์นี้ถูก require ครั้งเดียวตอนเริ่ม server) ให้เริ่ม poll ทันที ไม่ต้องรอ
@@ -392,6 +399,9 @@ function registerWebSocket(fastify) {
         // แค่ตอนนี้จุดเดียว ไม่อ่านซ้ำอีกเลยตลอดสาย แม้ % ใน Sheets จะเปลี่ยนกลางสายก็ไม่กระทบสายที่ freeze ไปแล้ว
         rollout = decideRollout(callSid, rolloutConfig.getCurrentRolloutPercent())
         console.log(`[Rollout] callSid=${callSid} bucket=${rollout.bucket} percent=${rollout.percentAtStart} chunked=${rollout.useChunkedStreaming}`)
+
+        // L1a: ต้องคำนวณหลัง rollout freeze แล้วเท่านั้น (ดูหมายเหตุที่ค่าคงที่ด้านบนไฟล์)
+        const interimFinalizeMs = rollout.useChunkedStreaming ? STT_INTERIM_FINALIZE_MS_CHUNKED : 900
 
         console.log(`[WS] Stream started: ${streamSid}`)
 
@@ -859,7 +869,7 @@ function registerWebSocket(fastify) {
           if (rollout?.useChunkedStreaming) return
           const session = callSessions.get(callSid)
           if (session) startPrewarm(session, interimText)
-        })
+        }, { interimFinalizeMs })
 
         // AI ทักทายก่อนเลย — ใช้ pre-generated audio ถ้ามี (ลด latency)
         const playGreeting = async () => {

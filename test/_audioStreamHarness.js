@@ -45,9 +45,10 @@ function ensureStubbed() {
   require.cache[sttPath] = {
     id: sttPath, filename: sttPath, loaded: true,
     exports: {
-      transcribeStream: (onTranscript, onInterim) => {
+      transcribeStream: (onTranscript, onInterim, options) => {
         state.lastSttCallbacks = { onTranscript, onInterim }
-        return { write: () => {}, end: () => {}, reset: () => {} }
+        state.lastSttOptions = options // L1a: ให้เทสตรวจได้ว่า interimFinalizeMs ที่ audioStream.js ส่งเข้ามาตรงกับ rollout ของสายนั้นจริง
+        return { write: () => {}, end: () => {} }
       },
     },
   }

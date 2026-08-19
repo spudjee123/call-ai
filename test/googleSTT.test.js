@@ -105,3 +105,87 @@ test('late isFinal จาก stream เก่าหลัง rotate ไปแล
 
   sttStream.end()
 })
+
+// ===== L1a — rollout-scoped STT endpoint experiment (interimFinalizeMs configurable) =====
+// googleSTT.js เป็น STT ตัวเดียวที่ legacy และ chunked path ใช้ร่วมกัน ห้ามเปลี่ยน default 900ms ตรงๆ เพราะจะ
+// กระทบ legacy production ทุกสายทันที — เทสชุดนี้พิสูจน์ว่า (1) ไม่ส่ง option เลย ยังคง 900ms เป๊ะ (กัน legacy ถูก
+// กระทบ) (2) ส่ง option มา ใช้ค่านั้นจริง (3) mechanism เดิมทั้งหมด (cancel timer เมื่อ isFinal จริงมาก่อน, rotate
+// หลัง deliver, cleanup ตอน end()) ยังทำงานถูกต้องไม่ว่า threshold จะเป็นค่าไหน
+
+test('L1a: ไม่ส่ง option เลย → default ยัง 900ms เหมือนเดิมทุกประการ (legacy ต้องไม่ถูกกระทบ)', async () => {
+  createdStreams = []
+  const transcripts = []
+  const sttStream = transcribeStream((t) => transcripts.push(t), () => {})
+  const first = createdStreams[0]
+
+  emitInterim(first, 'ทดสอบ default')
+  await delay(700) // ยังไม่ถึง 900ms
+  assert.equal(transcripts.length, 0, 'default ต้องยังไม่ deliver ที่ 700ms (ถ้า deliver แปลว่าเผลอใช้ threshold ต่ำกว่า 900 ไปแล้ว)')
+
+  await delay(300) // รวม ~1000ms แล้ว เกิน 900ms
+  assert.deepEqual(transcripts, ['ทดสอบ default'])
+
+  sttStream.end()
+})
+
+test('L1a: interimFinalizeMs=600 (chunked experiment) → deliver เร็วขึ้นจริงตามค่าที่ส่งมา', async () => {
+  createdStreams = []
+  const transcripts = []
+  const sttStream = transcribeStream((t) => transcripts.push(t), () => {}, { interimFinalizeMs: 600 })
+  const first = createdStreams[0]
+
+  emitInterim(first, 'ทดสอบ 600')
+  await delay(400) // ยังไม่ถึง 600ms
+  assert.equal(transcripts.length, 0, 'ยังไม่ควร deliver ก่อนถึง 600ms')
+
+  await delay(300) // รวม ~700ms แล้ว เกิน 600ms
+  assert.deepEqual(transcripts, ['ทดสอบ 600'])
+
+  sttStream.end()
+})
+
+test('L1a: real Google isFinal มาก่อน synthetic timer (600ms) จะครบ → ต้อง cancel timer ถูก ไม่ deliver ซ้ำ', async () => {
+  createdStreams = []
+  const transcripts = []
+  const sttStream = transcribeStream((t) => transcripts.push(t), () => {}, { interimFinalizeMs: 600 })
+  const first = createdStreams[0]
+
+  emitInterim(first, 'ทดสอบ')
+  await delay(200) // ยังไม่ถึง 600ms
+  emitFinal(first, 'ทดสอบ') // Google ส่ง isFinal จริงมาก่อน timer จะครบ
+
+  await delay(700) // รอเลย 600ms ไปมากๆ เผื่อ timer เดิมไม่ได้ถูก cancel จะ deliver ซ้ำ
+  assert.deepEqual(transcripts, ['ทดสอบ'], 'ต้อง deliver แค่ครั้งเดียวจาก isFinal จริง ไม่ใช่สองครั้ง (isFinal + synthetic timer ที่ควรถูก cancel ไปแล้ว)')
+
+  sttStream.end()
+})
+
+test('L1a: rotation ยังเกิดหลัง transcript deliver แม้ threshold จะเปลี่ยนเป็น 600ms', async () => {
+  createdStreams = []
+  const transcripts = []
+  const sttStream = transcribeStream((t) => transcripts.push(t), () => {}, { interimFinalizeMs: 600 })
+  const first = createdStreams[0]
+
+  emitInterim(first, 'ทดสอบ')
+  await delay(650)
+
+  assert.deepEqual(transcripts, ['ทดสอบ'])
+  assert.equal(createdStreams.length, 2, 'ต้อง rotate ไปใช้ prewarm stream ที่สองทันที เหมือนกับ default 900ms')
+  assert.equal(first.ended, true)
+
+  sttStream.end()
+})
+
+test('L1a: end() ระหว่าง timer ยังรอ (ก่อนครบ interimFinalizeMs) ต้อง cancel timer ไม่ deliver อะไรเลยหลัง end', async () => {
+  createdStreams = []
+  const transcripts = []
+  const sttStream = transcribeStream((t) => transcripts.push(t), () => {}, { interimFinalizeMs: 600 })
+  const first = createdStreams[0]
+
+  emitInterim(first, 'ทดสอบ')
+  await delay(200) // ยังไม่ถึง 600ms
+  sttStream.end() // จำลอง stop/close event — ต้อง clearTimeout(interimTimer) ให้ถูก
+
+  await delay(700) // รอเลยเวลาที่ timer เดิมควรจะครบไปมากๆ
+  assert.equal(transcripts.length, 0, 'ห้าม deliver อะไรเลยหลังจากที่ end() ไปแล้ว แม้ timer เดิมจะยังไม่ครบตอนนั้นก็ตาม')
+})
