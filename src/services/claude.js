@@ -13,17 +13,66 @@ function greetingInstruction(session) {
   return session.direction === 'inbound' ? INBOUND_GREETING_INSTRUCTION : OUTBOUND_GREETING_INSTRUCTION
 }
 
-// ใช้สำหรับ greeting เท่านั้น — Haiku เพราะต้องการ latency ต่ำ
-async function askClaude(session) {
+// G1 (production defect 2026-08-20) — greeting เคยถูกตัดกลางคำจริงใน production (max_tokens: 60 ไม่พอสำหรับ
+// ประโยคไทยบางประโยค) โดยไม่มี completion check ใดๆ เลย ระบบจึงพูดข้อความที่ตัดกลางคำออกไปให้ลูกค้าฟังตรงๆ
+// เพิ่ม margin (60→120) อย่างเดียวไม่พอ เพราะ prompt/ชื่อลูกค้ายาวขึ้นในอนาคตก็ทำให้เกิดซ้ำได้ — ต้องมี completion
+// check + fallback ที่ deterministic ด้วย
+const GREETING_MAX_TOKENS = 120
+
+// fallback ต้องแยกตาม direction เหมือน greetingInstruction() เอง — inbound (ลูกค้าโทรเข้ามาเอง) ไม่ควรถาม
+// "สะดวกคุยไหม" (ดูเหตุผลเดิมที่ greetingInstruction ด้านบน) ถ้าใช้ fallback เดียวปนกันจะทำให้ inbound behavior
+// regress เงียบๆ เฉพาะตอน fallback trigger เท่านั้น (เคสที่ test ปกติมักไม่ได้ครอบคลุม)
+function outboundFallbackGreeting(name) {
+  return `สวัสดีค่ะคุณ${name} ฟ้าจากพีจีด็อกนะคะ โทรมาทักทายและขอบคุณที่เข้ามาเป็นสมาชิกค่ะ สะดวกคุยสักครู่ไหมคะ`
+}
+function inboundFallbackGreeting(name) {
+  return `สวัสดีค่ะคุณ${name} ฟ้าจากพีจีด็อกนะคะ มีอะไรให้ช่วยไหมคะ`
+}
+function fallbackGreeting(session) {
+  return session.direction === 'inbound' ? inboundFallbackGreeting(session.name) : outboundFallbackGreeting(session.name)
+}
+
+// defensive: ห้ามอ่าน response.content[0].text ตรงๆ — ถ้า response ไม่มี text block เลย (เช่นตอบด้วย content
+// block ชนิดอื่นล้วนๆ) การ index ตรงๆ จะ throw ก่อนถึง fallback logic เสียอีก ทำให้เคส "!text → fallback" ที่
+// ตั้งใจไว้ไม่มีทางถูกใช้งานจริง
+function extractGreetingText(response) {
+  return response.content?.find(block => block.type === 'text')?.text?.trim() || ''
+}
+
+async function requestGreetingOnce(session) {
   const { name, campaign } = session
   const systemPrompt = buildSystemPrompt(campaign.script || campaign.system_prompt, name)
   const response = await client.messages.create({
     model: 'claude-haiku-4-5-20251001',
-    max_tokens: 60,
+    max_tokens: GREETING_MAX_TOKENS,
     system: systemPrompt,
     messages: [{ role: 'user', content: greetingInstruction(session) }],
   })
-  return response.content[0].text.trim()
+  const text = extractGreetingText(response)
+  console.log(`[GreetingGen] stopReason=${response.stop_reason} length=${text.length}`)
+  return { text, stopReason: response.stop_reason }
+}
+
+// ใช้สำหรับ greeting เท่านั้น — Haiku เพราะต้องการ latency ต่ำ
+//
+// completion policy (G1):
+//   attempt 1: end_turn + text        → accept
+//              max_tokens             → retry ครั้งเดียว
+//              empty text (ไม่ใช่ max_tokens) → fallback ทันที ไม่ retry (deterministic copy ที่ถูกต้องอยู่แล้ว
+//                                        retry เพิ่มแค่เสีย latency โดยไม่ได้ประโยชน์)
+//   attempt 2: complete + text        → accept
+//              max_tokens/empty       → fallback
+async function askClaude(session) {
+  let result = await requestGreetingOnce(session)
+  if (result.stopReason === 'max_tokens') {
+    console.error('[GreetingGen] Truncated (max_tokens) — retrying once')
+    result = await requestGreetingOnce(session)
+  }
+  if (result.stopReason === 'max_tokens' || !result.text) {
+    console.error(`[GreetingGen] Still incomplete after retry (stopReason=${result.stopReason}, length=${result.text.length}) — using deterministic fallback`)
+    return fallbackGreeting(session)
+  }
+  return result.text
 }
 
 async function summarizeCall(session) {
