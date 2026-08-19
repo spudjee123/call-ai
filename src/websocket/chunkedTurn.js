@@ -49,7 +49,11 @@ const { isCurrentGeneration } = require('../utils/generationGuard')
 // onFirstTtsRequest/onFirstTtsAudio (C4b Watchdog C) เป็น first-only ของทั้งเทิร์น เหมือน t5/t6 เอง — ถ้า chunk
 // #1 คอมมิตเสียงไปแล้วและ chunk #2 เริ่ม TTS ใหม่ ฮุคเหล่านี้จะไม่ยิงซ้ำ (เช็คจาก turnMetrics.t5/t6 == null ก่อน
 // markOnce เสมอ ไม่ใช่ per-call) — Watchdog C วัดแค่ "ได้ audio ก้อนแรกของทั้งเทิร์นไหม" ไม่ใช่ทุก TTS chunk
-async function synthesizeAndSend({ text, signal, socket, streamSid, voiceId, turnMetrics, turnState, isCurrent, startingSentCount, onFirstAudioSent, onFirstTtsRequest, onFirstTtsAudio }) {
+//
+// onAudioSent (C4c follow-up: commit-aware fallback watchdog) ตรงข้ามกับสองตัวบน — ยิงทุกก้อนที่ส่งสำเร็จ
+// จริง ไม่ใช่ first-only เสมอมาหลัง markAudioCommitted() แล้วเท่านั้น ให้ caller (เช่น fallback's post-commit
+// idle watchdog ใน audioStream.js) ใช้ commit เป็น source of truth ในการ rearm ทุกครั้งที่มี progress จริง
+async function synthesizeAndSend({ text, signal, socket, streamSid, voiceId, turnMetrics, turnState, isCurrent, startingSentCount, onFirstAudioSent, onAudioSent, onFirstTtsRequest, onFirstTtsAudio }) {
   if (!isCurrent() || signal?.aborted) return 0
 
   const isFirstTtsRequest = turnMetrics.t5 == null
@@ -71,8 +75,9 @@ async function synthesizeAndSend({ text, signal, socket, streamSid, voiceId, tur
     if (startingSentCount + sentCount === 0) console.log('[TTS] First audio chunk sent')
     socket.send(JSON.stringify({ event: 'media', streamSid, media: { payload: audioChunk.toString('base64') } }))
     markOnce(turnMetrics, 't7')
-    markAudioCommitted(turnState)
+    markAudioCommitted(turnState) // ต้องมาก่อน onAudioSent เสมอ — commit คือ source of truth ที่ caller (เช่น fallback's idle watchdog) ใช้ตัดสินใจ ไม่ใช่แค่ "ส่งไปแล้ว"
     if (startingSentCount + sentCount === 0) onFirstAudioSent?.()
+    onAudioSent?.() // ทุกก้อน (ไม่ใช่ first-only เหมือน onFirstAudioSent) — granularity เดียวกับ sentCount/totalSent ที่ caller ใช้อยู่แล้ว ไม่ใช่ raw ElevenLabs byte frame
     sentCount++
   }
   return sentCount
@@ -84,9 +89,9 @@ async function synthesizeAndSend({ text, signal, socket, streamSid, voiceId, tur
 //
 // หมายเหตุ: ไม่รับ onFirstTtsRequest/onFirstTtsAudio ตอนนี้ — Watchdog C ยังไม่ครอบคลุมการเรียกผ่านทางนี้
 // (follow-up หลัง blocked end_call, หรือ TTS ของ legacy fallback ใน audioStream.js) เป็น gap ที่รู้ไว้ก่อน
-async function speakFixedText({ text, signal, socket, streamSid, voiceId, turnMetrics, turnState, callState, generationId, onFirstAudioSent, startingSentCount = 0 }) {
+async function speakFixedText({ text, signal, socket, streamSid, voiceId, turnMetrics, turnState, callState, generationId, onFirstAudioSent, onAudioSent, startingSentCount = 0 }) {
   const isCurrent = () => isCurrentGeneration(callState, generationId)
-  const sentCount = await synthesizeAndSend({ text, signal, socket, streamSid, voiceId, turnMetrics, turnState, isCurrent, startingSentCount, onFirstAudioSent })
+  const sentCount = await synthesizeAndSend({ text, signal, socket, streamSid, voiceId, turnMetrics, turnState, isCurrent, startingSentCount, onFirstAudioSent, onAudioSent })
   return { sentCount }
 }
 

@@ -35,15 +35,23 @@ const CHUNK_READY_TIMEOUT_MS = 2000
 // ด้วยข้อมูลจริงจาก [Metrics] log ก่อนเปิด rollout เกิน 0%
 const TTS_FIRST_AUDIO_TIMEOUT_MS = 2000
 
-// Checkpoint C4c — timeout รวมของ legacy fallback ทั้งก้อน (Claude แบบไม่ stream + TTS) ไม่ใช่ staged เหมือน
-// A/B/C เพราะนี่คือ "ความพยายามสุดท้าย" ของเทิร์นนี้แล้ว — ถ้าไม่ทันเวลานี้ก็จบเทิร์นแบบไม่มีเสียงไปเลย ไม่พยายาม
-// fallback ซ้อน fallback (จะเปิด recursion/retry complexity โดยไม่จำเป็น) ตั้งไว้กว้างกว่า budget รวมของ
-// chunked path เพราะ askClaudeStream ต้องรอ "คำตอบเต็มก้อน" ก่อนถึงจะเริ่ม TTS ได้ ไม่ใช่ stream ทีละ token
+// Checkpoint C4c follow-up (production incident 2026-08-19, C6c barge-in retry call) — fallback watchdog เดิม
+// เป็น total-duration timeout ครอบ "ความพยายาม fallback ทั้งก้อน" เดียว ซึ่งพิสูจน์แล้วจาก production ว่าอันตราย:
+// ถ้า audio ก้อนแรกคอมมิตไปถึงลูกค้าแล้วก่อน 8s แต่ ElevenLabs stream ที่เหลือช้า/ค้าง watchdog เดิมจะ abort()
+// signal ที่ synthesizeAndSend ใช้อยู่ ตัดเสียงกลางประโยคทั้งที่ลูกค้าได้ยินไปบางส่วนแล้ว แถม runAttemptWithWatchdog
+// ทิ้งผลลัพธ์ของฝ่ายแพ้ race เสมอ (by design ถูกต้องสำหรับ watchdog A/B/C ที่ไม่มีอะไรคอมมิตมาก่อน) ทำให้
+// totalSent/fullText ของ audio ที่ส่งไปแล้วจริงหายไปเป็น 0/'' ด้วย — turn ถัดไปไม่รู้ว่า AI เพิ่งพูดอะไรไป
 //
-// ตั้งชื่อ FALLBACK_TIMEOUT (ไม่ใช่ FALLBACK_TTS_TIMEOUT) เพราะ timer นี้ครอบทั้ง askClaudeStream + TTS รวมกัน
-// ไม่ใช่แค่ TTS — ถ้า Claude เองช้าจน timeout ป้ายที่ผิดจะชี้ทางแก้ผิดจุดตอนวิเคราะห์ production traces ทีหลัง
-// ถ้าวันหลังอยากแยกจริงๆ ค่อยเพิ่ม milestone watchdog ของ fallback เอง (FALLBACK_CLAUDE_TIMEOUT/FALLBACK_TTS_TIMEOUT)
-const FALLBACK_TIMEOUT_MS = 8000
+// แก้เป็น 2 phase แยกจากกันชัดเจน ผ่าน armWatchdog rearm (กลไกเดียวกับ Watchdog A→B→C):
+//   Phase 1 (pre-commit)  — FALLBACK_PRECOMMIT_TIMEOUT_MS ตั้งแต่ fallback เริ่ม จนกว่าจะมี audio commit ก้อนแรก
+//                           ถ้าหมดเวลาก่อน commit: abort ได้เต็มที่เหมือนเดิม (audioCommitted ยังเป็น false แน่นอน)
+//   Phase 2 (post-commit) — FALLBACK_IDLE_TIMEOUT_MS แบบ rolling (rearm ใหม่ทุกครั้งที่มีก้อนเสียงส่งสำเร็จ ผ่าน
+//                           onAudioSent hook ใน chunkedTurn.js) วัด "หยุดนิ่งไปนานแค่ไหน" ไม่ใช่ "รวมนานแค่ไหน"
+//                           เพราะเทิร์นที่พูดยาวโดยธรรมชาติ (>8s ทั้งเทิร์น) ต้องไม่ถูกตัดกลางคันทั้งที่ progress ปกติ
+//
+// commit (turnState.audioCommitted) คือ source of truth เดียวที่บอกว่าอยู่ phase ไหน — ไม่ใช่ timestamp/ตัวนับเอง
+const FALLBACK_PRECOMMIT_TIMEOUT_MS = 8000
+const FALLBACK_IDLE_TIMEOUT_MS = 6000
 
 function shouldBlockEndCall(session, aiResponse) {
   const userMessages = session.messages.filter(m => m.role === 'user')
@@ -58,7 +66,7 @@ function shouldBlockEndCall(session, aiResponse) {
 // สำหรับเทิร์นเดียวกันนี้ แทนที่จะปล่อยให้ลูกค้าเงียบไปเฉยๆ ไม่ bump generation เพราะนี่คือการกู้ turn เดิม
 // ไม่ใช่ turn ใหม่ — เป็น adapter ระหว่าง legacy transport ([END_CALL] string marker) กับรูปแบบที่ chunked
 // branch ใช้อยู่แล้ว (endCallRequested boolean) ก่อน TTS เสมอ กัน marker หลุดเข้าไปให้ speakFixedText() พูดออกไปจริง
-async function runLegacyFallback({ session, signal, socket, streamSid, voiceId, turnMetrics, turnState, callState, generationId }) {
+async function runLegacyFallback({ session, signal, socket, streamSid, voiceId, turnMetrics, turnState, callState, generationId, onAudioSent }) {
   let rawText = null
   for await (const chunk of askClaudeStream(session, false, signal)) {
     if (signal.aborted) break
@@ -73,7 +81,7 @@ async function runLegacyFallback({ session, signal, socket, streamSid, voiceId, 
     return { fullText: spokenText, endCallRequested: legacyEndCallRequested, totalSent: 0 }
   }
 
-  const result = await speakFixedText({ text: spokenText, signal, socket, streamSid, voiceId, turnMetrics, turnState, callState, generationId, startingSentCount: 0 })
+  const result = await speakFixedText({ text: spokenText, signal, socket, streamSid, voiceId, turnMetrics, turnState, callState, generationId, startingSentCount: 0, onAudioSent })
   return { fullText: spokenText, endCallRequested: legacyEndCallRequested, totalSent: result.sentCount }
 }
 
@@ -551,16 +559,27 @@ function registerWebSocket(fastify) {
                   turnMetrics.fallbackStartedAt = performance.now()
                   console.log('[Fallback] Falling back to legacy Claude/TTS for this turn')
 
-                  // C4c: fallback มี terminal timeout ของตัวเอง ไม่ staged เหมือน A/B/C — ถ้าไม่ทันก็จบเทิร์นเลย
-                  // ไม่พยายาม fallback ซ้อน fallback (recursion complexity โดยไม่จำเป็น) ใช้ primitive เดียวกัน
-                  // แต่ run() ไม่เรียก arm() เองเลย จึงเป็นแค่ single-shot timeout ธรรมดา ไม่มีการ rearm
+                  // C4c follow-up: 2-phase commit-aware watchdog — pre-commit terminal timeout, แทนที่ด้วย
+                  // rolling post-commit idle timeout ทันทีที่มีก้อนเสียงคอมมิตจริง (ผ่าน onAudioSent ที่ rearm
+                  // ทุกครั้ง — ก้อนแรกก็เข้ามาแทนที่ precommit timer ไปในตัวเพราะ arm() clear timer เดิมก่อนตั้งใหม่เสมอ)
+                  //
+                  // fallbackProgress คือ side-channel นอก race โดยตั้งใจ — runAttemptWithWatchdog ทิ้งผลลัพธ์ของ
+                  // ฝ่ายแพ้ race เสมอเมื่อ watchdog ชนะ (ถูกต้องสำหรับ pre-commit ที่ยังไม่มีอะไรคอมมิต) แต่ totalSent
+                  // ที่คอมมิตไปแล้วจริงก่อน timeout/error ต้องรอดจากการทิ้งนั้นได้ จึงเก็บนอก return value ของ run()
+                  const fallbackProgress = { totalSent: 0 }
                   const fallbackAttempt = await runAttemptWithWatchdog({
                     signal,
-                    timeoutMs: FALLBACK_TIMEOUT_MS,
+                    timeoutMs: FALLBACK_PRECOMMIT_TIMEOUT_MS,
                     reason: 'FALLBACK_TIMEOUT',
-                    run: (fallbackSignal) => runLegacyFallback({
+                    run: (fallbackSignal, armWatchdog) => runLegacyFallback({
                       session: currentSession, signal: fallbackSignal, socket, streamSid,
                       voiceId: currentSession.campaign.voice_id, turnMetrics, turnState, callState, generationId,
+                      onAudioSent: () => {
+                        // granularity เดียวกับ totalSent เดิมเป๊ะ — นับก้อนที่ synthesizeAndSend ส่งสำเร็จ ไม่ใช่ raw
+                        // ElevenLabs/Twilio byte frame (ถ้าวันหลังอยากนับ frame แยกต่างหาก ใช้ field ใหม่คนละชื่อ)
+                        fallbackProgress.totalSent++
+                        armWatchdog(FALLBACK_IDLE_TIMEOUT_MS, 'FALLBACK_PARTIAL_TIMEOUT')
+                      },
                     }),
                   })
 
@@ -582,13 +601,35 @@ function registerWebSocket(fastify) {
                       turnMetrics.fallbackOutcome = 'STALE'
                       console.log('[Fallback] Generation went stale while legacy fallback was in flight — discarding its result')
                     }
-                  } else if (fallbackAttempt.outcome === 'timeout') {
-                    turnMetrics.fallbackOutcome = 'FALLBACK_TIMEOUT'
-                    console.error('[Fallback] FALLBACK_TIMEOUT — giving up, no further recovery attempted for this turn')
-                  } else {
-                    turnMetrics.fallbackOutcome = 'FALLBACK_ERROR'
-                    console.error('[Fallback error]', fallbackAttempt.error.message)
-                    healthMonitor.reportError('ai_tts_fallback', fallbackAttempt.error.message)
+                  } else if (fallbackAttempt.outcome === 'timeout' || fallbackAttempt.outcome === 'error') {
+                    // production incident 2026-08-19: turnState.audioCommitted (ไม่ใช่ outcome type เฉยๆ) คือตัว
+                    // ตัดสินใจเดียวว่านี่คือ "ไม่มีเสียงออกเลย" หรือ "มีเสียงออกไปแล้วบางส่วนก่อนพัง" — ต้องแยกให้ชัด
+                    // ไม่งั้น downstream (ai_done mark ไปยัง Twilio, playback-unlock timer) จะเข้าใจผิดว่าไม่มีเสียงออก
+                    // ทั้งที่ลูกค้าได้ยินไปแล้วจริง (นี่คือบั๊กที่เจอจาก production trace ของสายทดสอบ barge-in retry)
+                    if (turnState.audioCommitted) {
+                      totalSent = fallbackProgress.totalSent
+                      // ระบบไม่มี text↔audio word-level mapping จริง — ห้ามใส่ spokenText เต็มก้อนเป็น assistant
+                      // history เพราะไม่รู้ว่าพูดถึงคำไหนจริง ใส่ marker ตรงไปตรงมาแทน ให้ Claude เทิร์นถัดไปรู้บริบท
+                      // โดยไม่ assume ว่าลูกค้าได้ยินครบ
+                      fullText = '[ระบบ: คำตอบก่อนหน้าถูกขัดจังหวะหลังเริ่มส่งเสียง ลูกค้าอาจได้ยินเพียงบางส่วน]'
+                      // ไม่ไว้ใจ end_call intent จากคำตอบที่อาจไม่สมบูรณ์ — claimFallback เป็น single-fire อยู่แล้ว จึงไม่มีทาง retry fallback ซ้ำอีกในเทิร์นนี้ด้วย
+                      endCallRequested = false
+                      if (fallbackAttempt.outcome === 'timeout') {
+                        turnMetrics.fallbackOutcome = 'FALLBACK_PARTIAL_TIMEOUT'
+                        console.error(`[Fallback] FALLBACK_PARTIAL_TIMEOUT — audio stalled ${FALLBACK_IDLE_TIMEOUT_MS}ms after ${fallbackProgress.totalSent} chunk(s) already committed`)
+                      } else {
+                        turnMetrics.fallbackOutcome = 'FALLBACK_PARTIAL_ERROR'
+                        console.error(`[Fallback error after commit] ${fallbackAttempt.error.message} — ${fallbackProgress.totalSent} chunk(s) already committed`)
+                        healthMonitor.reportError('ai_tts_fallback', fallbackAttempt.error.message)
+                      }
+                    } else if (fallbackAttempt.outcome === 'timeout') {
+                      turnMetrics.fallbackOutcome = 'FALLBACK_TIMEOUT'
+                      console.error('[Fallback] FALLBACK_TIMEOUT — giving up before any audio committed, no further recovery attempted')
+                    } else {
+                      turnMetrics.fallbackOutcome = 'FALLBACK_ERROR'
+                      console.error('[Fallback error]', fallbackAttempt.error.message)
+                      healthMonitor.reportError('ai_tts_fallback', fallbackAttempt.error.message)
+                    }
                   }
                 }
               }

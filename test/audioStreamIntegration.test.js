@@ -7,6 +7,45 @@ const harness = require('./_audioStreamHarness')
 
 function delay(ms) { return new Promise(resolve => setTimeout(resolve, ms)) }
 
+// C4c follow-up (commit-aware fallback watchdog) — จับ [Metrics] log บรรทัดเดียวของเทิร์นนั้น แล้ว parse เป็น
+// object ตรงๆ ใช้แทนการ parse ข้อความ console.error ของ [Fallback] เพราะ fallbackOutcome อยู่ใน turnMetrics
+// อยู่แล้ว (ดู audioStream.js บรรทัดที่ push [Metrics] log ในส่วนท้ายที่ legacy/chunked ทั้งสอง branch มาบรรจบกัน)
+async function captureMetrics(fn) {
+  const originalLog = console.log
+  const logs = []
+  console.log = (...args) => { logs.push(args.join(' ')); originalLog(...args) }
+  try {
+    await fn()
+  } finally {
+    console.log = originalLog
+  }
+  const metricsLine = logs.find(l => l.includes('[Metrics]'))
+  return metricsLine ? JSON.parse(metricsLine.slice(metricsLine.indexOf('{'))) : null
+}
+
+// greeting เล่นเสมอ 300ms หลัง 'start' (setTimeout(playGreeting, 300) ใน audioStream.js) ไม่มี flag ปิดได้จาก
+// ข้างนอก — เทสที่ต้อง assert จำนวน media event ของเทิร์นทดสอบแบบเป๊ะๆ (ไม่ใช่แค่ > 0) ต้องรอให้ greeting จบไปก่อน
+// แล้วเคลียร์ log ทิ้ง ไม่งั้น greeting's เสียงจะปนเข้ามานับรวมด้วยโดยไม่ตั้งใจ (เจอจริงตอนเขียนเทสชุด fallback watchdog นี้)
+//
+// ต้องรอผ่าน "unlock" ของ greeting ด้วย ไม่ใช่แค่ตอนมันส่ง chunk เสร็จ — greeting ตั้ง isSpeaking=true และปลดล็อก
+// อีกที (fallback-unlock timer) หลังจากนั้นอีก playbackMs = sent*20+1500ms (1 chunk = 1520ms) ถ้าเทสส่ง final
+// transcript ก่อนปลดล็อก จะโดน "Short fragment during AI speech — ignoring echo" กลืนทิ้งเงียบๆ (transcript สั้น)
+// หรือถูกมองเป็น barge-in ของ greeting โดยไม่ตั้งใจ (transcript ยาว) — ไม่ใช่เทิร์นแรกปกติที่เทสต้องการ
+//
+// rolloutPercent ต้องตั้ง "ก่อน" sendStart เสมอ เพราะ rollout freeze ครั้งเดียวตอน 'start' (C0 design, ดู
+// test 7 ที่พิสูจน์ invariant นี้ไว้แล้ว) — ตั้งทีหลังจะไม่มีผลกับสายนี้อีกเลยตลอดสาย
+async function connectPastGreeting(callSid, { rolloutPercent = 100, sessionOverrides = {} } = {}) {
+  const state = harness.getState()
+  state.rolloutPercent = rolloutPercent
+  const session = makeSession({ greetingChunks: [Buffer.from('pregenerated-greeting')], ...sessionOverrides })
+  callSessions.set(callSid, session)
+  const socket = harness.connect({ callSid })
+  harness.sendStart(socket)
+  await delay(2000) // 300ms (greeting timer) + 1520ms (unlock ของ greeting เอง) + margin
+  socket.sent.length = 0
+  return { socket, session, state }
+}
+
 function makeSession(overrides = {}) {
   return {
     name: 'ทดสอบ',
@@ -283,5 +322,135 @@ test('6b) end_call ที่ shouldBlockEndCall=false (ไม่มีสัญ�
   await harness.sendFinalTranscript('ไม่สนใจค่ะ') // ไม่มี hasInterest → shouldBlockEndCall คืน false ทันที ไม่บล็อก
 
   assert.equal(session.hangupReason, 'ai_ended', 'end_call ที่ไม่ถูก block ต้องตั้ง hangupReason ทันที (ก่อนถึง socket.close() timer จริง)')
+  harness.disconnect(socket)
+})
+
+// ===== C4c follow-up — commit-aware fallback watchdog (production incident 2026-08-19) =====
+// จำลอง timeline เดียวกับสาย production จริงที่เจอบั๊ก (barge-in retry call, CAae2f6baed62fed9d4dcc7ff23f199725):
+// chunked พัง → fallback เริ่ม → ElevenLabs ช้า/ค้างระหว่างทาง → terminal watchdog เดิม abort กลางประโยคทั้งที่
+// ลูกค้าได้ยินไปแล้วบางส่วน (totalSent/fullText หายไปเป็น 0/'') ทดสอบชุดนี้ (9-14) ครอบ DoD A-F ที่ล็อกไว้ก่อน patch
+
+test('9) fallback pre-commit timeout (ไม่มีเสียงคอมมิตเลย) → FALLBACK_TIMEOUT, totalSent=0, ไม่มี media event ส่งออกเลย [DoD A]', { timeout: 15000 }, async () => {
+  const callSid = nextCallSid()
+  const { socket, state } = await connectPastGreeting(callSid)
+  state.claudeStreamChunkedImpl = async function* () { throw new Error('chunked boom') } // ล้มทันที → เข้า fallback ไม่ต้องรอ watchdog 3 วง
+  state.claudeStreamImpl = async function* () { yield 'คำตอบจาก fallback ที่จะไม่ได้พูดเลย.' }
+  state.ttsImpl = async function* () { await new Promise(() => {}) } // ไม่ yield อะไรเลย ไม่ resolve เลย — ElevenLabs ไม่ตอบกลับมาก่อน commit
+
+  const metrics = await captureMetrics(() => harness.sendFinalTranscript('ทดสอบ')) // ใช้เวลาจริงประมาณ 8 วินาทีกว่า precommit watchdog จะ timeout
+
+  assert.equal(metrics.fallbackOutcome, 'FALLBACK_TIMEOUT')
+  const mediaEvents = socket.sent.filter(e => e.event === 'media')
+  assert.equal(mediaEvents.length, 0, 'ไม่ควรมี media event ใดๆ เลยถ้าไม่เคย commit')
+  harness.disconnect(socket)
+})
+
+test('10) fallback commit เสียงก้อนแรกใกล้ precommit deadline เดิมมาก (~7.9s) → ห้ามถูก abort ที่ 8.0s [DoD F: stale-timer boundary]', { timeout: 15000 }, async () => {
+  const callSid = nextCallSid()
+  const { socket, state } = await connectPastGreeting(callSid)
+  state.claudeStreamChunkedImpl = async function* () { throw new Error('chunked boom') }
+  state.claudeStreamImpl = async function* () { yield 'คำตอบจาก fallback หลังคอมมิตใกล้ deadline.' }
+  state.ttsImpl = async function* () {
+    await delay(7900) // คอมมิตก้อนแรกใกล้ FALLBACK_PRECOMMIT_TIMEOUT_MS (8000ms) มากที่สุดเท่าที่ยังปลอดภัยสำหรับเทส
+    yield Buffer.from('chunk1')
+  }
+
+  const metrics = await captureMetrics(() => harness.sendFinalTranscript('ทดสอบ'))
+
+  assert.equal(metrics.fallbackOutcome, 'SPOKEN', 'precommit timer เก่าต้องไม่ยิง abort หลัง commit ไปแล้ว แม้จะใกล้ deadline เดิมมากแค่ไหนก็ตาม')
+  const mediaEvents = socket.sent.filter(e => e.event === 'media')
+  assert.ok(mediaEvents.length > 0)
+  harness.disconnect(socket)
+})
+
+test('11) fallback regression: commit ที่ 5.1s แล้วพูดต่อผ่าน 8.0s เดิมไปได้ปกติ (จำลอง production incident 2026-08-19 เป๊ะ) [DoD B]', { timeout: 20000 }, async () => {
+  const callSid = nextCallSid()
+  const { socket, state } = await connectPastGreeting(callSid)
+  state.claudeStreamChunkedImpl = async function* () { throw new Error('chunked boom') } // แทนที่ TTS_FIRST_AUDIO_TIMEOUT watchdog ตัวจริงของโปรดักชัน — error ก็เข้า fallback เหมือนกัน ทำเทสเร็วขึ้น
+  state.claudeStreamImpl = async function* () { yield 'คำตอบยาวที่พูดคร่อมเวลา 8 วินาทีเดิม.' }
+  state.ttsImpl = async function* () {
+    await delay(5100)
+    yield Buffer.from('chunk1') // คอมมิต — precommit timer ถูกแทนที่ด้วย idle timer จากตรงนี้
+    await delay(3500) // เวลารวมผ่านไป ~8.6s แล้ว (เกิน deadline เดิมของ precommit timer ที่ 8.0s ไปแล้ว)
+    yield Buffer.from('chunk2')
+  }
+
+  const metrics = await captureMetrics(() => harness.sendFinalTranscript('ทดสอบ'))
+
+  assert.equal(metrics.fallbackOutcome, 'SPOKEN')
+  const mediaEvents = socket.sent.filter(e => e.event === 'media')
+  assert.equal(mediaEvents.length, 2, 'ต้องได้ครบทั้ง 2 ก้อน ไม่ถูกตัดกลางคันที่ 8.0s เหมือนบั๊กเดิมที่เจอจาก production')
+  harness.disconnect(socket)
+})
+
+test('12) fallback commit แล้ว stall เกิน FALLBACK_IDLE_TIMEOUT_MS (6s) → FALLBACK_PARTIAL_TIMEOUT, history เป็น marker ไม่ใช่ข้อความเต็ม, endCallRequested ถูกบังคับ false [DoD C]', { timeout: 15000 }, async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid)
+  state.claudeStreamChunkedImpl = async function* () { throw new Error('chunked boom') }
+  state.claudeStreamImpl = async function* () { yield 'คำตอบยาว [END_CALL]' } // มี end_call intent ปนมาด้วย ต้องถูกเพิกเฉยเมื่อเป็น partial
+  state.ttsImpl = async function* () {
+    yield Buffer.from('chunk1') // คอมมิตทันที
+    await new Promise(() => {}) // ค้างตลอดไป — ไม่มี progress เพิ่มอีกเลย
+  }
+
+  const metrics = await captureMetrics(() => harness.sendFinalTranscript('ทดสอบ'))
+
+  assert.equal(metrics.fallbackOutcome, 'FALLBACK_PARTIAL_TIMEOUT')
+  const mediaEvents = socket.sent.filter(e => e.event === 'media')
+  assert.equal(mediaEvents.length, 1, 'ต้องมี chunk แรกที่คอมมิตไปแล้วจริง ไม่ใช่ 0 เหมือนบั๊กเดิม')
+  assert.equal(session.hangupReason, undefined, 'ห้ามวางสายจาก end_call intent ของคำตอบที่ไม่สมบูรณ์')
+  const lastAssistantMsg = session.messages.filter(m => m.role === 'assistant').at(-1)
+  assert.ok(lastAssistantMsg.content.includes('ขัดจังหวะ'), 'history ต้องเป็น marker บอกว่าคำตอบไม่สมบูรณ์ ไม่ใช่ spokenText เต็มก้อน')
+  harness.disconnect(socket)
+})
+
+test('13) fallback provider error หลัง commit → FALLBACK_PARTIAL_ERROR ไม่ใช่ FALLBACK_ERROR ธรรมดา (ไม่รายงานเหมือน "ไม่มีเสียงออก") [DoD D]', async () => {
+  const callSid = nextCallSid()
+  const { socket, state } = await connectPastGreeting(callSid)
+  state.claudeStreamChunkedImpl = async function* () { throw new Error('chunked boom') }
+  state.claudeStreamImpl = async function* () { yield 'คำตอบที่จะพังกลางคัน.' }
+  state.ttsImpl = async function* () {
+    yield Buffer.from('chunk1') // คอมมิตก่อน
+    throw new Error('ElevenLabs stream boom หลัง commit')
+  }
+
+  const metrics = await captureMetrics(() => harness.sendFinalTranscript('ทดสอบ'))
+
+  assert.equal(metrics.fallbackOutcome, 'FALLBACK_PARTIAL_ERROR')
+  const mediaEvents = socket.sent.filter(e => e.event === 'media')
+  assert.equal(mediaEvents.length, 1)
+  harness.disconnect(socket)
+})
+
+// หมายเหตุสำคัญ (เจอระหว่างเขียนเทสนี้ ไม่ใช่สมมติฐานเดิม): onTranscript ทั้งระบบ (audioStream.js) เช็ค
+// `if (sttProcessing) return` ก่อนถึง `if (isSpeaking) { bargeIn() }` เสมอ (ไม่ว่า path ไหน) — แปลว่า barge-in
+// ผ่าน final-transcript callback เป็นไปได้จริงเฉพาะตอน turn เดิม "ประมวลผลเสร็จสมบูรณ์แล้ว" (sttProcessing กลับ
+// เป็น false ใน finally) แต่ isSpeaking ยังค้าง true อยู่ (รอ mark/playback-unlock) เท่านั้น — ไม่ใช่ระหว่างที่
+// generator ยังค้างส่ง delta/chunk อยู่จริง (ตรงกับที่ Test 3 เดิมทำอยู่แล้ว และตรงกับที่ production Call 2 เจอ
+// จริงสองรอบ: interrupt ลงจังหวะหลัง AI พูดจบเทิร์นแล้วเท่านั้น) เป็นข้อจำกัดของกลไก barge-in เดิมทั้งระบบ ไม่ใช่
+// อะไรที่ patch นี้เปลี่ยน จึงทดสอบ DoD-E ตามรูปแบบที่ระบบรองรับจริงแทน (เหมือน Test 3 แต่ผ่าน fallback path)
+test('14) barge-in ทันทีหลัง fallback commit+จบเทิร์นแล้ว (isSpeaking ยังรอ mark เหมือน Test 3) → generation ใหม่ประมวลผลได้ปกติ ไม่มี ghost audio หลุดเพิ่ม [DoD E]', async () => {
+  const callSid = nextCallSid()
+  const { socket, state } = await connectPastGreeting(callSid)
+  state.claudeStreamChunkedImpl = async function* () { throw new Error('chunked boom') }
+  state.claudeStreamImpl = async function* () { yield 'คำตอบแรกจาก fallback.' }
+  state.ttsImpl = async function* () { yield Buffer.from('chunk1') } // คอมมิตแล้วจบเทิร์นตามปกติ — sttProcessing reset จริงใน finally เหมือน production
+
+  await harness.sendFinalTranscript('ทดสอบ') // fallback commit + จบสมบูรณ์
+
+  const sentBeforeBargeIn = socket.sent.filter(e => e.event === 'media').length
+  assert.equal(sentBeforeBargeIn, 1, 'chunk แรกของ fallback ต้องถูกคอมมิตไปแล้วก่อน barge-in')
+
+  let secondTurnCalls = 0
+  state.claudeStreamChunkedImpl = async function* () { secondTurnCalls++; yield 'ตอบเทิร์นใหม่หลัง barge-in.' }
+  await harness.sendFinalTranscript('ขอโทษนะคะ หนูพูดแทรกเข้ามา') // ยาวพอไม่ถูกมองเป็น echo/fragment สั้น
+
+  const clearEvents = socket.sent.filter(e => e.event === 'clear')
+  assert.ok(clearEvents.length > 0, 'barge-in ต้องส่ง clear event ไปที่ Twilio')
+  assert.equal(secondTurnCalls, 1, 'เทิร์นใหม่หลัง barge-in ต้องประมวลผลได้ปกติ ไม่ค้าง แม้เทิร์นก่อนหน้ามาจาก fallback path')
+
+  const mediaAfter = socket.sent.filter(e => e.event === 'media')
+  assert.equal(mediaAfter.length, sentBeforeBargeIn + 1, 'เสียงที่เพิ่มขึ้นหลัง barge-in ต้องมาจากเทิร์นใหม่เท่านั้น 1 ก้อน ไม่มีอะไรจาก fallback เก่าหลุดเพิ่มมาอีก')
+
   harness.disconnect(socket)
 })
