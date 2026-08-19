@@ -1,6 +1,6 @@
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
-const { findChunkBoundary } = require('../src/utils/speechChunker')
+const { findChunkBoundary, getNumericProtectionRemainingMs } = require('../src/utils/speechChunker')
 
 // chunk ผ่าน .trim() มาแล้วเลยสั้นกว่า cut point จริงได้ (เสียช่องว่างที่ตัดขอบไป) — ไม่ควรเช็คด้วย
 // buffer.slice(r.chunk.length) ตรงๆ เพราะจะเข้าใจผิดว่าช่องว่างที่ trim ทิ้งไปคือ "ตัวอักษรหาย" เช็คแค่ 2 คุณสมบัติที่สำคัญจริง:
@@ -97,4 +97,80 @@ test('buffer เป็นประโยคเดียวจบสนิท ไ
 test('buffer ว่างเปล่า → คืน null เสมอ', () => {
   assert.equal(findChunkBoundary('', 900), null)
   assert.equal(findChunkBoundary(null, 900), null)
+})
+
+// ---------------------------------------------------------------------------
+// L1c1 — protected numeric boundary (production defect 2026-08-19): natural-boundary cut ที่ candidate
+// chunk ลงท้ายด้วยตัวเลข ("รับ 2,000" | "พอยต์นะคะ" เป็นคนละ ElevenLabs request กัน ฟังเป็นคนละโทนเสียง) ต้อง
+// ถูกกันไว้จนกว่าจะครบ HARD_MAX_MS (reuse ceiling เดิม ไม่เพิ่ม constant ใหม่) — strong/soft boundary ไม่โดนกระทบ
+// ---------------------------------------------------------------------------
+
+const NUMERIC_TAIL_BUFFER = 'ตอนนี้สมาชิกใหม่ฝาก 100 บาท รับ 2,000 ' // ไม่มี strong/soft boundary ปนเลย ยาวเกิน FALLBACK_MIN_LENGTH
+
+test('L1c1-1) natural-boundary candidate ลงท้ายตัวเลข ที่ 300ms (พอดี SOFT_TIMEOUT) → ยังไม่ตัด (protected)', () => {
+  const r = findChunkBoundary(NUMERIC_TAIL_BUFFER, 300)
+  assert.equal(r, null, 'ต้องกันไว้ก่อน รอ delta ถัดไปที่น่าจะเป็นหน่วยนับ')
+})
+
+test('L1c1-2) ตัวเดียวกันที่ 799ms (ยังไม่ครบ HARD_MAX_MS) → ยังไม่ตัด (protected)', () => {
+  const r = findChunkBoundary(NUMERIC_TAIL_BUFFER, 799)
+  assert.equal(r, null, 'ยังไม่ครบ ceiling — ยังต้องกันไว้')
+})
+
+test('L1c1-3) ตัวเดียวกันที่ 800ms (ครบ HARD_MAX_MS พอดี) → protection หมดอายุ ตัดได้ตามปกติ', () => {
+  const r = findChunkBoundary(NUMERIC_TAIL_BUFFER, 800)
+  assert.ok(r, 'ครบ ceiling แล้ว ต้องยอมตัดกันไม่ให้รอไม่มีที่สิ้นสุดถ้า Claude เงียบผิดปกติจริง')
+  assertCleanSplit(NUMERIC_TAIL_BUFFER, r)
+})
+
+test('L1c1-4) "รับ 2,000 พอยต์นะคะ" (หน่วยนับมาครบแล้ว) → soft boundary "นะคะ" ตัดทั้ง semantic unit รวดเดียว ไม่แยก', () => {
+  const buffer = NUMERIC_TAIL_BUFFER + 'พอยต์นะคะ'
+  const r = findChunkBoundary(buffer, 300) // elapsedMs ไม่สำคัญ — soft boundary ตัดทันทีเสมอ
+  assert.ok(r.chunk.includes('2,000') && r.chunk.includes('พอยต์'), 'ตัวเลขกับหน่วยนับต้องอยู่ chunk เดียวกัน')
+  assert.equal(r.chunk, 'ตอนนี้สมาชิกใหม่ฝาก 100 บาท รับ 2,000 พอยต์นะคะ')
+})
+
+test('L1c1-5) natural boundary ที่ไม่ได้ลงท้ายตัวเลข ที่ 300ms → พฤติกรรมเดิมเป๊ะ ไม่ถูก protection ทำให้ช้าลง', () => {
+  const buffer = 'aaaaaaaaaa bbbbbbbbbb cccccccccc dddddddddd' // ลงท้ายตัวอักษร ไม่ใช่ตัวเลข
+  const r = findChunkBoundary(buffer, 300)
+  assert.ok(r, 'ต้องตัดได้ทันทีเหมือนก่อนมี L1c1 เพราะ candidate ไม่ได้ลงท้ายด้วยตัวเลข')
+  assertCleanSplit(buffer, r)
+})
+
+test('L1c1-6) strong boundary "รับ 2,000." → ตัดทันทีที่ elapsedMs=0 ไม่โดน numeric protection เลย (strong/soft มาก่อนเสมอ)', () => {
+  const r = findChunkBoundary('ยอดรับสิทธิ์ตอนนี้คือ 2,000. เยอะมากเลยนะคะ', 0)
+  assert.equal(r.chunk, 'ยอดรับสิทธิ์ตอนนี้คือ 2,000.')
+})
+
+// ---------------------------------------------------------------------------
+// L1c1 follow-up — getNumericProtectionRemainingMs(): ใช้โดย createChunkedProducer() ใน chunkedTurn.js สำหรับ
+// arm wall-clock timer เอง (ดูหมายเหตุที่ speechChunker.js) — ทดสอบ contract ตรงๆ แยกจาก findChunkBoundary()
+// ---------------------------------------------------------------------------
+
+test('getNumericProtectionRemainingMs: candidate ลงท้ายตัวเลข ยังไม่ครบ HARD_MAX_MS → คืนจำนวน ms ที่เหลือถูกต้อง', () => {
+  assert.equal(getNumericProtectionRemainingMs(NUMERIC_TAIL_BUFFER, 0), 800)
+  assert.equal(getNumericProtectionRemainingMs(NUMERIC_TAIL_BUFFER, 350), 450)
+  assert.equal(getNumericProtectionRemainingMs(NUMERIC_TAIL_BUFFER, 799), 1)
+})
+
+test('getNumericProtectionRemainingMs: elapsedMs >= HARD_MAX_MS → null (protection หมดอายุแล้ว)', () => {
+  assert.equal(getNumericProtectionRemainingMs(NUMERIC_TAIL_BUFFER, 800), null)
+  assert.equal(getNumericProtectionRemainingMs(NUMERIC_TAIL_BUFFER, 1200), null)
+})
+
+test('getNumericProtectionRemainingMs: buffer ที่มี strong/soft boundary อยู่แล้ว → null (ตัดได้เลย ไม่ใช่ numeric-protected case)', () => {
+  assert.equal(getNumericProtectionRemainingMs(NUMERIC_TAIL_BUFFER + 'พอยต์นะคะ', 100), null)
+})
+
+test('getNumericProtectionRemainingMs: candidate ไม่ได้ลงท้ายตัวเลข → null', () => {
+  assert.equal(getNumericProtectionRemainingMs('aaaaaaaaaa bbbbbbbbbb cccccccccc dddddddddd', 100), null)
+})
+
+test('getNumericProtectionRemainingMs: buffer สั้นกว่า FALLBACK_MIN_LENGTH → null (ไม่มี natural-boundary candidate ให้ protect)', () => {
+  assert.equal(getNumericProtectionRemainingMs('รับ 100', 100), null)
+})
+
+test('getNumericProtectionRemainingMs: buffer ว่างเปล่า → null', () => {
+  assert.equal(getNumericProtectionRemainingMs('', 100), null)
+  assert.equal(getNumericProtectionRemainingMs(null, 100), null)
 })

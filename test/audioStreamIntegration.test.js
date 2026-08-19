@@ -1498,3 +1498,56 @@ test('52) L1b: MISMATCH_FRESH ยังต้อง record prewarm telemetry เ
   assert.equal(typeof metrics.prewarmFirstChunkMs, 'number', 'chunk เกิดขึ้นจริงก่อน mismatch ต้องถูกบันทึกด้วย ไม่ใช่ null')
   harness.disconnect(socket)
 })
+
+// ===== L1c1 — protected numeric boundary (production defect 2026-08-19) =====
+test('53) L1c1 integration: delta ที่ทำให้ candidate ลงท้ายตัวเลขมาถึงตอน elapsedMs ข้าม SOFT_TIMEOUT_MS แล้ว → ไม่ flush แยกจากหน่วยนับที่ตามมา และไม่ทำให้ CHUNK_READY_TIMEOUT (2000ms) fire ก่อนเวลา', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 100 })
+
+  const ttsCalls = []
+  state.ttsImpl = async function* (text) { ttsCalls.push(text); yield Buffer.from('audio') }
+  state.claudeStreamChunkedImpl = async function* () {
+    yield 'ตอนนี้สมาชิกใหม่ฝาก 100 บาท '
+    await delay(350) // ผลักดัน elapsedMs ให้ข้าม SOFT_TIMEOUT_MS(300ms) ก่อน delta ถัดไปจะมาถึง — จำลองจังหวะจริงที่เจอใน production
+    yield 'รับ 2,000 ' // ตอนนี้ elapsedMs ~350ms, buffer ลงท้ายตัวเลข — ก่อนแก้ L1c1 จะโดน flush แยกทันทีตรงนี้
+    await delay(100) // หน่วยนับตามมาไม่นาน (ยังอยู่ในงบ HARD_MAX_MS=800ms ของ numeric protection)
+    yield 'พอยต์นะคะ'
+  }
+
+  await harness.sendFinalTranscript('ขอสอบถามโปรโมชั่นหน่อยค่ะ')
+
+  assert.ok(!ttsCalls.some(t => /2,000$/.test(t.trim())), 'ห้ามมี chunk ที่ลงท้าย "2,000" เดี่ยวๆ หลุดเข้า TTS แยกจากหน่วยนับ (defect เดิม)')
+  assert.ok(ttsCalls.some(t => t.includes('2,000') && t.includes('พอยต์')), 'ตัวเลขกับหน่วยนับต้องถูกพูดรวมเป็น chunk เดียวกัน')
+  const mediaEvents = socket.sent.filter(e => e.event === 'media')
+  assert.ok(mediaEvents.length > 0, 'ต้องมีเสียงออกจริง ไม่ใช่ fallback เพราะ CHUNK_READY_TIMEOUT fire ผิดจังหวะ')
+  harness.disconnect(socket)
+})
+
+test('54) L1c1 follow-up (commit-gate review): buffer ที่ถูก numeric protection กันอยู่ แต่ Claude เงียบเกิน HARD_MAX_MS โดยไม่มี delta ใหม่มาปลุกเลย → ต้องถูก flush เองผ่าน expiry timer ก่อน stream จะจบด้วยซ้ำ ไม่ใช่รอ delta ถัดไปหรือ final flush', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 100 })
+
+  let turnStartedAt = null
+  let ttsCalledAt = null
+  state.ttsImpl = async function* (text) {
+    if (ttsCalledAt === null) ttsCalledAt = Date.now()
+    yield Buffer.from('audio')
+  }
+  state.claudeStreamChunkedImpl = async function* () {
+    turnStartedAt = Date.now()
+    yield 'ตอนนี้สมาชิกใหม่ฝาก 100 บาท รับ 2,000 ' // numeric-protected candidate — ไม่มี delta ใหม่มาปลุกหลังจากนี้เลย
+    await delay(900) // Claude เงียบเกิน HARD_MAX_MS (800ms) แต่ยังไม่จบ stream จริงจนกว่าจะครบ 900ms — จำลอง stall จริง
+  }
+
+  await harness.sendFinalTranscript('ขอสอบถามโปรโมชั่นหน่อยค่ะ')
+
+  assert.ok(ttsCalledAt !== null, 'ต้องมี TTS ถูกเรียกจริง (chunk ถูก flush)')
+  const ttsDelayMs = ttsCalledAt - turnStartedAt
+  assert.ok(ttsDelayMs < 900, `TTS ต้องถูกเรียกจาก expiry timer (~800ms) ก่อน stream จะจบเองที่ 900ms — ใช้เวลาไป ${ttsDelayMs}ms (ถ้าไม่มี expiry timer จะรอจนถึง final flush ที่ ~900ms แทน)`)
+  assert.ok(ttsDelayMs >= 750, `expiry timer ต้อง honor HARD_MAX_MS (800ms) ไม่ตัดเร็วเกินไปก่อนครบเวลา — ใช้เวลาไป ${ttsDelayMs}ms`)
+
+  const lastAssistant = session.messages.filter(m => m.role === 'assistant').at(-1)
+  assert.equal(lastAssistant.content.trim(), 'ตอนนี้สมาชิกใหม่ฝาก 100 บาท รับ 2,000') // fullTextAccum เป็น raw concatenation ของ delta ไม่ trim เอง (พฤติกรรมเดิม ไม่เกี่ยวกับ L1c1)
+
+  harness.disconnect(socket)
+})

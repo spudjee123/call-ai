@@ -45,7 +45,7 @@
 const { performance } = require('perf_hooks')
 const { askClaudeStreamChunked } = require('../services/claude')
 const { synthesizeSpeechStream } = require('../services/tts')
-const { findChunkBoundary } = require('../utils/speechChunker')
+const { findChunkBoundary, getNumericProtectionRemainingMs } = require('../utils/speechChunker')
 const { markOnce } = require('../utils/turnMetrics')
 const { markTtsPending, markAudioCommitted } = require('../utils/turnState')
 const { isCurrentGeneration } = require('../utils/generationGuard')
@@ -196,6 +196,42 @@ function createChunkedProducer({ session, signal, getIsValid = () => true }) {
   const done = (async () => {
     let buffer = ''
     let segmentStartMs = null
+    let numericProtectionTimer = null
+
+    function clearNumericProtectionTimer() {
+      if (numericProtectionTimer) { clearTimeout(numericProtectionTimer); numericProtectionTimer = null }
+    }
+
+    // L1c1 follow-up (commit-gate review) — findChunkBoundary() ไม่มี wall-clock polling ในตัวเอง เรียกเฉพาะตอน
+    // มี delta ใหม่มาถึงเท่านั้น ถ้า buffer กำลังถูก numeric protection กันอยู่ (ตัวเลข+หน่วยนับที่ยังมาไม่ครบ) แล้ว
+    // Claude เงียบเกินไป (ไม่มี delta ใหม่มาปลุกเลย) ไม่มีใครมาตรวจว่า protection หมดอายุแล้วจริงที่ HARD_MAX_MS —
+    // เสี่ยงชน CHUNK_READY_TIMEOUT (Watchdog B, 2000ms) ทั้งที่สั้นกว่ามาก จึง arm wall-clock timer เองตรงนี้ทุก
+    // ครั้งที่ไม่มี chunk พร้อมตัด แต่ buffer ยังถูก protect อยู่ — เรียกซ้ำจากทั้ง delta-arrival path (ผ่าน loop
+    // ด้านล่าง) และจาก timer callback เอง (recursive) ด้วย logic เดียวกันเป๊ะ กัน drift ระหว่างสอง path
+    function drainReadyChunks() {
+      clearNumericProtectionTimer()
+      while (true) {
+        const elapsedMs = performance.now() - segmentStartMs
+        const result = findChunkBoundary(buffer, elapsedMs)
+        if (result) {
+          if (!getIsValid()) return // boundary 2 (C3b, injectable) — stale ต้องไม่ notifyChunk()/enqueue()
+          notifyChunk()
+          enqueue(result.chunk)
+          buffer = result.remainder
+          continue // buffer อาจมี chunk พร้อมมากกว่าหนึ่งก้อน ต้องวนต่อจนกว่าจะหมด
+        }
+        const remainingMs = getNumericProtectionRemainingMs(buffer, elapsedMs)
+        if (remainingMs != null) {
+          numericProtectionTimer = setTimeout(() => {
+            numericProtectionTimer = null
+            if (signal?.aborted || !getIsValid()) return // ถูก abort/invalidate ไปแล้วระหว่างรอ — ไม่ทำอะไรต่อ
+            drainReadyChunks()
+          }, remainingMs)
+        }
+        return
+      }
+    }
+
     try {
       for await (const delta of askClaudeStreamChunked(session, signal, emitControl)) {
         if (signal?.aborted) break
@@ -209,16 +245,10 @@ function createChunkedProducer({ session, signal, getIsValid = () => true }) {
         buffer += delta
         if (wasEmpty) segmentStartMs = performance.now()
 
-        while (true) {
-          const elapsedMs = performance.now() - segmentStartMs
-          const result = findChunkBoundary(buffer, elapsedMs)
-          if (!result) break
-          if (!getIsValid()) break // boundary 2 (C3b, injectable)
-          notifyChunk()
-          enqueue(result.chunk)
-          buffer = result.remainder
-        }
+        drainReadyChunks()
       }
+
+      clearNumericProtectionTimer() // stream จบแล้ว (ปกติหรือ error) — ไม่ต้องรอ expiry timer อีกต่อไป final flush ด้านล่างจัดการเอง
 
       const finalText = buffer.trim()
       if (finalText && !signal?.aborted && getIsValid()) {
@@ -228,6 +258,7 @@ function createChunkedProducer({ session, signal, getIsValid = () => true }) {
     } catch (err) {
       if (!signal?.aborted) producerError = err
     } finally {
+      clearNumericProtectionTimer()
       producerDone = true
       if (waiter) { waiter(); waiter = null }
       resolveProgress()
