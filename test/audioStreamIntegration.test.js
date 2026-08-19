@@ -93,6 +93,33 @@ test('2) rollout 100% → chunked path only: askClaudeStream (legacy) ไม่�
   harness.disconnect(socket)
 })
 
+test('C6c follow-up: t2 (Claude request sent) ต้องถูก mark สำหรับ chunked turn ด้วย ไม่ใช่ null เหมือนที่เจอจาก production trace จริง', async () => {
+  const callSid = nextCallSid()
+  callSessions.set(callSid, makeSession())
+  const state = harness.getState()
+  state.rolloutPercent = 100
+  state.claudeStreamChunkedImpl = async function* () { yield 'ตอบจาก chunked path.' }
+
+  const originalLog = console.log
+  const logs = []
+  console.log = (...args) => { logs.push(args.join(' ')); originalLog(...args) }
+  let metrics
+  try {
+    const socket = harness.connect({ callSid })
+    harness.sendStart(socket)
+    await harness.sendFinalTranscript('ทดสอบ')
+    harness.disconnect(socket)
+    const metricsLine = logs.find(l => l.includes('[Metrics]'))
+    metrics = JSON.parse(metricsLine.slice(metricsLine.indexOf('{')))
+  } finally {
+    console.log = originalLog
+  }
+
+  assert.equal(metrics.path, 'chunked')
+  assert.equal(typeof metrics.t2, 'number', 't2 ต้องมีค่าจริง ไม่ใช่ null — เดิมเป็นช่องโหว่ที่ทำให้ claudeTTFT/requestToAudio วัดไม่ได้เลยสำหรับ chunked turn')
+  assert.ok(metrics.t1 <= metrics.t2, 't2 ต้องเกิดหลัง t1 เสมอ (ไม่ใช่ก่อนหน้า)')
+})
+
 test('7) rollout ถูก freeze ตอนเริ่มสาย — เปลี่ยนค่าใน config กลางสาย ไม่กระทบเทิร์นถัดไปของสายเดิม', async () => {
   const callSid = nextCallSid()
   callSessions.set(callSid, makeSession())

@@ -476,6 +476,11 @@ function registerWebSocket(fastify) {
           // rollout ยัง 0% เสมอตอนนี้ จึงยังไม่มีสายไหนเข้า branch นี้จริงในโปรดักชัน (ดู C0/decideRollout)
           if (rollout.useChunkedStreaming) {
             try {
+              // C6c follow-up: legacy มี t2 (Claude request sent) แต่ chunked branch ไม่เคยถูกใส่ไว้เลยตั้งแต่ C1 —
+              // เจอจาก production trace จริงที่ t2 เป็น null ทุกเทิร์น ทำให้ claudeTTFT (t2→t3) และ requestToAudio
+              // (t2→t7) วัดไม่ได้เลย มาร์กตรงนี้ (จุดเดียวกับที่ legacy มาร์ก คือ "กำลังจะเริ่มขอคำตอบ" ก่อนเรียก
+              // Claude จริง) ไม่กระทบ branch decision invariant เพราะเป็นแค่ timestamp ไม่ใช่ side effect
+              markOnce(turnMetrics, 't2')
               // C4b: race runChunkedTurn ต่อ watchdog สามวงเรียงกัน (Watchdog A → B → C) ผ่าน child AbortController
               // เดียวที่ compose มาจาก outer signal (barge-in) — barge-in ยังฆ่าทั้งคู่ได้เสมอ แต่ watchdog ฆ่าได้แค่
               // chunked attempt นี้เท่านั้น ไม่แตะ outer signal เลย เพื่อให้ fallback ด้านล่าง (ที่ใช้ outer signal)
