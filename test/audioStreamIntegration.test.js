@@ -454,3 +454,132 @@ test('14) barge-in ทันทีหลัง fallback commit+จบเทิ�
 
   harness.disconnect(socket)
 })
+
+// ===== C6c follow-up — barge-in gate fix: แยก interrupt control ออกจาก transcript processing single-flight
+// gate (production discovery 2026-08-19) =====
+// เดิม onTranscript เช็ค `if (sttProcessing) return` ก่อนถึง `if (isSpeaking) bargeIn()` เสมอ — แปลว่าลูกค้าพูด
+// แทรกตอน AI ยัง generate/พูดอยู่จริง (sttProcessing=true) จะถูกทิ้งเงียบๆ ก่อนแม้แต่จะพยายาม barge-in เลย แก้โดย
+// แยกสองเรื่องออกจากกัน: bargeIn() ยิงได้ทันทีไม่ว่า sttProcessing จะเป็นอะไร ส่วน sttProcessing ยังคุม
+// single-flight ของ Claude/TTS pipeline เหมือนเดิม — ถ้า barge-in เกิดตอนเทิร์นเดิมยัง sttProcessing=true อยู่จริง
+// transcript จะถูกเก็บไว้ (pendingTranscript, ช่องเดียว latest-wins) แล้วให้เทิร์นเดิมสั่ง process ต่อเองหลังปล่อย
+// sttProcessing จริงใน processTranscript() (ดู audioStream.js)
+//
+// DoD D (sttProcessing=true แต่ isSpeaking=false → behavior เดิมยังคงเดิม) ไม่มีเทสแยกเพราะ state นี้ไม่ reachable
+// จริงในระบบ — isSpeaking/sttProcessing ถูกตั้ง true คู่กันเสมอที่จุดเริ่ม processTranscript() แบบ synchronous
+// (ไม่มี await คั่นระหว่างสองบรรทัดนี้ จึงไม่มีช่องให้ transcript อื่นแทรกเข้ามาเห็น state นี้ได้) เมื่อ state ไม่มีทาง
+// เกิดจริง โค้ด branch ที่จะรันก็คือ busy-drop เดิม (byte-identical กับก่อน patch) — พิสูจน์ด้วยการอ่านโค้ดแทนเทส
+
+test('15) DoD A: final transcript ระหว่าง isSpeaking=true+sttProcessing=true → bargeIn ทันที ไม่ทิ้ง transcript ประมวลผลเป็นเทิร์นใหม่หลัง turn เดิมปล่อย sttProcessing', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 }) // legacy path — เรียบง่ายสุดสำหรับพิสูจน์กลไก gate เอง ไม่ต้องพึ่ง chunked/fallback
+
+  let resumeOldTurn
+  const oldTurnGate = new Promise(resolve => { resumeOldTurn = resolve })
+  state.claudeStreamImpl = async function* () {
+    yield 'กำลังตอบคำถามแรก'
+    await oldTurnGate // ค้างตรงนี้ — จำลอง AI ยัง generate อยู่จริง (sttProcessing=true) ตอนลูกค้าพูดแทรก
+    yield ' ต่อจนจบประโยค' // ต้องไม่ถูกใช้เลยหลัง barge-in (signal.aborted ต้องกันไว้)
+  }
+
+  const oldTurnPromise = harness.sendFinalTranscript('คำถามแรกครับ')
+  await delay(30) // ให้เทิร์นแรกเข้าสู่ isSpeaking=true, sttProcessing=true และเริ่ม await Claude ค้างอยู่แล้ว
+
+  let newTurnCalls = 0
+  state.claudeStreamImpl = async function* () { newTurnCalls++; yield 'ตอบเรื่องถอนเงิน' }
+
+  // ลูกค้าพูดแทรกระหว่างเทิร์นแรกยังไม่ปล่อย sttProcessing เลย
+  await harness.sendFinalTranscript('เดี๋ยวก่อนครับ ขอถามเรื่องถอนเงินก่อน')
+
+  const clearEvents = socket.sent.filter(e => e.event === 'clear')
+  assert.ok(clearEvents.length > 0, 'bargeIn ต้องยิงทันทีแม้เทิร์นเดิมยัง sttProcessing=true อยู่ — ต้องเห็น clear event ทันที')
+  assert.equal(newTurnCalls, 0, 'ยังไม่ควรเริ่มเทิร์นใหม่ทันที — เทิร์นเดิมยังไม่ปล่อย sttProcessing')
+
+  resumeOldTurn() // ปล่อยให้เทิร์นเดิมทำงานต่อ — จะพบว่า signal ตัวเองถูก abort ไปแล้วจาก bargeIn()
+  await oldTurnPromise
+
+  assert.equal(newTurnCalls, 1, 'transcript ที่พูดแทรกไว้ต้องถูก process เป็นเทิร์นใหม่ทันทีหลังเทิร์นเดิมปล่อย sttProcessing')
+  const lastUserMsg = session.messages.filter(m => m.role === 'user').at(-1)
+  assert.equal(lastUserMsg.content, 'เดี๋ยวก่อนครับ ขอถามเรื่องถอนเงินก่อน', 'transcript ที่พูดแทรกต้องไม่หาย ต้องถูกบันทึกเข้า session จริง')
+
+  const mediaEvents = socket.sent.filter(e => e.event === 'media')
+  assert.ok(mediaEvents.length > 0, 'เทิร์นใหม่ต้องพูดออกมาจริง')
+
+  harness.disconnect(socket)
+})
+
+test('16) DoD C: final transcript หลายอันมาระหว่าง turn เดิมยัง processing → ไม่สร้างหลาย Claude turns ใช้ transcript ล่าสุดเสมอ (latest-wins ช่องเดียว)', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+
+  let resumeOldTurn
+  const oldTurnGate = new Promise(resolve => { resumeOldTurn = resolve })
+  state.claudeStreamImpl = async function* () { yield 'กำลังตอบ'; await oldTurnGate }
+
+  const oldTurnPromise = harness.sendFinalTranscript('คำถามแรก')
+  await delay(30)
+
+  let newTurnCalls = 0
+  state.claudeStreamImpl = async function* () { newTurnCalls++; yield 'ตอบ' }
+
+  await harness.sendFinalTranscript('แทรกแรก')
+  await harness.sendFinalTranscript('แทรกสอง')
+  await harness.sendFinalTranscript('แทรกสามล่าสุด')
+
+  resumeOldTurn()
+  await oldTurnPromise
+
+  assert.equal(newTurnCalls, 1, 'ห้ามเกิดหลาย Claude turn จากการพูดแทรกหลายครั้งระหว่างรอเทิร์นเดิมปล่อย sttProcessing')
+  const lastUserMsg = session.messages.filter(m => m.role === 'user').at(-1)
+  assert.equal(lastUserMsg.content, 'แทรกสามล่าสุด', 'ต้องใช้ transcript ล่าสุด (latest-wins) ไม่ใช่อันแรกที่แทรกเข้ามา')
+
+  harness.disconnect(socket)
+})
+
+test('17) DoD B+F: barge-in ระหว่าง fallback ที่ audioCommitted=true → generation เก่าถูก invalidate ทันที ไม่มี ghost audio ไม่มี recovery ซ้ำ (fallbackOutcome=STALE) generation ใหม่ตอบได้หลัง turn เดิมปล่อย sttProcessing', { timeout: 15000 }, async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid) // rolloutPercent=100 default — chunked+fallback path
+  state.claudeStreamChunkedImpl = async function* () { throw new Error('chunked boom') } // ล้มทันที → เข้า fallback
+  state.claudeStreamImpl = async function* () { yield 'คำตอบจาก fallback ที่กำลังพูดอยู่' }
+
+  let resumeStall
+  const stallGate = new Promise(resolve => { resumeStall = resolve })
+  state.ttsImpl = async function* () {
+    yield Buffer.from('chunk1') // คอมมิตทันที — audioCommitted=true, sttProcessing ยังเป็น true (ยัง await อยู่)
+    await stallGate // ค้างตรงนี้ — จำลองช่วงที่ fallback ยังไม่จบงานตัวเอง (เหมือน production incident) barge-in จะเกิดตอนนี้
+    yield Buffer.from('GHOST_AUDIO_old_gen_chunk2') // ต้องไม่ถูกส่งออกไปเลยหลัง barge-in (generation guard ต้องกันไว้)
+  }
+
+  const oldTurnPromise = captureMetrics(() => harness.sendFinalTranscript('ขอสอบถามโปรโมชั่นหน่อยครับ'))
+  await delay(30) // ให้ chunk แรกส่งออกไปจริง (commit) ก่อน
+
+  const sentBeforeBargeIn = socket.sent.filter(e => e.event === 'media').length
+  assert.ok(sentBeforeBargeIn > 0, 'ต้องมีเสียง fallback คอมมิตไปแล้วก่อน barge-in')
+
+  let newTurnCalls = 0
+  state.claudeStreamChunkedImpl = async function* () { newTurnCalls++; yield 'ตอบคำถามใหม่หลัง barge-in' }
+  // สำคัญ: reset ttsImpl ด้วย ไม่งั้นเทิร์นใหม่ (chunked success คราวนี้) จะไปเรียก stub เดิมที่ยังค้าง GHOST_AUDIO
+  // อยู่ต่อ (state.ttsImpl เป็น stub เดียวใช้ร่วมกันทั้ง chunked path หลักและ fallback path) ทำให้เทสเข้าใจผิดว่า
+  // เสียงที่มาจากเทิร์นใหม่ (ถูกต้องแล้ว) เป็น ghost audio ของเทิร์นเก่า
+  state.ttsImpl = async function* () { yield Buffer.from('clean-new-turn-chunk') }
+
+  await harness.sendFinalTranscript('เดี๋ยวก่อนครับ ขอถามเรื่องถอนเงินก่อน')
+
+  const clearEvents = socket.sent.filter(e => e.event === 'clear')
+  assert.ok(clearEvents.length > 0, 'barge-in ต้องยิงทันทีแม้ fallback เดิมยัง sttProcessing=true อยู่')
+  assert.equal(newTurnCalls, 0, 'ยังไม่ควรเริ่มเทิร์นใหม่ทันที — fallback เดิมยังไม่ปล่อย sttProcessing')
+
+  resumeStall() // ปล่อยให้ fallback เดิมทำงานต่อ — จะพบว่า generation ตัวเองเก่าไปแล้วจาก barge-in
+  const metrics = await oldTurnPromise
+
+  assert.equal(metrics.fallbackOutcome, 'STALE', 'fallback เดิมต้องรู้ตัวว่า generation เก่าแล้วผ่าน isCurrentGeneration ไม่พยายาม recovery ซ้ำ')
+
+  const leaked = socket.sent.filter(e => e.event === 'media')
+    .some(e => Buffer.from(e.media.payload, 'base64').toString().includes('GHOST_AUDIO'))
+  assert.equal(leaked, false, 'ห้ามมี audio ของ generation เก่า (chunk2 ที่ resume หลัง barge-in) หลุดออกไปเด็ดขาด (ไม่มี ghost audio)')
+
+  assert.equal(newTurnCalls, 1, 'transcript ที่พูดแทรกไว้ต้องถูก process เป็นเทิร์นใหม่หลัง fallback เก่าปล่อย sttProcessing จริง')
+  const lastUserMsg = session.messages.filter(m => m.role === 'user').at(-1)
+  assert.equal(lastUserMsg.content, 'เดี๋ยวก่อนครับ ขอถามเรื่องถอนเงินก่อน')
+
+  harness.disconnect(socket)
+})

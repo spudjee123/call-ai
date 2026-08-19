@@ -128,6 +128,7 @@ function registerWebSocket(fastify) {
     let durationTimer = null
     let lastMarkTime = 0
     let pendingEndCall = false
+    let pendingTranscript = null  // C6c follow-up: barge-in ที่มาถึงตอนเทิร์นเดิมยังไม่ปล่อย sttProcessing — ช่องเดียว, latest-wins (ดูหมายเหตุที่ processTranscript())
     let activePipelineId = 0
     let prewarmPromise = null    // pre-warmed Claude response Promise<string|null>
     let prewarmStartText = null  // interim text that triggered prewarm
@@ -318,7 +319,11 @@ function registerWebSocket(fastify) {
         socket.send(JSON.stringify({ event: 'clear', streamSid }))
       }
       isSpeaking = false
-      sttProcessing = false  // unlock ให้รับ utterance ใหม่ได้ทันที
+      // C6c follow-up: ไม่ set sttProcessing = false ที่นี่อีกต่อไป — ถ้าเทิร์นเดิมยัง await Claude/TTS อยู่จริง
+      // (sttProcessing ยังเป็น true) นี่ยังไม่ใช่จังหวะปลอดภัยที่จะเริ่ม pipeline ใหม่ซ้อนกัน ปล่อยให้เทิร์นเดิมเป็น
+      // เจ้าของ sttProcessing แต่ผู้เดียว (single writer) — reset เองใน finally ของมันตามปกติเมื่อ async work จริงๆ จบ
+      // (generation guard ที่มีอยู่แล้วทำให้ async work ที่เหลือของเทิร์นเดิมเป็น no-op ทั้งหมดอยู่แล้วหลัง bumpGeneration ด้านบน)
+      // ถ้า sttProcessing เป็น false อยู่แล้ว (เทิร์นเดิมทำงานเสร็จจริง แค่รอ mark/playback-unlock) บรรทัดนี้ไม่มีผลอะไรเช่นกัน
     }
 
     // Streaming TTS — ส่ง chunk ไป Twilio ทันทีที่ ElevenLabs generate
@@ -391,54 +396,22 @@ function registerWebSocket(fastify) {
 
         durationTimer = setTimeout(handleMaxDuration, MAX_CALL_DURATION_MS)
 
-        // เริ่ม STT stream
-        sttStream = transcribeStream(async (transcript) => {
-          if (!transcript || !callActive) return
-          if (pendingEndCall) return
-          if (socket.readyState !== socket.OPEN) return
-          if (sttProcessing) {
-            // log เต็มข้อความ + จำนวนคำ ไว้เช็คความถี่/เนื้อหาจริงที่หายไป ก่อนตัดสินใจว่าคุ้มแก้เป็น queue ไหม (ยังไม่เปลี่ยนพฤติกรรม แค่วัดผล)
-            const trimmed = transcript.trim()
-            const wc = trimmed ? trimmed.split(/\s+/).length : 0
-            console.log(`[STT] Transcript dropped (busy, ${wc} words): "${transcript}"`)
-            return
-          }
-          if (bargeInCooldown) {
-            console.log(`[STT] Transcript dropped (barge-in cooldown): "${transcript.substring(0, 40)}"`)
-            return
-          }
-          // Post-mark echo filter: short fragment ภายใน 500ms ของ mark = delayed PSTN echo
-          const msSinceMark = Date.now() - lastMarkTime
-          if (msSinceMark < 500) {
-            const wc = transcript.trim().split(/\s+/).length
-            if (wc < 3 && transcript.length < 10) {
-              console.log(`[STT] Echo suppressed (${msSinceMark}ms after mark): "${transcript}"`)
-              return
-            }
-          }
-
-          const currentSession = callSessions.get(callSid)
-          if (!currentSession) return
-
-          console.log(`[STT] "${transcript}"`)
-          clearSilenceTimer()
-          silencePromptCount = 0
-
-          // Barge-in: ตรวจสอบว่าเป็นเสียงจริง ไม่ใช่ echo ของ AI
-          if (isSpeaking) {
-            const wordCount = transcript.trim().split(/\s+/).length
-            if (wordCount < 2 && transcript.length < 8) {
-              // Fragment สั้น = echo หรือ noise → ไม่ barge-in
-              console.log(`[STT] Short fragment during AI speech — ignoring echo: "${transcript}"`)
-              return
-            }
-            bargeIn()
-            bargeInCooldown = true
-            setTimeout(() => { bargeInCooldown = false }, 400)
-            await new Promise(r => setTimeout(r, 200))
-          }
-
-          if (sttProcessing) return  // double-check หลัง await
+        // C6c follow-up (production discovery 2026-08-19): เดิม sttProcessing gate เช็คก่อนถึง isSpeaking/bargeIn()
+        // เสมอ ("if (sttProcessing) return" อยู่บนสุดของ callback) — แปลว่าลูกค้าพูดแทรกตอน AI ยัง generate/พูดอยู่
+        // จริง (sttProcessing=true) จะถูกทิ้งเงียบๆ ก่อนแม้แต่จะพยายาม barge-in เลย ทั้งที่นี่คือช่วงที่ barge-in
+        // สำคัญที่สุด (ตรงกับที่ production Call 2 เจอสองรอบ: interrupt ลงจังหวะหลัง AI พูดจบเทิร์นแล้วเท่านั้น)
+        //
+        // แก้โดยแยก "interrupt control" (bargeIn ต้องยิงได้ทันทีไม่ว่า sttProcessing จะเป็นอะไร) ออกจาก
+        // "transcript processing single-flight gate" (sttProcessing ยังคุม "ห้ามมี Claude/TTS pipeline ซ้อนกัน
+        // สองอัน" เหมือนเดิมทุกประการ เป็น single writer เดียว — เทิร์นเจ้าของเท่านั้นที่ reset มันได้ ดู bargeIn())
+        //
+        // ถ้า barge-in เกิดระหว่างเทิร์นเดิมยัง sttProcessing=true อยู่จริง (ยังไม่ถึง finally ของมันเอง) transcript
+        // ที่พูดแทรกจะถูกเก็บไว้ใน pendingTranscript (ช่องเดียว, latest-wins — ไม่ทำ FIFO queue กันหลาย turn เกิด
+        // จากพูดครั้งเดียวระหว่าง STT ส่ง final ซ้ำ/fragment ใกล้ๆ กัน) แล้วให้เทิร์นเดิมเป็นคนสั่ง process ต่อเองใน
+        // finally ของ processTranscript() หลังปล่อย sttProcessing จริง (ผ่าน generation guard เดิมที่มีอยู่แล้ว
+        // ทำให้ async work ที่เหลือของเทิร์นเดิมเป็น no-op ทั้งหมดอยู่แล้วหลัง bumpGeneration ใน bargeIn())
+        async function processTranscript(currentSession, transcript) {
+          if (sttProcessing) return // defensive — ไม่ควรเกิดจริงเพราะทุกจุดที่เรียกมาเช็คมาก่อนแล้ว
           sttProcessing = true
           currentSession.messages.push({ role: 'user', content: transcript })
           const pipelineId = ++activePipelineId
@@ -762,6 +735,84 @@ function registerWebSocket(fastify) {
             const fallbackDelay = totalSent * 20 + 5000
             setTimeout(() => { if (socket.readyState === socket.OPEN) socket.close() }, fallbackDelay)
           }
+
+          // C6c follow-up: sttProcessing ถูกปล่อยไปแล้วจริง (ใน finally ของ branch ด้านบน) ณ จุดนี้ — ถ้ามี
+          // transcript ที่พูดแทรกเข้ามาระหว่างเทิร์นนี้ยังทำงานอยู่ (เก็บไว้ใน pendingTranscript โดย onTranscript)
+          // ให้ process ต่อทันทีในฐานะเทิร์นใหม่ปกติ — เช็ค callActive กันไม่ให้ process ต่อหลังสายวางไปแล้ว
+          if (pendingTranscript && callActive) {
+            const next = pendingTranscript
+            pendingTranscript = null
+            await processTranscript(next.session, next.text)
+          }
+        }
+
+        // เริ่ม STT stream
+        sttStream = transcribeStream(async (transcript) => {
+          if (!transcript || !callActive) return
+          if (pendingEndCall) return
+          if (socket.readyState !== socket.OPEN) return
+          if (bargeInCooldown) {
+            console.log(`[STT] Transcript dropped (barge-in cooldown): "${transcript.substring(0, 40)}"`)
+            return
+          }
+          // Post-mark echo filter: short fragment ภายใน 500ms ของ mark = delayed PSTN echo
+          const msSinceMark = Date.now() - lastMarkTime
+          if (msSinceMark < 500) {
+            const wc = transcript.trim().split(/\s+/).length
+            if (wc < 3 && transcript.length < 10) {
+              console.log(`[STT] Echo suppressed (${msSinceMark}ms after mark): "${transcript}"`)
+              return
+            }
+          }
+
+          const currentSession = callSessions.get(callSid)
+          if (!currentSession) return
+
+          console.log(`[STT] "${transcript}"`)
+          clearSilenceTimer()
+          silencePromptCount = 0
+
+          // Barge-in: ต้องเช็คก่อน sttProcessing เสมอ (ดูหมายเหตุที่ processTranscript() ด้านบน)
+          if (isSpeaking) {
+            const wordCount = transcript.trim().split(/\s+/).length
+            if (wordCount < 2 && transcript.length < 8) {
+              // Fragment สั้น = echo หรือ noise → ไม่ barge-in
+              console.log(`[STT] Short fragment during AI speech — ignoring echo: "${transcript}"`)
+              return
+            }
+            bargeIn()
+            bargeInCooldown = true
+            setTimeout(() => { bargeInCooldown = false }, 400)
+
+            if (sttProcessing) {
+              // เทิร์นเดิมยัง await Claude/TTS อยู่จริง (ยังไม่ถึง finally ของมันเอง) — ห้าม process ซ้อนตอนนี้
+              // เก็บ transcript นี้ไว้ก่อน แล้วให้เทิร์นเดิมเป็นคนสั่ง process ต่อเอง (ดู processTranscript() ด้านบน)
+              pendingTranscript = { session: currentSession, text: transcript }
+              console.log('[Barge-in] Old turn still processing — transcript queued (latest-wins)')
+              return
+            }
+            await new Promise(r => setTimeout(r, 200))
+            if (sttProcessing) return // เผื่อมี turn อื่นแทรกเข้ามาระหว่าง 200ms นี้
+          }
+
+          if (sttProcessing) {
+            if (pendingTranscript) {
+              // ยังอยู่ในช่วงรอเทิร์นเดิมปล่อย sttProcessing หลัง barge-in ไปแล้ว (isSpeaking ถูก bargeIn() ตั้งเป็น
+              // false ไปแล้วตั้งแต่รอบก่อนหน้า แต่ pendingTranscript ยังไม่ถูก drain) — STT อาจส่ง final ซ้ำ/fragment
+              // ต่อเนื่องระหว่างที่ลูกค้ายังพูดอยู่ ถือเป็นส่วนหนึ่งของการพูดแทรกเดียวกัน ใช้ตัวล่าสุดแทนที่เสมอ
+              // (latest-wins ช่องเดียว ไม่ FIFO — กัน AI ตอบหลาย turn จากการพูดแทรกครั้งเดียว)
+              pendingTranscript = { session: currentSession, text: transcript }
+              console.log('[Barge-in] Additional transcript while still queued — replacing with latest')
+              return
+            }
+            // non-barge-in overlap (isSpeaking=false แต่ sttProcessing=true) — กันเหมือนเดิมทุกประการ
+            const trimmed = transcript.trim()
+            const wc = trimmed ? trimmed.split(/\s+/).length : 0
+            console.log(`[STT] Transcript dropped (busy, ${wc} words): "${transcript}"`)
+            return
+          }
+
+          await processTranscript(currentSession, transcript)
         }, (interimText) => {
           if (!callActive || isSpeaking || sttProcessing || bargeInCooldown) return
           clearSilenceTimer()
@@ -849,6 +900,7 @@ function registerWebSocket(fastify) {
         clearDurationTimer()
         clearPrewarm()
         endCall(callState)
+        pendingTranscript = null // C6c follow-up: กัน pending transcript ของสายที่จบไปแล้วถูก drain ทีหลัง (แม้ processTranscript() จะเช็ค callActive ป้องกันไว้อีกชั้นอยู่แล้วก็ตาม)
         if (sttStream) { sttStream.end(); sttStream = null }
       }
     })
@@ -860,6 +912,7 @@ function registerWebSocket(fastify) {
       clearSilenceTimer()
       clearDurationTimer()
       endCall(callState)
+      pendingTranscript = null // C6c follow-up: เช่นเดียวกับ 'stop' — กัน reference ค้างถ้าปิดสายจาก close โดยไม่มี stop event มาก่อน
       if (sttStream) { sttStream.end(); sttStream = null }
       // ถ้ายังไม่มีเหตุผลปิดสายถูก tag ไว้เลย (ไม่ใช่ AI ปิดปกติ/หมดเวลาเงียบ) แปลว่าอีกฝั่งวางสายเอง
       const endedSession = callSessions.get(callSid)
