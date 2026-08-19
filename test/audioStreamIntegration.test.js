@@ -712,3 +712,205 @@ test('22) L1a: chunked (rollout=100%) ต้องส่ง interimFinalizeMs=90
   assert.equal(state.lastSttOptions?.interimFinalizeMs, 900, 'chunked ต้องได้ 900ms เหมือน legacy หลัง 600ms ถูก reject — mechanism/wiring ยังอยู่ครบ เผื่อทดลองค่าอื่นทีหลัง')
   harness.disconnect(socket)
 })
+
+// ===== Commit A — legacy prewarm bounded grace (production incident 2026-08-19) =====
+// เดิม `aiText = await myPrewarm` ไม่มี deadline เลย — prewarm ที่ยัง pending ตอน final มาถึงสามารถ block final
+// path ได้ไม่มีขอบเขต (production trace จริง: Claude ตอบช้า ~11s บน prewarm request ที่เริ่มไว้ก่อน final)
+// เทสชุดนี้พิสูจน์ทุก state ตามที่ล็อกไว้ก่อนแก้: READY/PENDING-within-grace/PENDING-timeout/null-result/
+// unusable/barge-in-during-grace/late-resolution-after-timeout/teardown-during-grace
+
+test('23) Commit A: prewarm READY ก่อน final มาถึง → hit ทันที ไม่มี fresh call ซ้ำ', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+
+  let callCount = 0
+  state.claudeStreamImpl = async function* () { callCount++; yield 'คำตอบจาก prewarm' }
+
+  harness.sendInterim('สวัสดีครับขอสอบถามโปรโมชั่น')
+  await delay(30) // ให้ prewarm resolve จริงก่อน final มาถึง (READY แล้ว)
+  await harness.sendFinalTranscript('สวัสดีครับขอสอบถามโปรโมชั่นสมาชิกใหม่')
+
+  assert.equal(callCount, 1, 'ต้องเรียก Claude แค่ครั้งเดียว (prewarm) ไม่มี fresh call ซ้ำ')
+  const lastAssistant = session.messages.filter(m => m.role === 'assistant').at(-1)
+  assert.equal(lastAssistant.content, 'คำตอบจาก prewarm')
+  harness.disconnect(socket)
+})
+
+test('24) Commit A: prewarm ยัง pending ตอน final มาถึง แต่ resolve ภายใน grace (150ms) → hit ไม่มี fresh call', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+
+  let callCount = 0
+  state.claudeStreamImpl = async function* () {
+    callCount++
+    await delay(80) // ช้ากว่าจะ resolve ตอน final มาถึง แต่ยังเร็วกว่า grace 150ms
+    yield 'คำตอบจาก prewarm ช้าหน่อย'
+  }
+
+  harness.sendInterim('สวัสดีครับขอสอบถามโปรโมชั่น')
+  await harness.sendFinalTranscript('สวัสดีครับขอสอบถามโปรโมชั่นสมาชิกใหม่') // ส่งทันที ไม่รอ prewarm
+
+  assert.equal(callCount, 1, 'ต้องเรียก Claude แค่ครั้งเดียว (prewarm resolve ทันภายใน grace)')
+  const lastAssistant = session.messages.filter(m => m.role === 'assistant').at(-1)
+  assert.equal(lastAssistant.content, 'คำตอบจาก prewarm ช้าหน่อย')
+  harness.disconnect(socket)
+})
+
+test('25) Commit A: prewarm ยัง pending เกิน grace (150ms) → abort prewarm request จริง แล้ว fresh call พอดี 1 ครั้ง', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+
+  let callCount = 0
+  let firstCallSignal = null
+  state.claudeStreamImpl = async function* (s, isGreeting, signal) {
+    callCount++
+    if (callCount === 1) {
+      firstCallSignal = signal
+      await new Promise(() => {}) // ค้างตลอดไป — จำลอง Claude ช้าผิดปกติแบบที่เจอจริงใน production (~11s)
+    } else {
+      yield 'คำตอบจาก fresh call'
+    }
+  }
+
+  harness.sendInterim('สวัสดีครับขอสอบถามโปรโมชั่น')
+  await delay(10) // ให้ prewarm เริ่มจริงก่อน
+  await harness.sendFinalTranscript('สวัสดีครับขอสอบถามโปรโมชั่นสมาชิกใหม่')
+
+  assert.equal(callCount, 2, 'ต้องมี fresh call เกิดขึ้นจริงอีกครั้งหลัง grace หมด (นอกเหนือจาก prewarm ที่ยังค้างอยู่)')
+  assert.equal(firstCallSignal.aborted, true, 'prewarm request เดิมที่ยังค้างอยู่ต้องถูก abort จริงที่ signal level ไม่ใช่แค่ทิ้ง reference เฉยๆ')
+  const lastAssistant = session.messages.filter(m => m.role === 'assistant').at(-1)
+  assert.equal(lastAssistant.content, 'คำตอบจาก fresh call')
+  harness.disconnect(socket)
+})
+
+test('26) Commit A: prewarm resolve เป็น null (Claude ตอบว่างเปล่า) → ถือเป็น miss fresh call เกิดขึ้น 1 ครั้ง', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+
+  let callCount = 0
+  state.claudeStreamImpl = async function* () {
+    callCount++
+    if (callCount === 1) return // ไม่ yield อะไรเลย → prewarm resolve เป็น null
+    yield 'คำตอบจาก fresh call หลัง prewarm null'
+  }
+
+  harness.sendInterim('สวัสดีครับขอสอบถามโปรโมชั่น')
+  await delay(10)
+  await harness.sendFinalTranscript('สวัสดีครับขอสอบถามโปรโมชั่นสมาชิกใหม่')
+
+  assert.equal(callCount, 2, 'prewarm resolve เป็น null ต้องถือเป็น miss ไปเรียก fresh call ต่อ')
+  const lastAssistant = session.messages.filter(m => m.role === 'assistant').at(-1)
+  assert.equal(lastAssistant.content, 'คำตอบจาก fresh call หลัง prewarm null')
+  harness.disconnect(socket)
+})
+
+test('27) Commit A: prewarm unusable (interim ไม่ตรงกับ final) → ไม่มี grace wait เลย ไปเรียก fresh call ทันที', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+
+  let callCount = 0
+  state.claudeStreamImpl = async function* () {
+    callCount++
+    if (callCount === 1) { await new Promise(() => {}) } // prewarm ค้างตลอดไป (ไม่ควรถูกใช้เลย)
+    else yield 'คำตอบจาก fresh call'
+  }
+
+  harness.sendInterim('สวัสดีครับ') // interim ไม่เกี่ยวกับ final ด้านล่างเลย
+  await delay(10)
+  const startedAt = Date.now()
+  await harness.sendFinalTranscript('ไม่มีอะไรตรงกับ interim เลยครับ') // ไม่ match isPrewarmUsable
+  assert.ok(Date.now() - startedAt < 100, 'ไม่ควรมี grace wait เลยเพราะ interim ไม่ match final ตั้งแต่ต้น')
+
+  assert.equal(callCount, 2, 'ต้องข้าม prewarm ไปเรียก fresh call ทันที ไม่ต้องรอ grace เลย')
+  const lastAssistant = session.messages.filter(m => m.role === 'assistant').at(-1)
+  assert.equal(lastAssistant.content, 'คำตอบจาก fresh call')
+  harness.disconnect(socket)
+})
+
+test('28) Commit A: barge-in ระหว่าง grace wait → เทิร์นจบแบบไม่มีเสียง ไม่เรียก fresh call ของตัวเอง, transcript ที่พูดแทรกไม่หาย', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+
+  let callCount = 0
+  state.claudeStreamImpl = async function* (s, isGreeting, signal) {
+    callCount++
+    if (callCount === 1) {
+      // จำลอง SDK จริงที่ signal.abort() ทำให้ request ยุติเร็ว (ไม่ yield อะไรเลย) แทนที่จะค้างตลอดไปแบบไม่สนใจ signal
+      await new Promise((resolve) => { signal.addEventListener('abort', () => resolve(), { once: true }) })
+      return
+    }
+    yield 'ตอบเรื่องที่พูดแทรก'
+  }
+
+  harness.sendInterim('สวัสดีครับขอสอบถามโปรโมชั่น')
+  await delay(10)
+  const turnPromise = harness.sendFinalTranscript('สวัสดีครับขอสอบถามโปรโมชั่นสมาชิกใหม่') // เข้า grace wait (150ms) — เทิร์นนี้ isSpeaking=true แล้ว
+
+  await delay(50) // อยู่ในช่วง grace wait แน่นอน (< 150ms)
+  harness.sendInterim('เดี๋ยวก่อนครับขอถามเรื่องอื่นก่อน') // ยาวพอไม่ใช่ echo — trigger bargeIn() เพราะ isSpeaking=true อยู่
+
+  const clearEvents = socket.sent.filter(e => e.event === 'clear')
+  assert.ok(clearEvents.length > 0, 'barge-in ต้อง trigger ทันทีแม้เทิร์นเดิมกำลังรอ prewarm grace อยู่')
+
+  await harness.sendFinalTranscript('เดี๋ยวก่อนครับขอถามเรื่องอื่นก่อน') // final ของ interrupt — ต้องถูก queue ไว้ (sttProcessing ยัง true เพราะเทิร์นเดิมยัง await grace ไม่จบ)
+
+  await turnPromise // ปล่อยให้เทิร์นเดิม (ที่ถูก barge-in) จบ แล้ว drain transcript ที่ queue ไว้ต่อ
+
+  assert.equal(callCount, 2, 'callCount=1 คือ prewarm เดิมที่ถูก abort (ไม่นับเป็น fresh call ใหม่) callCount=2 คือเทิร์นใหม่หลัง barge-in เท่านั้น')
+  const lastAssistant = session.messages.filter(m => m.role === 'assistant').at(-1)
+  assert.equal(lastAssistant.content, 'ตอบเรื่องที่พูดแทรก')
+  const lastUser = session.messages.filter(m => m.role === 'user').at(-1)
+  assert.equal(lastUser.content, 'เดี๋ยวก่อนครับขอถามเรื่องอื่นก่อน', 'transcript ที่พูดแทรกต้องไม่หาย')
+
+  harness.disconnect(socket)
+})
+
+test('29) Commit A: prewarm ที่ resolve ช้าหลัง grace timeout ไปแล้ว ต้องไม่ถูกใช้ย้อนหลัง (ไม่มี double commit)', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+
+  let resumeLatePrewarm
+  const lateGate = new Promise(resolve => { resumeLatePrewarm = resolve })
+  let callCount = 0
+  state.claudeStreamImpl = async function* () {
+    callCount++
+    if (callCount === 1) { await lateGate; yield 'คำตอบ prewarm ที่มาสายเกินไปแล้ว' }
+    else { yield 'คำตอบจาก fresh call' }
+  }
+
+  harness.sendInterim('สวัสดีครับขอสอบถามโปรโมชั่น')
+  await delay(10)
+  await harness.sendFinalTranscript('สวัสดีครับขอสอบถามโปรโมชั่นสมาชิกใหม่') // grace หมด (150ms) แล้วไปเรียก fresh call จนจบสมบูรณ์ก่อน
+
+  assert.equal(callCount, 2)
+  const messagesBeforeLate = session.messages.length
+  const lastAssistantBefore = session.messages.filter(m => m.role === 'assistant').at(-1)
+  assert.equal(lastAssistantBefore.content, 'คำตอบจาก fresh call')
+
+  resumeLatePrewarm() // ปล่อย prewarm เก่าให้ resolve ตอนนี้ (สายเกินไปแล้ว)
+  await delay(50) // ให้เวลามันทำงานถ้าจะทำอะไรผิดพลาด
+
+  assert.equal(session.messages.length, messagesBeforeLate, 'prewarm ที่มาสายต้องไม่ commit อะไรเพิ่มเข้า history เลย')
+  const mediaEvents = socket.sent.filter(e => e.event === 'media')
+  assert.ok(mediaEvents.length > 0, 'ต้องมีเสียงจาก fresh call ที่ถูกต้องเท่านั้น')
+
+  harness.disconnect(socket)
+})
+
+test('30) Commit A: disconnect ระหว่าง grace wait ต้องไม่ throw/ค้าง', async () => {
+  const callSid = nextCallSid()
+  const { socket, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+
+  state.claudeStreamImpl = async function* () { await new Promise(() => {}) } // ค้างตลอดไป
+
+  harness.sendInterim('สวัสดีครับขอสอบถามโปรโมชั่น')
+  await delay(10)
+  const turnPromise = harness.sendFinalTranscript('สวัสดีครับขอสอบถามโปรโมชั่นสมาชิกใหม่')
+  await delay(30) // อยู่ในช่วง grace wait
+
+  harness.disconnect(socket) // ปิดสายระหว่างที่ยังรอ grace อยู่
+
+  await turnPromise // ต้องไม่ throw หรือค้างตลอดไป (grace หมดตามธรรมชาติที่ 150ms แล้วจบ turn อย่างปลอดภัย)
+
+  assert.ok(true, 'ไม่ throw/ค้าง')
+})

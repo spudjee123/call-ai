@@ -27,6 +27,21 @@ const MAX_CALL_DURATION_MS = (parseInt(process.env.MAX_CALL_DURATION_SECONDS) ||
 // ไปก่อน แต่ยังคง mechanism/wiring/log ทั้งหมดไว้ เผื่อวันหลังอยากทดลองค่าอื่น (เช่น 750-800ms) ใหม่
 const STT_INTERIM_FINALIZE_MS_CHUNKED = 900
 
+// Commit A (L1b prep, production incident 2026-08-19) — legacy's prewarm consumption เดิม `await myPrewarm`
+// ไม่มี deadline เลย ทำให้ speculative optimization กลายเป็น blocking dependency ได้จริง: production trace แสดง
+// prewarm ที่ยัง PENDING ตอน final มาถึง กลับทำให้ sttToTwilio ยาวถึง ~11.8s เพราะ Claude ตอบช้าผิดปกติ (tail
+// latency) บน request เก่าที่เริ่มไว้ก่อนแล้ว ทั้งที่ตัว prewarm ควรช่วยให้เร็วขึ้นเท่านั้น ไม่ใช่ทำให้ช้าลง
+//
+// invariant ที่ต้องคง: prewarm อาจลด latency ได้ แต่ต้องไม่ทำให้ latency แย่ลงกว่า main path เดิมเด็ดขาด — จึงจำกัด
+// เวลารอ prewarm ที่ยัง pending ไว้ที่ PREWARM_GRACE_MS เท่านั้น หมดเวลาแล้วยัง pending → abort request เดิมทิ้ง
+// แล้ว fall through ไปเรียก fresh call ตามปกติ (เหมือนไม่เคยมี prewarm เลย) — ใช้ runAttemptWithWatchdog ตัวเดิม
+// (ออกแบบมาสำหรับ compose child abort จาก outer signal + แยก success/aborted/timeout/error อยู่แล้วจาก C4b)
+//
+// ยังไม่ใส่ watchdog ให้ fresh legacy call เอง (ตอนไม่มี prewarm ให้ใช้เลย) — ต้องออกแบบ recovery policy ก่อน
+// (retry/hedge/canned response) ไม่ใช่แค่ abort() เฉยๆ ที่จะเปลี่ยน "ช้า 11 วิ" เป็น "เงียบแล้วไม่มีคำตอบ" ซึ่งแย่กว่าเดิม
+// เก็บเป็น Commit A2 แยกต่างหาก
+const PREWARM_GRACE_MS = 150
+
 // Checkpoint C5: % rollout ของ chunked-streaming path มาจาก Google Sheets แล้ว (แท็บ "Streaming Config")
 // ผ่าน background polling ของตัวเอง ไม่ใช่ hardcoded คงที่แบบ C0 อีกต่อไป — start() ครั้งเดียวตอน module load
 // (เท่ากับตอน process bootstrap เพราะไฟล์นี้ถูก require ครั้งเดียวตอนเริ่ม server) ให้เริ่ม poll ทันที ไม่ต้องรอ
@@ -147,6 +162,7 @@ function registerWebSocket(fastify) {
     let prewarmPromise = null    // pre-warmed Claude response Promise<string|null>
     let prewarmStartText = null  // interim text that triggered prewarm
     let prewarmAbort = null      // AbortController for prewarm call
+    let prewarmStartedAt = 0     // performance.now() ตอนเริ่ม request จริง — สำหรับ telemetry (prewarmAgeMs), คนละตัวกับ prewarmRetriggerAt (Date.now()-based throttle)
     let prewarmRetriggerAt = 0   // เวลาต่ำสุดที่อนุญาตเดาใหม่รอบถัดไป (throttle กันยิง Claude ถี่เกิน)
 
     // Checkpoint C0: safety infrastructure ของ B.5 ผูกไว้กับสายนี้แล้ว แต่ยังไม่มีจุดไหนอ่าน/ใช้งานจริง
@@ -243,6 +259,7 @@ function registerWebSocket(fastify) {
         clearPrewarm()
       }
       prewarmRetriggerAt = Date.now() + 700
+      prewarmStartedAt = performance.now()
       prewarmStartText = interimText
       prewarmAbort = new AbortController()
       const signal = prewarmAbort.signal
@@ -467,8 +484,15 @@ function registerWebSocket(fastify) {
           }, 30000)
 
           // Capture prewarm reference — ป้องกัน pipeline เก่าล้าง prewarm ของ pipeline ใหม่
+          // Commit A: snapshot prewarmAbort คู่กับ myPrewarm ด้วย (ไม่ใช่แค่ text) — prewarmPromise/prewarmAbort
+          // เป็น mutable global ที่ clearPrewarm()/startPrewarm() เปลี่ยน ref ได้ตลอดเวลา ถ้า grace-timeout handler
+          // อ้าง prewarmAbort ตรงๆ (แทนที่จะ snapshot ไว้ ณ จุดนี้) อาจไป abort() ตัวที่ไม่ใช่เจ้าของ myPrewarm จริง
+          // ถ้ามี prewarm ใหม่เริ่มไปแล้วระหว่างที่ turn นี้ยัง await grace อยู่ (unlikely จาก sttProcessing/isSpeaking
+          // guard เดิม แต่ snapshot ตรงตามตัวแปรที่ผูกกันจริงเป็น invariant ที่แข็งแรงกว่า ไม่ต้องพึ่ง guard อื่นค้ำ)
           const myPrewarm = prewarmPromise
           const myPrewarmText = prewarmStartText
+          const myPrewarmAbort = prewarmAbort
+          const myPrewarmStartedAt = prewarmStartedAt
 
           // C3a: ตัดสิน branch ก่อน Claude side effect แรกเสมอ — ห้ามมี code เรียก Claude ก่อนจุดนี้ไม่ว่า path ไหน
           // rollout ยัง 0% เสมอตอนนี้ จึงยังไม่มีสายไหนเข้า branch นี้จริงในโปรดักชัน (ดู C0/decideRollout)
@@ -640,10 +664,42 @@ function registerWebSocket(fastify) {
             let aiText = null
             markOnce(turnMetrics, 't2') // legacy: askClaudeStream yield ข้อความเต็มก้อนเดียว จึงไม่มี t3/t4 ที่มีความหมาย
             if (myPrewarm && isPrewarmUsable(myPrewarmText, transcript)) {
-              console.log(`[Prewarm] Awaiting pre-warmed response for: "${transcript}"`)
-              aiText = await myPrewarm
-              if (aiText) console.log(`[Prewarm] Hit — skipping fresh Claude call`)
-              else console.log(`[Prewarm] Null result — falling back to fresh call`)
+              const graceWaitStartedAt = performance.now() // เวลาเริ่ม "รอบรอ grace นี้" คนละตัวกับ myPrewarmStartedAt (เวลาที่ request เริ่มจริงตอน startPrewarm())
+              console.log(`[Prewarm] Awaiting pre-warmed response for: "${transcript}" (grace=${PREWARM_GRACE_MS}ms)`)
+              const attempt = await runAttemptWithWatchdog({
+                signal, // signal เดิมของเทิร์นนี้ — barge-in ยัง abort ได้ทันทีเหมือนเดิม ไม่ต้องเพิ่มโค้ดแยก
+                timeoutMs: PREWARM_GRACE_MS,
+                reason: 'PREWARM_GRACE_TIMEOUT',
+                run: (childSignal) => {
+                  // ต้อง abort myPrewarmAbort ที่ snapshot ไว้ (ไม่ใช่ prewarmAbort global) — กัน race ถ้ามี
+                  // prewarm รอบใหม่เริ่มไปแล้วระหว่างที่ turn นี้ยัง await grace อยู่พอดี
+                  childSignal.addEventListener('abort', () => {
+                    if (myPrewarmAbort && !myPrewarmAbort.signal.aborted) myPrewarmAbort.abort()
+                  }, { once: true })
+                  return myPrewarm
+                },
+              })
+              const waitedMs = Math.round(performance.now() - graceWaitStartedAt)
+
+              // prewarm IIFE เองมี try/catch คลุมอยู่แล้ว (คืน null เสมอตอน error ไม่เคย throw ออกมาจริง) จึงต้อง
+              // เช็คทั้ง outcome และ result ร่วมกัน — success+null ก็ต้องถือเป็น miss แล้วไป fresh call เหมือนกัน
+              //
+              // ทุก branch (รวม aborted) ปล่อยให้ไหลลงไปถึง shared tail ท้าย processTranscript() ตามปกติ ห้าม
+              // early return ที่นี่เด็ดขาด — ถ้า barge-in ทำให้ transcript ถูก queue ไว้ใน pendingTranscript ไปแล้ว
+              // (โดย onTranscript ตั้งแต่ bargeIn() ทำงาน) ต้องให้ drain logic ท้ายฟังก์ชันเป็นคนสั่ง process ต่อ
+              // aiText ปล่อยเป็น null แล้วให้ guard เดิมด้านล่าง (!signal.aborted) กัน fresh call/TTS เองตามปกติพอ
+              if (attempt.outcome === 'success' && attempt.result) {
+                aiText = attempt.result
+                console.log(`[Prewarm] Grace success waitedMs=${waitedMs} — skipping fresh Claude call`)
+              } else if (attempt.outcome === 'success') {
+                console.log(`[Prewarm] Grace success waitedMs=${waitedMs} but null result — falling back to fresh call`)
+              } else if (attempt.outcome === 'timeout') {
+                console.log(`[Prewarm] Grace timeout waitedMs=${waitedMs} prewarmAgeMs=${Math.round(performance.now() - myPrewarmStartedAt)} — falling back to fresh call`)
+              } else if (attempt.outcome === 'aborted') {
+                console.log('[Prewarm] Grace wait aborted by barge-in — no fresh call, turn ends with no audio')
+              } else {
+                console.log(`[Prewarm] Grace error waitedMs=${waitedMs} (${attempt.error?.message}) — falling back to fresh call`)
+              }
             }
             if (prewarmPromise === myPrewarm) clearPrewarm()
 
