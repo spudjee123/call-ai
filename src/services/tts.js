@@ -10,7 +10,9 @@ async function synthesizeSpeech(text, voiceId) {
 
 // Streaming version — async generator yielding 160-byte μ-law chunks
 // Google TTS ไม่รองรับ streaming → fall back to batch แล้ว yield ทีละ chunk
-async function* synthesizeSpeechStream(text, voiceId, signal) {
+//
+// L1c2a: previousText (optional) — thread ผ่านไปยัง ElevenLabs เท่านั้น (Google TTS batch API ไม่มี concept นี้)
+async function* synthesizeSpeechStream(text, voiceId, signal, previousText) {
   if (isGoogleVoice(voiceId)) {
     const chunks = await synthesizeSpeechThai(text, voiceId)
     for (const chunk of chunks) {
@@ -18,7 +20,7 @@ async function* synthesizeSpeechStream(text, voiceId, signal) {
       yield chunk
     }
   } else {
-    yield* elevenLabsStream(text, voiceId, signal)
+    yield* elevenLabsStream(text, voiceId, signal, previousText)
   }
 }
 

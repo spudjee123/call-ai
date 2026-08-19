@@ -65,7 +65,16 @@ const { isCurrentGeneration } = require('../utils/generationGuard')
 // onAudioSent (C4c follow-up: commit-aware fallback watchdog) ตรงข้ามกับสองตัวบน — ยิงทุกก้อนที่ส่งสำเร็จ
 // จริง ไม่ใช่ first-only เสมอมาหลัง markAudioCommitted() แล้วเท่านั้น ให้ caller (เช่น fallback's post-commit
 // idle watchdog ใน audioStream.js) ใช้ commit เป็น source of truth ในการ rearm ทุกครั้งที่มี progress จริง
-async function synthesizeAndSend({ text, signal, socket, streamSid, voiceId, turnMetrics, turnState, isCurrent, startingSentCount, onFirstAudioSent, onAudioSent, onFirstTtsRequest, onFirstTtsAudio }) {
+// L1c2a — previousText (optional): thread เข้า ElevenLabs previous_text ตรงๆ (ดู elevenlabs.js) เพื่อรักษา
+// prosody ต่อเนื่องระหว่าง chunk ที่ chunker แยกจริง — caller (adoptChunkedProducer) เป็นเจ้าของ state ว่า chunk
+// ก่อนหน้าคืออะไร ฟังก์ชันนี้แค่ thread ผ่านไปเฉยๆ ไม่รู้จัก sequence เอง
+//
+// onChunkTelemetry (optional): ยิงครั้งเดียวใน finally เสมอ (แม้ error/abort ก่อนเสียงแรก) ด้วย raw timestamp
+// ดิบ — ไม่ interpret/log เอง ปล่อยให้ caller (ที่มี callSid/generationId/chunkIndex/state ข้าม chunk) ประกอบ log
+// เอง — แยก firstAudioAt/lastAudioAt (ตอน ElevenLabs ส่ง byte มาถึง ก่อน guard check ใดๆ) จาก firstSentAt/
+// lastSentAt (ตอน socket.send() จริงหลัง guard ผ่านแล้ว) เพราะสอง timestamp นี้มีความหมายต่างกัน: อันแรกวัด
+// provider latency ล้วนๆ อันหลังวัด "seam" ที่ audio path จริงจะเจอ (รวม guard/stale overhead ถ้ามี)
+async function synthesizeAndSend({ text, signal, socket, streamSid, voiceId, turnMetrics, turnState, isCurrent, startingSentCount, onFirstAudioSent, onAudioSent, onFirstTtsRequest, onFirstTtsAudio, previousText, onChunkTelemetry }) {
   if (!isCurrent() || signal?.aborted) return 0
 
   const isFirstTtsRequest = turnMetrics.t5 == null
@@ -73,24 +82,50 @@ async function synthesizeAndSend({ text, signal, socket, streamSid, voiceId, tur
   markTtsPending(turnState) // no-op ถ้า phase ไม่ใช่ GENERATING แล้ว (เช่น AUDIO_COMMITTED ไปแล้วจากข้อความก่อนหน้าในเทิร์นเดียวกัน) — monotonic โดย turnState.js เอง ไม่มีทาง regress
   if (isFirstTtsRequest) onFirstTtsRequest?.() // arm Watchdog C ตอน TTS request เริ่มจริง ไม่ใช่ตอน chunk ถูก dequeue จาก queue
 
-  let sentCount = 0
-  for await (const audioChunk of synthesizeSpeechStream(text, voiceId, signal)) {
-    // boundary 4+5 รวมกัน (ElevenLabs audio arrival + ก่อน socket.send) — ไม่มี async gap คั่นสองจุดนี้จริง
-    // นี่คือ "ด่านสุดท้าย" ที่สำคัญที่สุด: ต้องเช็คก่อนแม้แต่ markOnce(t6)/markAudioCommitted ไม่ใช่แค่ก่อน send
-    if (!isCurrent()) break
-    if (signal?.aborted) break
-    if (socket.readyState !== socket.OPEN) break
+  const telemetry = {
+    requestStartedAt: performance.now(),
+    firstAudioAt: null,
+    lastAudioAt: null,
+    firstSentAt: null,
+    lastSentAt: null,
+    requestDoneAt: null,
+    sentCount: 0,
+  }
 
-    const isFirstTtsAudio = turnMetrics.t6 == null
-    markOnce(turnMetrics, 't6')
-    if (isFirstTtsAudio) onFirstTtsAudio?.() // disarm Watchdog C — first-only เช่นกัน
-    if (startingSentCount + sentCount === 0) console.log('[TTS] First audio chunk sent')
-    socket.send(JSON.stringify({ event: 'media', streamSid, media: { payload: audioChunk.toString('base64') } }))
-    markOnce(turnMetrics, 't7')
-    markAudioCommitted(turnState) // ต้องมาก่อน onAudioSent เสมอ — commit คือ source of truth ที่ caller (เช่น fallback's idle watchdog) ใช้ตัดสินใจ ไม่ใช่แค่ "ส่งไปแล้ว"
-    if (startingSentCount + sentCount === 0) onFirstAudioSent?.()
-    onAudioSent?.() // ทุกก้อน (ไม่ใช่ first-only เหมือน onFirstAudioSent) — granularity เดียวกับ sentCount/totalSent ที่ caller ใช้อยู่แล้ว ไม่ใช่ raw ElevenLabs byte frame
-    sentCount++
+  let sentCount = 0
+  try {
+    for await (const audioChunk of synthesizeSpeechStream(text, voiceId, signal, previousText)) {
+      // provider-side timing — วัด "ElevenLabs ส่ง byte มาถึงเราตอนไหน" ก่อน guard ใดๆ (นี่ไม่ใช่ side effect
+      // ที่ C3b guard ป้องกัน แค่ timestamp ใน object ท้องถิ่นที่ยังไม่หลุดออกไปไหนจนกว่า finally ด้านล่าง)
+      telemetry.lastAudioAt = performance.now()
+      if (telemetry.firstAudioAt === null) telemetry.firstAudioAt = telemetry.lastAudioAt
+
+      // boundary 4+5 รวมกัน (ElevenLabs audio arrival + ก่อน socket.send) — ไม่มี async gap คั่นสองจุดนี้จริง
+      // นี่คือ "ด่านสุดท้าย" ที่สำคัญที่สุด: ต้องเช็คก่อนแม้แต่ markOnce(t6)/markAudioCommitted ไม่ใช่แค่ก่อน send
+      if (!isCurrent()) break
+      if (signal?.aborted) break
+      if (socket.readyState !== socket.OPEN) break
+
+      const isFirstTtsAudio = turnMetrics.t6 == null
+      markOnce(turnMetrics, 't6')
+      if (isFirstTtsAudio) onFirstTtsAudio?.() // disarm Watchdog C — first-only เช่นกัน
+      if (startingSentCount + sentCount === 0) console.log('[TTS] First audio chunk sent')
+      socket.send(JSON.stringify({ event: 'media', streamSid, media: { payload: audioChunk.toString('base64') } }))
+      const sentAt = performance.now()
+      telemetry.lastSentAt = sentAt
+      if (telemetry.firstSentAt === null) telemetry.firstSentAt = sentAt
+      markOnce(turnMetrics, 't7')
+      markAudioCommitted(turnState) // ต้องมาก่อน onAudioSent เสมอ — commit คือ source of truth ที่ caller (เช่น fallback's idle watchdog) ใช้ตัดสินใจ ไม่ใช่แค่ "ส่งไปแล้ว"
+      if (startingSentCount + sentCount === 0) onFirstAudioSent?.()
+      onAudioSent?.() // ทุกก้อน (ไม่ใช่ first-only เหมือน onFirstAudioSent) — granularity เดียวกับ sentCount/totalSent ที่ caller ใช้อยู่แล้ว ไม่ใช่ raw ElevenLabs byte frame
+      sentCount++
+    }
+  } finally {
+    // finally เสมอ ไม่ใช่แค่ happy path — เคสที่อยากเห็น telemetry มากที่สุดคือตอน ElevenLabs error/abort ก่อน
+    // เสียงแรก (timestamp อื่นๆ ยัง null ตามจริง ไม่ fabricate)
+    telemetry.requestDoneAt = performance.now()
+    telemetry.sentCount = sentCount
+    onChunkTelemetry?.(telemetry)
   }
   return sentCount
 }
@@ -287,6 +322,13 @@ async function adoptChunkedProducer({ producer, signal, socket, streamSid, voice
 
   let totalSent = 0
   let consumerError = null
+  // L1c2a — state ข้าม chunk ที่ adoptChunkedProducer เป็นเจ้าของ (synthesizeAndSend ไม่รู้จัก sequence เอง):
+  // previousChunkText สำหรับ ElevenLabs previous_text, previousLastAudioAt/previousLastSentAt สำหรับคำนวณ
+  // providerGapMs/sendGapMs ใน [ChunkMetrics] log
+  let previousChunkText = null
+  let previousLastAudioAt = null
+  let previousLastSentAt = null
+  let chunkIndex = 0
   try {
     while (true) {
       await producer.waitForWork()
@@ -295,7 +337,40 @@ async function adoptChunkedProducer({ producer, signal, socket, streamSid, voice
       if (!isCurrent()) break // boundary 3
 
       const chunk = producer.queue.shift()
-      totalSent += await synthesizeAndSend({ text: chunk, signal, socket, streamSid, voiceId, turnMetrics, turnState, isCurrent, startingSentCount: totalSent, onFirstAudioSent, onAudioSent, onFirstTtsRequest, onFirstTtsAudio })
+      const myChunkIndex = chunkIndex++
+      const myPreviousLastAudioAt = previousLastAudioAt
+      const myPreviousLastSentAt = previousLastSentAt
+      const sent = await synthesizeAndSend({
+        text: chunk, signal, socket, streamSid, voiceId, turnMetrics, turnState, isCurrent,
+        startingSentCount: totalSent, onFirstAudioSent, onAudioSent, onFirstTtsRequest, onFirstTtsAudio,
+        previousText: previousChunkText,
+        onChunkTelemetry: (telemetry) => {
+          console.log('[ChunkMetrics]', JSON.stringify({
+            callSid: turnMetrics.callSid,
+            generationId: turnMetrics.generationId,
+            chunkIndex: myChunkIndex,
+            ttfbMs: telemetry.firstAudioAt != null ? Math.round(telemetry.firstAudioAt - telemetry.requestStartedAt) : null,
+            requestDurationMs: Math.round(telemetry.requestDoneAt - telemetry.requestStartedAt),
+            // providerGapMs — ระยะจาก audio ก้อนสุดท้ายของ chunk ก่อนหน้า ถึง audio ก้อนแรกของ chunk นี้ (ฝั่ง
+            // ElevenLabs ล้วนๆ) ไม่ใช่ requestStartedAt(ปัจจุบัน)-requestDoneAt(ก่อนหน้า) ที่จะได้ ~0ms เสมอเพราะ
+            // consumer เป็น serial (loop ต่อ request ใหม่ทันทีที่ request เก่า resolve)
+            providerGapMs: myPreviousLastAudioAt != null && telemetry.firstAudioAt != null ? Math.round(telemetry.firstAudioAt - myPreviousLastAudioAt) : null,
+            // sendGapMs — proxy ที่ตรงกับ "seam" ของ audio path จริงมากกว่า (ไม่ใช่ "เงียบที่หูได้ยิน" 100%
+            // เพราะ Twilio มี buffering/playout ของตัวเอง แต่สะท้อนจังหวะที่เราส่งเข้า socket จริง)
+            sendGapMs: myPreviousLastSentAt != null && telemetry.firstSentAt != null ? Math.round(telemetry.firstSentAt - myPreviousLastSentAt) : null,
+            sentCount: telemetry.sentCount,
+          }))
+          if (telemetry.lastAudioAt != null) previousLastAudioAt = telemetry.lastAudioAt
+          if (telemetry.lastSentAt != null) previousLastSentAt = telemetry.lastSentAt
+        },
+      })
+      totalSent += sent
+
+      // chunk นี้กลายเป็น "predecessor" สำหรับ previous_text ของ chunk ถัดไปก็ต่อเมื่อมันถูกพูดจริง (sentCount>0)
+      // และเทิร์นยังไม่ stale/aborted ตอนจบ — ไม่งั้น chunk ที่ลูกค้าไม่เคยได้ยินจริงจะกลายเป็น predecessor ปลอม
+      if (sent > 0 && !signal?.aborted && isCurrent()) {
+        previousChunkText = chunk
+      }
     }
   } catch (err) {
     if (!signal?.aborted) consumerError = err

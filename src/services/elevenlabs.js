@@ -69,22 +69,31 @@ async function synthesizeSpeech(text, voiceId) {
 
 // Streaming version — yields 160-byte μ-law chunks as ElevenLabs generates them
 // ลด latency: Twilio เล่นเสียงได้ทันทีโดยไม่ต้องรอ TTS เสร็จทั้งหมด
-async function* synthesizeSpeechStream(text, voiceId, signal) {
+//
+// L1c2a (production defect follow-up) — previousText (optional): ข้อความของ speech chunk ก่อนหน้าที่เพิ่งพูด
+// จบไปจริง (ถ้ามี) ส่งเป็น previous_text ใน request body — ElevenLabs ใช้ช่วยรักษา prosody ต่อเนื่องเวลานำหลาย
+// generation มาต่อกัน (แก้ "เสียงคนละโทน" ระหว่าง chunk ที่ chunker ต้องแยกจริงๆ เช่น ตัวเลข/หน่วยนับที่ยัง
+// protect ไม่ทันในบางจังหวะ) — ใส่ key นี้เฉพาะเมื่อมีค่าจริง (falsy เช่น undefined/null/'' ไม่ใส่เลย ไม่ใช่ส่ง
+// previous_text ว่างเปล่า) เพราะ chunk แรกของเทิร์นไม่มี predecessor จริง
+async function* synthesizeSpeechStream(text, voiceId, signal, previousText) {
   voiceId = voiceId || DEFAULT_VOICE_ID
   console.log(`[ElevenLabs Stream] voiceId=${voiceId} text="${text.substring(0, 60)}"`)
 
+  const body = {
+    text,
+    model_id: 'eleven_v3',
+    voice_settings: {
+      stability: 0.5,   // ลดจาก 0.85 — เดิมนิ่งเกินจนเสียงราบเรียบไม่มีอารมณ์
+      similarity_boost: 0.90,
+      style: 0.25,       // เพิ่มจาก 0 — ดึงอารมณ์/บุคลิกจากเสียงต้นฉบับออกมาให้ฟังเป็นธรรมชาติขึ้น
+      use_speaker_boost: true
+    },
+  }
+  if (previousText) body.previous_text = previousText
+
   const response = await axios.post(
     `${BASE_URL}/text-to-speech/${voiceId}/stream?output_format=${OUTPUT_FORMAT}`,
-    {
-      text,
-      model_id: 'eleven_v3',
-      voice_settings: {
-        stability: 0.5,   // ลดจาก 0.85 — เดิมนิ่งเกินจนเสียงราบเรียบไม่มีอารมณ์
-        similarity_boost: 0.90,
-        style: 0.25,       // เพิ่มจาก 0 — ดึงอารมณ์/บุคลิกจากเสียงต้นฉบับออกมาให้ฟังเป็นธรรมชาติขึ้น
-        use_speaker_boost: true
-      },
-    },
+    body,
     {
       headers: {
         'xi-api-key': API_KEY,

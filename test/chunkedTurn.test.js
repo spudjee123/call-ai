@@ -17,7 +17,7 @@ const ttsPath = require.resolve('../src/services/tts')
 require.cache[ttsPath] = {
   id: ttsPath, filename: ttsPath, loaded: true,
   exports: {
-    synthesizeSpeechStream: (text, voiceId, signal) => state.ttsImpl(text, voiceId, signal),
+    synthesizeSpeechStream: (text, voiceId, signal, previousText) => state.ttsImpl(text, voiceId, signal, previousText),
   },
 }
 
@@ -563,6 +563,112 @@ test('L1b) adoptChunkedProducer: attach ให้ producer ที่ buffer chun
   const result = await adoptChunkedProducer({ producer, signal: null, socket, streamSid: 'SS1', voiceId: 'v1', turnMetrics, turnState, callState, generationId })
   assert.deepEqual(ttsCalls, ['Ready before adopt.'])
   assert.equal(result.totalSent, 1)
+})
+
+// ---------------------------------------------------------------------------
+// L1c2a — previous_text continuity + per-chunk telemetry
+// ---------------------------------------------------------------------------
+
+test('L1c2a) chunk แรกของเทิร์น → previousText เป็น null (ไม่มี predecessor จริง)', async () => {
+  state.claudeImpl = fakeClaude(['Hello. ', 'World.'])
+  const previousTexts = []
+  state.ttsImpl = async function* (text, voiceId, signal, previousText) { previousTexts.push(previousText); yield Buffer.from('a') }
+  const socket = makeSocket()
+  const { turnMetrics, turnState, callState, generationId } = makeMetricsAndState()
+  await runChunkedTurn({ session: {}, signal: null, socket, streamSid: 'SS1', voiceId: 'v1', turnMetrics, turnState, callState, generationId })
+  assert.equal(previousTexts[0], null)
+})
+
+test('L1c2a) chunk ที่สอง → previousText ตรงกับข้อความ chunk แรกที่เพิ่งพูดจบไปเป๊ะ', async () => {
+  state.claudeImpl = fakeClaude(['Hello. ', 'World.'])
+  const previousTexts = []
+  state.ttsImpl = async function* (text, voiceId, signal, previousText) { previousTexts.push(previousText); yield Buffer.from('a') }
+  const socket = makeSocket()
+  const { turnMetrics, turnState, callState, generationId } = makeMetricsAndState()
+  await runChunkedTurn({ session: {}, signal: null, socket, streamSid: 'SS1', voiceId: 'v1', turnMetrics, turnState, callState, generationId })
+  assert.equal(previousTexts[1], 'Hello.')
+})
+
+test('L1c2a) chunk ที่ไม่เคยถูกพูดจริง (sentCount=0 เพราะ socket ปิดกลางทาง) → ไม่กลายเป็น previousText ของ chunk ถัดไป', async () => {
+  state.claudeImpl = fakeClaude(['First. ', 'Second.'])
+  let call = 0
+  const previousTexts = []
+  const socket = makeSocket()
+  state.ttsImpl = async function* (text, voiceId, signal, previousText) {
+    call++
+    previousTexts.push(previousText)
+    if (call === 1) { socket.readyState = 0; yield Buffer.from('a'); return } // chunk แรก "ได้ audio" จาก provider แต่ไม่เคยถูกส่งจริง (socket ปิดพอดี)
+    socket.readyState = 1
+    yield Buffer.from('b')
+  }
+  const { turnMetrics, turnState, callState, generationId } = makeMetricsAndState()
+  await runChunkedTurn({ session: {}, signal: null, socket, streamSid: 'SS1', voiceId: 'v1', turnMetrics, turnState, callState, generationId })
+  assert.equal(previousTexts[1], null, 'chunk แรกไม่เคยถูกส่งจริง (socket ปิด) ต้องไม่กลายเป็น predecessor ของ chunk ที่สอง (ยังเป็นค่าเริ่มต้น null เหมือนไม่มี predecessor)')
+})
+
+test('L1c2a) onChunkTelemetry (ผ่าน [ChunkMetrics] log): requestStartedAt <= firstAudioAt <= requestDoneAt เรียงลำดับถูกต้อง', async () => {
+  state.claudeImpl = fakeClaude(['Hello world. '])
+  state.ttsImpl = async function* () { await new Promise(r => setTimeout(r, 5)); yield Buffer.from('a') }
+  const socket = makeSocket()
+  const { turnMetrics, turnState, callState, generationId } = makeMetricsAndState()
+  const originalLog = console.log
+  const logs = []
+  console.log = (...args) => { logs.push(args.join(' ')); }
+  try {
+    await runChunkedTurn({ session: {}, signal: null, socket, streamSid: 'SS1', voiceId: 'v1', turnMetrics, turnState, callState, generationId })
+  } finally {
+    console.log = originalLog
+  }
+  const line = logs.find(l => l.includes('[ChunkMetrics]'))
+  assert.ok(line, 'ต้องมี [ChunkMetrics] log')
+  const record = JSON.parse(line.slice(line.indexOf('{')))
+  assert.equal(record.chunkIndex, 0)
+  assert.ok(record.ttfbMs >= 0, 'ttfbMs ต้อง >= 0')
+  assert.ok(record.requestDurationMs >= record.ttfbMs, 'requestDurationMs ต้อง >= ttfbMs')
+  assert.equal(record.providerGapMs, null, 'chunk แรกไม่มี predecessor ต้อง providerGapMs=null')
+  assert.equal(record.sendGapMs, null)
+  assert.equal(record.sentCount, 1)
+})
+
+test('L1c2a) [ChunkMetrics] ยิงแม้ TTS error ก่อนเสียงแรก (finally เสมอ) — timestamp ที่ไม่เกิดขึ้นจริงเป็น null ไม่ fabricate', async () => {
+  state.claudeImpl = fakeClaude(['Hello world. '])
+  state.ttsImpl = async function* () { throw new Error('TTS boom') }
+  const socket = makeSocket()
+  const { turnMetrics, turnState, callState, generationId } = makeMetricsAndState()
+  const originalLog = console.log
+  const logs = []
+  console.log = (...args) => { logs.push(args.join(' ')) }
+  try {
+    await assert.rejects(() => runChunkedTurn({ session: {}, signal: null, socket, streamSid: 'SS1', voiceId: 'v1', turnMetrics, turnState, callState, generationId }))
+  } finally {
+    console.log = originalLog
+  }
+  const line = logs.find(l => l.includes('[ChunkMetrics]'))
+  assert.ok(line, '[ChunkMetrics] ต้องยิงแม้ error ก่อนเสียงแรก')
+  const record = JSON.parse(line.slice(line.indexOf('{')))
+  assert.equal(record.ttfbMs, null, 'ไม่มี audio มาถึงเลยก่อน error — ttfbMs ต้องเป็น null ไม่ใช่ 0 ปลอมๆ')
+  assert.equal(record.sentCount, 0)
+})
+
+test('L1c2a) providerGapMs/sendGapMs มีค่าจริงตั้งแต่ chunk ที่สองเป็นต้นไป', async () => {
+  state.claudeImpl = fakeClaude(['One thing. ', 'Two thing.'])
+  state.ttsImpl = async function* () { yield Buffer.from('a') }
+  const socket = makeSocket()
+  const { turnMetrics, turnState, callState, generationId } = makeMetricsAndState()
+  const originalLog = console.log
+  const logs = []
+  console.log = (...args) => { logs.push(args.join(' ')) }
+  try {
+    await runChunkedTurn({ session: {}, signal: null, socket, streamSid: 'SS1', voiceId: 'v1', turnMetrics, turnState, callState, generationId })
+  } finally {
+    console.log = originalLog
+  }
+  const records = logs.filter(l => l.includes('[ChunkMetrics]')).map(l => JSON.parse(l.slice(l.indexOf('{'))))
+  assert.equal(records.length, 2)
+  assert.equal(records[0].providerGapMs, null)
+  assert.equal(records[0].sendGapMs, null)
+  assert.equal(typeof records[1].providerGapMs, 'number')
+  assert.equal(typeof records[1].sendGapMs, 'number')
 })
 
 test('stale callback ต้องไม่มีสิทธิ์แตะ metrics/state ของ generation อื่นเลย แม้จะเป็นแค่การ mark ไม่ใช่ side effect ที่มองเห็นได้จากภายนอก', async () => {

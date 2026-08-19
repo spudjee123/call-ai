@@ -38,7 +38,7 @@ function ensureStubbed() {
   const ttsPath = require.resolve('../src/services/tts')
   require.cache[ttsPath] = {
     id: ttsPath, filename: ttsPath, loaded: true,
-    exports: { synthesizeSpeechStream: (text, voiceId, signal) => state.ttsImpl(text, voiceId, signal) },
+    exports: { synthesizeSpeechStream: (text, voiceId, signal, previousText) => state.ttsImpl(text, voiceId, signal, previousText) },
   }
 
   const sttPath = require.resolve('../src/services/googleSTT')
