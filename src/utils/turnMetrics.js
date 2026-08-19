@@ -24,6 +24,15 @@ function createTurnMetrics({ callSid, generationId, path, rolloutBucket, rollout
     fallbackStartedAt: null, // C4a — performance.now() ตอนเริ่มพยายาม fallback (ถ้ามี) ใช้แยกวิเคราะห์ turn ที่ fallback ออกจาก pure-chunked latency percentile
     fallbackOutcome: null, // C4c — สิ่งที่เกิดกับ "ความพยายาม fallback เอง": SPOKEN/STALE/FALLBACK_TIMEOUT/FALLBACK_ERROR
     audioCommitted: false,
+    // L1b — prewarm telemetry แยกจาก canonical t1-t7 โดยตั้งใจ (ห้ามปนกัน — speculation อาจเริ่มก่อน t1/STT-final
+    // ด้วยซ้ำ ถ้าเอาไป mark t2 ตรงๆ จะทำให้ t2 < t1 ผิด sequence) ทุกค่า relative ต่อ prewarmStartedAt เอง ไม่ใช่
+    // absolute performance.now() — t3/t4 (canonical) ยังหมายถึง "accepted-path availability time" เหมือนเดิมเป๊ะ
+    prewarmStartedAt: null, // performance.now() ตอน speculation เริ่มจริง (ถ้ามี speculation ให้ turn นี้)
+    prewarmFirstDeltaMs: null, // เวลาที่ delta แรกของ speculation มาถึง สัมพัทธ์กับ prewarmStartedAt
+    prewarmFirstChunkMs: null, // เวลาที่ safe chunk แรกของ speculation พร้อม สัมพัทธ์กับ prewarmStartedAt
+    prewarmAgeAtFinalMs: null, // อายุของ speculation ณ ตอน final transcript มาถึงจริง (snapshot ก่อน grace ใดๆ)
+    prewarmOutcome: null, // BUFFERED_HIT/READY_HIT/CONTROL_ONLY_HIT/DELTA_ONLY_HIT/GRACE_HIT/GRACE_TIMEOUT_FRESH/MISMATCH_FRESH/EMPTY_FRESH/ERROR_FRESH/ABORTED
+    prewarmBufferedChunks: null, // จำนวน chunk ที่ค้างใน queue ตอน adopt (หรือ null ถ้าไม่มี speculation)
   }
 }
 

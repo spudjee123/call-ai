@@ -21,7 +21,7 @@ require.cache[ttsPath] = {
   },
 }
 
-const { runChunkedTurn, speakFixedText } = require('../src/websocket/chunkedTurn')
+const { runChunkedTurn, speakFixedText, createChunkedProducer, adoptChunkedProducer } = require('../src/websocket/chunkedTurn')
 const { createTurnMetrics } = require('../src/utils/turnMetrics')
 const { createTurnState, markAudioCommitted } = require('../src/utils/turnState')
 const { createCallState, bumpGeneration } = require('../src/utils/generationGuard')
@@ -446,6 +446,123 @@ test('C3c-5) startingSentCount > 0 (follow-up ต่อจากข้อคว�
   let onFirstCalls = 0
   await speakFixedText({ text: 'follow up', signal: null, socket, streamSid: 'SS1', voiceId: 'v1', turnMetrics, turnState, callState, generationId, startingSentCount: 5, onFirstAudioSent: () => { onFirstCalls++ } })
   assert.equal(onFirstCalls, 0, 'ไม่ใช่ audio chunk แรกของทั้งเทิร์น (มี 5 ก้อนก่อนหน้าจากข้อความหลักแล้ว) ไม่ควรเรียก onFirstAudioSent ซ้ำ')
+})
+
+// ---------------------------------------------------------------------------
+// L1b — createChunkedProducer / adoptChunkedProducer (primitives ที่ runChunkedTurn ถูก decompose ออกมา)
+// ---------------------------------------------------------------------------
+
+test('L1b) createChunkedProducer: emitControl buffer end_call เข้า controlEvent แต่ไม่ forward เอง (quarantine ก่อนมี attachForwarder)', async () => {
+  state.claudeImpl = async function* (session, signal, onControl) { onControl?.({ type: 'end_call' }) }
+  const producer = createChunkedProducer({ session: {}, signal: null })
+  await producer.done
+  assert.deepEqual(producer.controlEvent, { type: 'end_call' })
+})
+
+test('L1b) attachForwarder: replay controlEvent ที่ buffer ไว้ก่อนหน้าทันทีตอน attach ถ้ายัง valid', async () => {
+  state.claudeImpl = async function* (session, signal, onControl) { onControl?.({ type: 'end_call' }) }
+  const producer = createChunkedProducer({ session: {}, signal: null })
+  await producer.done
+  const forwarded = []
+  producer.attachForwarder(ev => forwarded.push(ev))
+  assert.deepEqual(forwarded, [{ type: 'end_call' }])
+})
+
+test('L1b) attachForwarder: ห้าม replay ถ้า getIsValid() เป็น false ตอน attach แม้ controlEvent จะถูก buffer ไว้ตอนยัง valid ก็ตาม (control-buffered-while-valid-then-stale-before-adopt)', async () => {
+  let valid = true
+  state.claudeImpl = async function* (session, signal, onControl) { onControl?.({ type: 'end_call' }) } // ยิงตอน valid=true
+  const producer = createChunkedProducer({ session: {}, signal: null, getIsValid: () => valid })
+  await producer.done
+  assert.deepEqual(producer.controlEvent, { type: 'end_call' }, 'ยังต้อง buffer ไว้เหมือนเดิม ไม่แตะ controlEvent เอง')
+  valid = false // generation กลายเป็น stale ก่อน adoption
+  const forwarded = []
+  producer.attachForwarder(ev => forwarded.push(ev))
+  assert.deepEqual(forwarded, [], 'ต้องไม่ replay end_call ที่ stale ออกไปเด็ดขาด')
+})
+
+test('L1b) attachForwarder: ห้าม attach เลยด้วยซ้ำถ้า signal.aborted ตอนเรียก (controlForwarder ต้องยังเป็น null)', async () => {
+  const controller = new AbortController()
+  controller.abort()
+  state.claudeImpl = async function* () {}
+  const producer = createChunkedProducer({ session: {}, signal: controller.signal })
+  await producer.done
+  let called = 0
+  producer.attachForwarder(() => { called++ })
+  // ยิง emitControl ไม่ได้อยู่แล้ว (guard ที่ emitControl เอง) แต่ยืนยันผ่าน controlEvent ว่าไม่มีอะไรถูก forward
+  assert.equal(called, 0)
+})
+
+test('L1b) emitControl: ถูก guard ด้วย signal.aborted — end_call ที่มาหลัง abort ไม่ถูก buffer เลย (late control after abort)', async () => {
+  const controller = new AbortController()
+  state.claudeImpl = async function* (session, signal, onControl) {
+    controller.abort()
+    onControl?.({ type: 'end_call' }) // จำลอง late event ที่มาหลัง abort ไปแล้วเศษเสี้ยววินาที
+  }
+  const producer = createChunkedProducer({ session: {}, signal: controller.signal })
+  await producer.done
+  assert.equal(producer.controlEvent, null)
+})
+
+test('L1b) emitControl: ถูก guard ด้วย getIsValid() ด้วย (ไม่ใช่แค่ signal) — generation stale ระหว่างทางก็บล็อกเหมือนกัน', async () => {
+  let valid = true
+  state.claudeImpl = async function* (session, signal, onControl) {
+    valid = false
+    onControl?.({ type: 'end_call' })
+  }
+  const producer = createChunkedProducer({ session: {}, signal: null, getIsValid: () => valid })
+  await producer.done
+  assert.equal(producer.controlEvent, null)
+})
+
+test('L1b) onFirstDelta/onFirstChunk: replay ทันทีถ้าเหตุการณ์เกิดไปแล้วก่อน subscribe (ใช้ตอน adopt speculation ที่มี progress อยู่แล้ว)', async () => {
+  state.claudeImpl = fakeClaude(['Hello world. '])
+  const producer = createChunkedProducer({ session: {}, signal: null })
+  await producer.done
+  let deltaCalls = 0, chunkCalls = 0
+  producer.onFirstDelta(() => { deltaCalls++ })
+  producer.onFirstChunk(() => { chunkCalls++ })
+  assert.equal(deltaCalls, 1)
+  assert.equal(chunkCalls, 1)
+})
+
+test('L1b) waitForFirstProgress: resolve ทันทีถ้าไม่มี delta เลยแต่ producer จบแล้ว (empty response case)', async () => {
+  state.claudeImpl = async function* () {} // จบทันทีไม่มี delta เลย
+  const producer = createChunkedProducer({ session: {}, signal: null })
+  await producer.done
+  let resolved = false
+  producer.waitForFirstProgress().then(() => { resolved = true })
+  await Promise.resolve()
+  assert.equal(resolved, true, 'producerDone=true ต้องทำให้ waitForFirstProgress resolve ได้แม้ไม่เคยมี delta เลย')
+})
+
+test('L1b) waitForFirstProgress: ไม่ resolve จนกว่าจะมี delta แรกจริง (ไม่ใช่ chunk) — ตื่นเร็วกว่า waitForWork() เสมอ', async () => {
+  let releaseDelta
+  const gate = new Promise(resolve => { releaseDelta = resolve })
+  state.claudeImpl = async function* () {
+    await gate
+    yield 'delta arrived but no chunk boundary yet'
+  }
+  const producer = createChunkedProducer({ session: {}, signal: null })
+  let progressResolved = false
+  producer.waitForFirstProgress().then(() => { progressResolved = true })
+  await new Promise(r => setTimeout(r, 10))
+  assert.equal(progressResolved, false, 'ยังไม่มี delta เลย ต้องไม่ resolve')
+  releaseDelta()
+  await new Promise(r => setTimeout(r, 10))
+  assert.equal(progressResolved, true, 'delta แรกมาแล้วต้อง resolve ทันที แม้จะยังไม่มี chunk boundary ก็ตาม')
+})
+
+test('L1b) adoptChunkedProducer: attach ให้ producer ที่ buffer chunk ไว้แล้วก่อน adopt → consumer drain queue เดิมได้ปกติ (BUFFERED_HIT/READY_HIT scenario)', async () => {
+  state.claudeImpl = fakeClaude(['Ready before adopt. '])
+  const producer = createChunkedProducer({ session: {}, signal: null })
+  await producer.done // producer จบไปแล้วทั้งก้อนก่อน adopt เลย (READY_HIT)
+  const ttsCalls = []
+  state.ttsImpl = async function* (text) { ttsCalls.push(text); yield Buffer.from('a') }
+  const socket = makeSocket()
+  const { turnMetrics, turnState, callState, generationId } = makeMetricsAndState()
+  const result = await adoptChunkedProducer({ producer, signal: null, socket, streamSid: 'SS1', voiceId: 'v1', turnMetrics, turnState, callState, generationId })
+  assert.deepEqual(ttsCalls, ['Ready before adopt.'])
+  assert.equal(result.totalSent, 1)
 })
 
 test('stale callback ต้องไม่มีสิทธิ์แตะ metrics/state ของ generation อื่นเลย แม้จะเป็นแค่การ mark ไม่ใช่ side effect ที่มองเห็นได้จากภายนอก', async () => {

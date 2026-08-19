@@ -17,6 +17,17 @@ function attachChildAbort(signal) {
   return { child, detach: () => signal.removeEventListener('abort', propagate) }
 }
 
+// L1b — one-directional bridge: เมื่อ sourceSignal aborts (ตอนนี้หรือในอนาคต) ให้ targetController.abort() ตาม
+// เช่น "watchdog attempt's childSignal aborts → speculative Claude producer's own AbortController aborts ด้วย"
+// ต้องเช็ค sourceSignal.aborted ก่อนเสมอ ไม่ใช่ addEventListener เพียวๆ — เพราะ runAttemptWithWatchdog อาจสร้าง
+// child แล้ว abort() มันทันทีตั้งแต่ก่อน run() ถูกเรียกด้วยซ้ำ (ถ้า outer signal abort ไปแล้วตั้งแต่ก่อนเริ่ม race)
+// ถ้า attach listener หลัง event เกิดไปแล้ว listener จะไม่ถูกเรียกเลย (พลาด edge case จริงที่เจอจาก design review)
+function bridgeAbort(sourceSignal, targetController) {
+  const abortTarget = () => { if (!targetController.signal.aborted) targetController.abort() }
+  if (sourceSignal.aborted) abortTarget()
+  else sourceSignal.addEventListener('abort', abortTarget, { once: true })
+}
+
 // run(childSignal, arm) — the caller's attempt. `arm(ms, reason)` (re)arms the watchdog with a new
 // window and reason, cancelling whatever window was running before — this lets a caller chain
 // sequential milestone timeouts over a single attempt (e.g. "Claude first delta" window handing off
@@ -87,4 +98,4 @@ async function runAttemptWithWatchdog({ signal, timeoutMs, reason, run }) {
   }
 }
 
-module.exports = { runAttemptWithWatchdog }
+module.exports = { runAttemptWithWatchdog, bridgeAbort }

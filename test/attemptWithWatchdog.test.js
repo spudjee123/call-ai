@@ -1,6 +1,6 @@
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
-const { runAttemptWithWatchdog } = require('../src/utils/attemptWithWatchdog')
+const { runAttemptWithWatchdog, bridgeAbort } = require('../src/utils/attemptWithWatchdog')
 
 function delay(ms) { return new Promise(resolve => setTimeout(resolve, ms)) }
 
@@ -251,4 +251,50 @@ test('claimFallback-style caller: หลัง timeout ต้อง detach liste
     run: async () => { await delay(50); return 'x' },
   })
   assert.doesNotThrow(() => outer.abort())
+})
+
+// ---------------------------------------------------------------------------
+// L1b — bridgeAbort: one-directional abort bridge ระหว่าง watchdog attempt's childSignal และ speculative
+// producer's AbortController (ดู chunkedTurn.js/audioStream.js) — สอง test แรกคือ blocker ที่ design review
+// รอบ 4 จับได้จริง: race ที่ childSignal อาจถูก abort ไปแล้วก่อน bridgeAbort() ถูกเรียกด้วยซ้ำ
+// ---------------------------------------------------------------------------
+
+test('bridgeAbort: sourceSignal ยังไม่ abort ตอนเรียก → abort ทีหลังจริง target ก็ต้อง abort ตาม', () => {
+  const source = new AbortController()
+  const target = new AbortController()
+  bridgeAbort(source.signal, target)
+  assert.equal(target.signal.aborted, false)
+  source.abort()
+  assert.equal(target.signal.aborted, true)
+})
+
+test('bridgeAbort: sourceSignal abort ไปแล้วตั้งแต่ก่อนเรียก bridgeAbort() เลย → target ต้อง abort ทันที (child-already-aborted-before-bridge)', () => {
+  const source = new AbortController()
+  source.abort() // จำลอง runAttemptWithWatchdog สร้าง+abort child ไปแล้วก่อน run()/bridge จะทันเรียก
+  const target = new AbortController()
+  bridgeAbort(source.signal, target)
+  assert.equal(target.signal.aborted, true, 'ถ้า attach listener หลัง event เกิดไปแล้ว listener จะไม่ถูกเรียกเลย — ต้องเช็ค .aborted ก่อนเสมอ')
+})
+
+test('bridgeAbort: target abort ไปแล้วก่อนหน้า (เช่นจาก path อื่น) → ไม่ throw ซ้ำตอน source abort ตามมาทีหลัง', () => {
+  const source = new AbortController()
+  const target = new AbortController()
+  target.abort()
+  assert.doesNotThrow(() => { bridgeAbort(source.signal, target); source.abort() })
+})
+
+test('bridgeAbort: ใช้ผูก runAttemptWithWatchdog\'s childSignal เข้ากับ target controller จริง — watchdog timeout ต้อง abort target ด้วย', async () => {
+  const target = new AbortController()
+  const outcome = await runAttemptWithWatchdog({
+    signal: new AbortController().signal,
+    timeoutMs: 15,
+    reason: 'TEST_TIMEOUT',
+    run: async (childSignal) => {
+      bridgeAbort(childSignal, target)
+      await delay(100) // ช้ากว่า watchdog แน่นอน
+      return 'too late'
+    },
+  })
+  assert.equal(outcome.outcome, 'timeout')
+  assert.equal(target.signal.aborted, true, 'watchdog timeout ต้อง abort target ผ่าน bridge ด้วย ไม่ใช่แค่ childSignal เอง')
 })

@@ -1074,3 +1074,427 @@ test('35) Commit A2: barge-in ระหว่างพูด recovery phrase เ
 
   harness.disconnect(socket)
 })
+
+// ===== L1b — chunked speculative prewarm (design locked 2026-08-19, 4 review rounds) =====
+// รวม 3 corrections สุดท้ายจากรอบ implementation-authorize เข้าไปในทุกเทสที่เกี่ยวข้องอยู่แล้ว:
+//   #1 bridgeAbort ผูกกับ childSignal ของแต่ละ watchdog attempt (ไม่ใช่ outer signal เฉยๆ)
+//   #2 producer's getIsValid() upgrade เป็น generation guard จริงหลัง adopt (ไม่ใช่แค่ AbortSignal)
+//   #3 prewarmAgeAtFinalMs snapshot ก่อน grace ใดๆ (ดู test 51)
+test('36) L1b: BUFFERED_HIT — safe chunk พร้อมอยู่แล้วก่อน final (producer ยังสตรีมต่อ) → adopt ทันที Claude ถูกเรียกครั้งเดียว', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 100 })
+
+  let callCount = 0
+  let releaseRest
+  const restGate = new Promise(resolve => { releaseRest = resolve })
+  state.claudeStreamChunkedImpl = async function* () {
+    callCount++
+    yield 'พร้อมพูดได้เลยค่ะ. ' // ตัด boundary ทันที (strong '.') → enqueue จริงก่อน final
+    await restGate // producer ยังไม่จบตอน final มาถึง
+  }
+
+  harness.sendInterim('ขอสอบถามโปรโมชั่นหน่อยค่ะ')
+  await delay(30)
+  const turnPromise = harness.sendFinalTranscript('ขอสอบถามโปรโมชั่นหน่อยค่ะ')
+  await delay(20)
+  releaseRest()
+  await turnPromise
+
+  assert.equal(callCount, 1, 'ต้องเรียก askClaudeStreamChunked แค่ครั้งเดียว (speculation ถูก adopt ไม่ใช่ fresh call ซ้ำ)')
+  const mediaEvents = socket.sent.filter(e => e.event === 'media')
+  assert.ok(mediaEvents.length > 0)
+  harness.disconnect(socket)
+})
+
+test('37) L1b: READY_HIT — speculation จบเต็มก้อนก่อน final มาถึงเลย → adopt, TTS เริ่มจาก buffered chunk ทันที', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 100 })
+
+  let callCount = 0
+  state.claudeStreamChunkedImpl = async function* () {
+    callCount++
+    yield 'พร้อมพูดได้เลยค่ะ.'
+  }
+
+  harness.sendInterim('ขอสอบถามโปรโมชั่นหน่อยค่ะ')
+  await delay(30) // ให้ speculation จบสมบูรณ์ (producerDone=true) ก่อน final
+  await harness.sendFinalTranscript('ขอสอบถามโปรโมชั่นหน่อยค่ะ')
+
+  assert.equal(callCount, 1)
+  const mediaEvents = socket.sent.filter(e => e.event === 'media')
+  assert.ok(mediaEvents.length > 0)
+  harness.disconnect(socket)
+})
+
+test('38) L1b: DELTA_ONLY_HIT — มี delta แต่ยังไม่มี chunk ตอน final มาถึง → adopt ทันที ไม่รอ pre-adopt wait ยาวก่อน (design correction #2)', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 100 })
+
+  let callCount = 0
+  let releaseChunk
+  const chunkGate = new Promise(resolve => { releaseChunk = resolve })
+  state.claudeStreamChunkedImpl = async function* () {
+    callCount++
+    yield 'เอ่อ เดี๋ยวก่อนนะ' // delta มา ไม่มี boundary ให้ตัดเลย (< SOFT_TIMEOUT_MS 300ms, < FALLBACK_MIN_LENGTH 25)
+    await chunkGate
+    yield ' พร้อมแล้วค่ะ.'
+  }
+
+  harness.sendInterim('ขอสอบถามโปรโมชั่นหน่อยค่ะ')
+  await delay(30) // delta แรกมาแล้วจริง แต่ยังไม่มี chunk
+  const turnPromise = harness.sendFinalTranscript('ขอสอบถามโปรโมชั่นหน่อยค่ะ')
+  await delay(20) // ให้ adoption commit เกิดขึ้นจริง (ควรเกิดทันที ไม่รอ 2000ms แบบดีไซน์เก่าที่ถูก reject)
+
+  const startedWaiting = Date.now()
+  releaseChunk() // ปล่อยให้ chunk พร้อมหลัง adopt แล้ว — Watchdog B ตัวจริงของเทิร์นเป็นคนคุมต่อ ไม่ใช่ pre-adopt wait
+  await turnPromise
+  const elapsed = Date.now() - startedWaiting
+  assert.ok(elapsed < 500, `ต้อง adopt ทันทีแล้วรอ Watchdog B จริงแทน ไม่ใช่ pre-adopt wait ยาว — ใช้เวลาอีก ${elapsed}ms หลัง release`)
+
+  assert.equal(callCount, 1)
+  const mediaEvents = socket.sent.filter(e => e.event === 'media')
+  assert.ok(mediaEvents.length > 0)
+  harness.disconnect(socket)
+})
+
+test('39) L1b: DELTA_ONLY_HIT adopted แต่ chunk ไม่มาเลยเกิน CHUNK_READY_TIMEOUT_MS → fallback ไป legacy จริง (Watchdog B ตัวจริงของเทิร์นยังทำงาน ไม่หายไปหลัง adopt)', { timeout: 15000 }, async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 100 })
+
+  state.claudeStreamChunkedImpl = async function* () {
+    yield 'เอ่อ เดี๋ยวก่อนนะ' // delta มา ไม่มี boundary เลย แล้วค้างตลอดไป (ไม่เคยมี chunk)
+    await new Promise(() => {})
+  }
+  state.claudeStreamImpl = async function* () { yield 'คำตอบจาก legacy fallback' }
+
+  harness.sendInterim('ขอสอบถามโปรโมชั่นหน่อยค่ะ')
+  await delay(30)
+  await harness.sendFinalTranscript('ขอสอบถามโปรโมชั่นหน่อยค่ะ')
+
+  const lastAssistant = session.messages.filter(m => m.role === 'assistant').at(-1)
+  assert.equal(lastAssistant.content, 'คำตอบจาก legacy fallback')
+  harness.disconnect(socket)
+})
+
+test('40) L1b: zero-progress grace ตื่นทันทีที่ delta แรกมาถึง ไม่ใช่รอครบ 150ms เต็ม (Correction #1, design รอบ 4)', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 100 })
+
+  let callCount = 0
+  state.claudeStreamChunkedImpl = async function* () {
+    callCount++
+    await delay(50) // ช้ากว่า final แต่เร็วกว่า grace เต็ม (150ms) มาก
+    yield 'มาแล้วค่ะ พร้อมตอบ.'
+  }
+
+  harness.sendInterim('ขอสอบถามโปรโมชั่นหน่อยค่ะ')
+  const startedAt = Date.now()
+  await harness.sendFinalTranscript('ขอสอบถามโปรโมชั่นหน่อยค่ะ') // final มาทันทีก่อน speculation มี progress เลย
+  const elapsed = Date.now() - startedAt
+
+  assert.equal(callCount, 1, 'ต้องเรียกแค่ครั้งเดียว (speculation ถูก adopt หลัง grace ตื่นจาก delta แรก)')
+  assert.ok(elapsed < 120, `grace ต้องตื่นทันทีที่ delta มา (~50ms) ไม่ใช่รอครบ 150ms เต็ม — ใช้เวลาไป ${elapsed}ms`)
+  harness.disconnect(socket)
+})
+
+test('41) L1b: zero-progress grace timeout (150ms) เต็ม ไม่มี delta มาเลย → DROP speculation + fresh chunked เกิดขึ้นพอดี 1 ครั้ง (รวม speculative เป็น 2 ครั้ง)', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 100 })
+
+  let callCount = 0
+  let firstSignal = null
+  state.claudeStreamChunkedImpl = async function* (s, signal) {
+    callCount++
+    if (callCount === 1) {
+      firstSignal = signal
+      await new Promise(() => {}) // ค้างตลอดไป ไม่เคย yield delta เลย
+    } else {
+      yield 'คำตอบจาก fresh chunked call'
+    }
+  }
+
+  harness.sendInterim('ขอสอบถามโปรโมชั่นหน่อยค่ะ')
+  await delay(10)
+  await harness.sendFinalTranscript('ขอสอบถามโปรโมชั่นหน่อยค่ะ')
+
+  assert.equal(callCount, 2, 'ต้องมี fresh chunked call เกิดขึ้นจริงอีกครั้งหลัง grace timeout')
+  assert.equal(firstSignal.aborted, true, 'speculative producer เดิมต้องถูก abort จริงที่ signal level ไม่ใช่แค่ทิ้ง reference เฉยๆ')
+  const lastAssistant = session.messages.filter(m => m.role === 'assistant').at(-1)
+  assert.equal(lastAssistant.content, 'คำตอบจาก fresh chunked call')
+  harness.disconnect(socket)
+})
+
+test('42) L1b: MISMATCH_FRESH — interim ไม่ตรงกับ final เลย → ไม่มี grace wait เลย ไปเรียก fresh chunked ทันที', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 100 })
+
+  let callCount = 0
+  state.claudeStreamChunkedImpl = async function* () {
+    callCount++
+    if (callCount === 1) { await new Promise(() => {}) } // speculation ค้างตลอดไป (ไม่ควรถูกใช้เลย)
+    else yield 'คำตอบจาก fresh chunked'
+  }
+
+  harness.sendInterim('สวัสดีครับ')
+  await delay(10)
+  const startedAt = Date.now()
+  await harness.sendFinalTranscript('ไม่มีอะไรตรงกับ interim เลยครับ')
+  assert.ok(Date.now() - startedAt < 100, 'ไม่ควรมี grace wait เลยเพราะ mismatch ตั้งแต่ต้น')
+
+  assert.equal(callCount, 2)
+  const lastAssistant = session.messages.filter(m => m.role === 'assistant').at(-1)
+  assert.equal(lastAssistant.content, 'คำตอบจาก fresh chunked')
+  harness.disconnect(socket)
+})
+
+test('43) L1b: EMPTY_FRESH — speculation จบแบบว่างเปล่า (ไม่มี delta ไม่มี control เลย) → DROP fresh chunked เกิดขึ้น 1 ครั้ง', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 100 })
+
+  let callCount = 0
+  state.claudeStreamChunkedImpl = async function* () {
+    callCount++
+    if (callCount === 1) return // จบทันทีไม่ yield อะไรเลย ไม่เรียก end_call ด้วย
+    yield 'คำตอบจาก fresh chunked หลัง speculation ว่างเปล่า'
+  }
+
+  harness.sendInterim('ขอสอบถามโปรโมชั่นหน่อยค่ะ')
+  await delay(20) // ให้ speculation จบไปแล้วจริง (producerDone=true) ก่อน final
+  await harness.sendFinalTranscript('ขอสอบถามโปรโมชั่นหน่อยค่ะ')
+
+  assert.equal(callCount, 2, 'response ว่างเปล่าต้องถือเป็น DROP ไปเรียก fresh call ต่อ')
+  const lastAssistant = session.messages.filter(m => m.role === 'assistant').at(-1)
+  assert.equal(lastAssistant.content, 'คำตอบจาก fresh chunked หลัง speculation ว่างเปล่า')
+  harness.disconnect(socket)
+})
+
+test('44) L1b: ERROR_FRESH — speculative Claude error กลางทาง (มี partial chunk buffer อยู่ก่อน error) → DROP ทั้งก้อนรวม partial ด้วย ไม่ splice กับ fresh', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 100 })
+
+  let callCount = 0
+  const ttsCalls = []
+  state.ttsImpl = async function* (text) { ttsCalls.push(text); yield Buffer.from('audio') }
+  state.claudeStreamChunkedImpl = async function* () {
+    callCount++
+    if (callCount === 1) {
+      yield 'ข้อความ speculative ที่ไม่ควรถูกพูดเลย.' // ได้ chunk มาก่อน error
+      throw new Error('Claude boom mid-speculation')
+    }
+    yield 'คำตอบจาก fresh chunked หลัง error'
+  }
+
+  harness.sendInterim('ขอสอบถามโปรโมชั่นหน่อยค่ะ')
+  await delay(20) // ให้ error เกิดขึ้นจริงก่อน final (producerError ถูก set)
+  await harness.sendFinalTranscript('ขอสอบถามโปรโมชั่นหน่อยค่ะ')
+
+  assert.equal(callCount, 2, 'ERROR ต้อง DROP ทั้งหมด ไปเรียก fresh call ใหม่')
+  assert.ok(!ttsCalls.some(t => t.includes('speculative')), 'partial speculative text ที่ error ต้องไม่ถูกส่งเข้า TTS เลย')
+  const lastAssistant = session.messages.filter(m => m.role === 'assistant').at(-1)
+  assert.equal(lastAssistant.content, 'คำตอบจาก fresh chunked หลัง error')
+  harness.disconnect(socket)
+})
+
+test('45) L1b: CONTROL_ONLY_HIT — speculative response เป็น end_call ล้วนๆ ไม่มี text เลย → adopt, endCallRequested=true, ไม่มี TTS เลย', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 100 })
+
+  let callCount = 0
+  const ttsCalls = []
+  state.ttsImpl = async function* (text) { ttsCalls.push(text); yield Buffer.from('audio') }
+  state.claudeStreamChunkedImpl = async function* (s, signal, onControl) {
+    callCount++
+    onControl?.({ type: 'end_call' })
+  }
+
+  harness.sendInterim('ไม่สะดวกคุยแล้วครับ วางสายเลย')
+  await delay(20) // ให้ speculation จบแล้ว (producerDone=true, controlEvent buffered) ก่อน final
+  await harness.sendFinalTranscript('ไม่สะดวกคุยแล้วครับ วางสายเลย')
+
+  assert.equal(callCount, 1, 'ต้องเรียกแค่ครั้งเดียว (adopt control-only response)')
+  assert.deepEqual(ttsCalls, [], 'ไม่มี text ให้พูดเลย ไม่ควรมี TTS call ใดๆ')
+  assert.equal(session.hangupReason, 'ai_ended', 'end_call ที่ adopt มาต้องถูก policy เดิม (hangup) ปฏิบัติเหมือน fresh chunked end_call ทุกประการ')
+  harness.disconnect(socket)
+})
+
+test('46) L1b: disconnect ระหว่าง speculation ยังไม่ถูก adopt (ก่อน final มาถึง) → producer ถูก abort จริง ไม่ throw/ค้าง', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 100 })
+
+  let specSignal = null
+  state.claudeStreamChunkedImpl = async function* (s, signal) {
+    specSignal = signal
+    await new Promise(() => {})
+  }
+
+  harness.sendInterim('ขอสอบถามโปรโมชั่นหน่อยค่ะ')
+  await delay(20)
+  assert.ok(specSignal && !specSignal.aborted)
+
+  assert.doesNotThrow(() => harness.disconnect(socket))
+  await delay(10)
+  assert.equal(specSignal.aborted, true, 'speculation ต้องถูก abort จริงตอนสายจบ')
+})
+
+test('47) L1b: barge-in หลัง adoption ต้อง abort speculative Claude producer ด้วย ไม่ใช่แค่หยุด TTS (Correction #1 — bridge ผ่าน childSignal ไม่ใช่ outer signal)', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 100 })
+
+  let specSignal = null
+  state.claudeStreamChunkedImpl = async function* (s, signal) {
+    specSignal = signal
+    yield 'เอ่อ เดี๋ยวก่อนนะ' // DELTA_ONLY_HIT — adopt ทันทีตอน final โดยไม่ต้องรอ chunk
+    await new Promise(() => {}) // ยังไม่จบ ยัง "มีชีวิต" อยู่ตอน adopt แล้วก็ตอน barge-in
+  }
+
+  harness.sendInterim('ขอสอบถามโปรโมชั่นหน่อยค่ะ')
+  await delay(30)
+  harness.sendFinalTranscript('ขอสอบถามโปรโมชั่นหน่อยค่ะ') // ไม่ await — isSpeaking=true ตั้งแต่ต้นเทิร์นแล้ว แม้ยังไม่มี chunk ให้พูดจริงก็ตาม
+  await delay(50) // ให้ adopt เกิดจริง (DELTA_ONLY_HIT ไม่ต้องรอ)
+
+  assert.ok(specSignal, 'speculation ต้องเริ่มจริง')
+  assert.equal(specSignal.aborted, false, 'ยังไม่ถูก abort ก่อน barge-in')
+
+  harness.sendInterim('เดี๋ยวก่อนครับขอถามเรื่องอื่น') // barge-in ระหว่าง speculation ที่ adopt แล้วยังมีชีวิตอยู่
+
+  await delay(20)
+  assert.equal(specSignal.aborted, true, 'speculative Claude producer ต้องถูก abort จริงผ่าน bridge หลัง barge-in ไม่ใช่แค่หยุดส่งเสียงเฉยๆ')
+
+  harness.disconnect(socket)
+})
+
+test('48) L1b: interim ใหม่ที่ยาวขึ้นมากพอหลังผ่าน throttle cooldown (retrigger) → speculation เก่าถูก abort สะอาด ตัวใหม่เป็นตัวที่ adopt', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 100 })
+
+  let callCount = 0
+  let firstSignal = null
+  state.claudeStreamChunkedImpl = async function* (s, signal) {
+    callCount++
+    if (callCount === 1) {
+      firstSignal = signal
+      await new Promise((resolve) => { signal.addEventListener('abort', () => resolve(), { once: true }) })
+      return
+    }
+    yield 'คำตอบจาก speculation ที่สอง'
+  }
+
+  harness.sendInterim('ขอสอบถาม')
+  await delay(20)
+  await delay(700) // ผ่าน throttle cooldown (700ms) ก่อน retrigger ได้จริง
+  harness.sendInterim('ขอสอบถามโปรโมชั่นสมาชิกใหม่ตอนนี้เลยค่ะ')
+  await delay(20)
+
+  assert.equal(firstSignal.aborted, true, 'speculation แรกต้องถูก abort ตอน retrigger')
+
+  await harness.sendFinalTranscript('ขอสอบถามโปรโมชั่นสมาชิกใหม่ตอนนี้เลยค่ะ')
+
+  assert.equal(callCount, 2, 'ต้องมี speculation ตัวที่สองเริ่มจริงหลัง retrigger')
+  const lastAssistant = session.messages.filter(m => m.role === 'assistant').at(-1)
+  assert.equal(lastAssistant.content, 'คำตอบจาก speculation ที่สอง')
+  harness.disconnect(socket)
+})
+
+test('49) L1b: interim ใหม่ที่มาเร็วเกินไป (ยังไม่ผ่าน throttle cooldown) → ไม่ retrigger speculation เดิมยังทำงานต่อ', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 100 })
+
+  let callCount = 0
+  state.claudeStreamChunkedImpl = async function* () {
+    callCount++
+    yield 'คำตอบจาก speculation แรก.'
+  }
+
+  harness.sendInterim('ขอสอบถาม')
+  await delay(20)
+  harness.sendInterim('ขอสอบถามโปรโมชั่นสมาชิกใหม่ตอนนี้เลยค่ะ') // ยาวขึ้นมากพอ แต่มาเร็วเกินไป (ยังไม่ผ่าน throttle 700ms)
+  await delay(20)
+
+  assert.equal(callCount, 1, 'ต้องไม่ retrigger เพราะยังอยู่ในช่วง throttle cooldown')
+  harness.disconnect(socket)
+})
+
+test('50) L1b: barge-in ระหว่าง zero-progress grace wait → ABORTED ไม่พยายามเริ่ม fresh chunked เลย (Correction #4a)', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 100 })
+
+  let callCount = 0
+  state.claudeStreamChunkedImpl = async function* (s, signal) {
+    callCount++
+    if (callCount === 1) {
+      await new Promise((resolve) => { signal.addEventListener('abort', () => resolve(), { once: true }) })
+      return
+    }
+    yield 'ตอบเรื่องที่พูดแทรก'
+  }
+
+  harness.sendInterim('ขอสอบถามโปรโมชั่นหน่อยค่ะ')
+  await delay(10)
+  const turnPromise = harness.sendFinalTranscript('ขอสอบถามโปรโมชั่นหน่อยค่ะ') // ยังไม่มี progress เลย เข้า zero-progress grace (150ms)
+
+  await delay(50) // อยู่ในช่วง grace wait แน่นอน (< 150ms)
+  harness.sendInterim('เดี๋ยวก่อนครับขอถามเรื่องอื่นก่อน') // trigger bargeIn() เพราะ isSpeaking=true อยู่แล้วตั้งแต่ต้นเทิร์น
+
+  const clearEvents = socket.sent.filter(e => e.event === 'clear')
+  assert.ok(clearEvents.length > 0, 'barge-in ต้อง trigger ทันทีแม้เทิร์นเดิมกำลังรอ zero-progress grace อยู่')
+
+  await harness.sendFinalTranscript('เดี๋ยวก่อนครับขอถามเรื่องอื่นก่อน') // final ของ interrupt — ถูก queue ไว้ (sttProcessing ยัง true)
+
+  await turnPromise
+
+  assert.equal(callCount, 2, 'callCount=1 คือ speculation เดิมที่ถูก abort (ไม่นับเป็น fresh call) callCount=2 คือเทิร์นใหม่หลัง barge-in เท่านั้น — ต้องไม่มี fresh chunked call แทรกระหว่างนั้น')
+  const lastAssistant = session.messages.filter(m => m.role === 'assistant').at(-1)
+  assert.equal(lastAssistant.content, 'ตอบเรื่องที่พูดแทรก')
+  harness.disconnect(socket)
+})
+
+test('51) L1b: prewarmAgeAtFinalMs ต้อง snapshot ก่อน grace ไม่ใช่หลัง grace (Correction #3), prewarmOutcome=GRACE_HIT ถูกบันทึกถูกต้อง, canonical t3 ถูก mark หลัง adopt', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 100 })
+
+  state.claudeStreamChunkedImpl = async function* () {
+    await delay(60) // ยังไม่มี progress ตอน final มาถึง ต้องรอ grace ก่อน
+    yield 'มาแล้วค่ะ พร้อมตอบ.'
+  }
+
+  harness.sendInterim('ขอสอบถามโปรโมชั่นหน่อยค่ะ')
+  await delay(30) // speculation อายุ ~30ms ตอน final มาถึง (ยังไม่มี delta เลย)
+  const metrics = await captureMetrics(() => harness.sendFinalTranscript('ขอสอบถามโปรโมชั่นหน่อยค่ะ'))
+
+  assert.equal(metrics.prewarmOutcome, 'GRACE_HIT')
+  assert.ok(metrics.prewarmAgeAtFinalMs >= 15 && metrics.prewarmAgeAtFinalMs < 100, `prewarmAgeAtFinalMs ควร ~30ms (วัดตอน final มาถึงจริง ไม่ใช่บวก grace เข้าไปด้วย) ได้ ${metrics.prewarmAgeAtFinalMs}`)
+  assert.equal(typeof metrics.t3, 'number', 'canonical t3 ต้องถูก mark หลัง adopt สำเร็จ')
+  harness.disconnect(socket)
+})
+
+test('52) L1b: MISMATCH_FRESH ยังต้อง record prewarm telemetry เต็มชุดก่อน abort (ไม่ทิ้งแค่ prewarmOutcome เฉยๆ — blocker จาก commit-gate review)', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 100 })
+
+  let callCount = 0
+  state.claudeStreamChunkedImpl = async function* (s, signal) {
+    callCount++
+    if (callCount === 1) {
+      yield 'พร้อมพูดได้เลยค่ะ. ' // ได้ delta+chunk จริงก่อนที่ mismatch จะถูกตรวจพบตอน final
+      // ค้างจนกว่าจะถูก abort จริงตอน mismatch (ไม่ใช่ค้างตลอดไปแบบไม่มีเงื่อนไข — ไม่งั้นถ้า mock ตัวนี้ถูกเรียก
+      // ซ้ำเป็น fresh call รอบสองหลัง mismatch มันจะค้างตลอดไปจนโดน MAX_CALL_DURATION_MS (300s) เหมือนบั๊กที่เจอจริง
+      // ระหว่างรัน full suite รอบนี้ — เทสก่อนหน้าเคยพลาดจุดนี้เพราะ mock ไม่แยก call แรก/ที่สอง)
+      await new Promise((resolve) => { signal.addEventListener('abort', () => resolve(), { once: true }) })
+      return
+    }
+    yield 'คำตอบจาก fresh chunked หลัง mismatch.'
+  }
+
+  harness.sendInterim('ขอสอบถามโปรโมชั่นหน่อยค่ะ')
+  await delay(30) // ให้ chunk ถูก enqueue จริงก่อน final (มี speculative work ที่ "เสียไป" จริง ไม่ใช่ handle เปล่า)
+  const metrics = await captureMetrics(() => harness.sendFinalTranscript('ไม่มีอะไรตรงกับ interim เลยครับ'))
+
+  assert.equal(callCount, 2, 'ต้องมี fresh chunked call เกิดขึ้นจริงหลัง mismatch (ไม่ใช่ speculation ตัวเดียวที่ค้าง)')
+  assert.equal(metrics.prewarmOutcome, 'MISMATCH_FRESH')
+  assert.ok(metrics.prewarmStartedAt != null, 'prewarmStartedAt ต้องถูก record แม้ mismatch ไม่ใช่ปล่อย null')
+  assert.ok(metrics.prewarmAgeAtFinalMs >= 0, 'prewarmAgeAtFinalMs ต้องมีค่าจริง')
+  assert.equal(metrics.prewarmBufferedChunks, 1, 'ต้องสะท้อนจำนวน chunk ที่ speculation เสียไปจริงตอน miss')
+  assert.equal(typeof metrics.prewarmFirstDeltaMs, 'number', 'delta เกิดขึ้นจริงก่อน mismatch ต้องถูกบันทึกด้วย ไม่ใช่ null')
+  assert.equal(typeof metrics.prewarmFirstChunkMs, 'number', 'chunk เกิดขึ้นจริงก่อน mismatch ต้องถูกบันทึกด้วย ไม่ใช่ null')
+  harness.disconnect(socket)
+})

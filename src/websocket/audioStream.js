@@ -7,8 +7,9 @@ const { createCallState, bumpGeneration, isCurrentGeneration, endCall } = requir
 const { decideRollout } = require('../utils/rolloutBucket')
 const { createTurnMetrics, markOnce, computeDerivedMetrics } = require('../utils/turnMetrics')
 const { createTurnState, markTtsPending, markAudioCommitted, markDone, claimFallback } = require('../utils/turnState')
-const { runChunkedTurn, speakFixedText } = require('./chunkedTurn')
-const { runAttemptWithWatchdog } = require('../utils/attemptWithWatchdog')
+const { runChunkedTurn, speakFixedText, createChunkedProducer, adoptChunkedProducer } = require('./chunkedTurn')
+const { runAttemptWithWatchdog, bridgeAbort } = require('../utils/attemptWithWatchdog')
+const { isSpeculationMatch, classifyForAdoption } = require('../utils/chunkedSpeculation')
 const { createRolloutConfig } = require('../utils/rolloutConfig')
 const { performance } = require('perf_hooks')
 
@@ -38,6 +39,12 @@ const STT_INTERIM_FINALIZE_MS_CHUNKED = 900
 // (ออกแบบมาสำหรับ compose child abort จาก outer signal + แยก success/aborted/timeout/error อยู่แล้วจาก C4b)
 //
 const PREWARM_GRACE_MS = 150
+
+// L1b (chunked speculative prewarm, design locked 2026-08-19) — reuse PREWARM_GRACE_MS as the budget for the
+// *only* remaining pre-adoption wait: "zero progress at all" (no first delta yet). Any state where a first
+// delta already exists adopts immediately instead of waiting (see classifyForAdoption in chunkedSpeculation.js)
+// — same invariant as Commit A: speculative optimization must never become a blocking dependency.
+const CHUNKED_SPEC_PROGRESS_GRACE_TIMEOUT_MS = PREWARM_GRACE_MS
 
 // Commit A2 — legacy's "fresh" Claude call (ไม่ว่าจะไม่เคยมี prewarm เลย หรือ prewarm miss/timeout จาก Commit A
 // แล้วก็ตาม) ยังเป็น `for await (chunk of askClaudeStream(...))` เปล่าๆ ไม่มี deadline เหมือนกัน — production
@@ -103,6 +110,20 @@ const TTS_FIRST_AUDIO_TIMEOUT_MS = 2000
 // commit (turnState.audioCommitted) คือ source of truth เดียวที่บอกว่าอยู่ phase ไหน — ไม่ใช่ timestamp/ตัวนับเอง
 const FALLBACK_PRECOMMIT_TIMEOUT_MS = 8000
 const FALLBACK_IDLE_TIMEOUT_MS = 6000
+
+// L1b — populate prewarm telemetry จาก handle เดียวกันไม่ว่า outcome จะเป็นอะไร (ADOPT_NOW/DROP/GRACE_HIT/
+// MISMATCH_FRESH ฯลฯ) — ต้องเรียกให้ครบทุก branch ที่มี speculation จริง ไม่ใช่แค่ตอน exact match เท่านั้น
+// เพราะข้อมูล "เสีย speculative work ไปเท่าไรตอน miss" (มี delta แล้วหรือยัง/มี chunk พร้อมหรือยัง) สำคัญพอกับ
+// ตอน hit สำหรับ tuning hit-rate ในอนาคต (blocker จาก review รอบ commit gate — MISMATCH_FRESH เคย populate
+// แค่ prewarmOutcome เฉยๆ ทิ้ง field อื่นที่มีความหมายจริงไปหมด)
+function recordChunkedPrewarmMetrics(metrics, handle, finalAcceptedAt, outcome) {
+  metrics.prewarmOutcome = outcome
+  metrics.prewarmStartedAt = handle.startedAt
+  metrics.prewarmAgeAtFinalMs = Math.round(finalAcceptedAt - handle.startedAt)
+  metrics.prewarmFirstDeltaMs = handle.producer.firstDeltaAt != null ? Math.round(handle.producer.firstDeltaAt - handle.startedAt) : null
+  metrics.prewarmFirstChunkMs = handle.producer.firstChunkAt != null ? Math.round(handle.producer.firstChunkAt - handle.startedAt) : null
+  metrics.prewarmBufferedChunks = handle.producer.queue.length
+}
 
 function shouldBlockEndCall(session, aiResponse) {
   const userMessages = session.messages.filter(m => m.role === 'user')
@@ -187,6 +208,11 @@ function registerWebSocket(fastify) {
     let prewarmAbort = null      // AbortController for prewarm call
     let prewarmStartedAt = 0     // performance.now() ตอนเริ่ม request จริง — สำหรับ telemetry (prewarmAgeMs), คนละตัวกับ prewarmRetriggerAt (Date.now()-based throttle)
     let prewarmRetriggerAt = 0   // เวลาต่ำสุดที่อนุญาตเดาใหม่รอบถัดไป (throttle กันยิง Claude ถี่เกิน)
+    // L1b — chunked speculative prewarm: คนละ mechanism จาก prewarmPromise ข้างบน (Promise<string|null> เดิม
+    // เป็นของ legacy เท่านั้น) ไม่แชร์ clock/state กันเลยแม้ในทางปฏิบัติสายหนึ่งจะใช้แค่ทางใดทางหนึ่งเสมอ (rollout
+    // freeze ครั้งเดียวต่อสาย) — แยกไว้ชัดเจนกันความสับสน/regression ในอนาคตหากมีคนแก้แค่ฝั่งเดียว
+    let chunkedPrewarmHandle = null   // { transcript, producer, abortController, startedAt, adopted, generationGuard }
+    let chunkedSpecRetriggerAt = 0    // throttle deadline แยกจาก prewarmRetriggerAt โดยตั้งใจ
 
     // Checkpoint C0: safety infrastructure ของ B.5 ผูกไว้กับสายนี้แล้ว แต่ยังไม่มีจุดไหนอ่าน/ใช้งานจริง
     // (ไม่มี chunked path ให้ guard ในไฟล์นี้เลยตอนนี้) — legacy path ทั้งหมดด้านล่างยังทำงานเหมือนเดิมทุกบรรทัด
@@ -221,6 +247,7 @@ function registerWebSocket(fastify) {
 
       clearSilenceTimer()
       clearPrewarm()
+      abortChunkedSpeculation()
       if (greetingAbortController) { greetingAbortController.abort(); greetingAbortController = null }
       if (ttsAbortController) { ttsAbortController.abort(); ttsAbortController = null }
 
@@ -266,18 +293,22 @@ function registerWebSocket(fastify) {
     // เพราะวัดผลจริงจาก log พบว่า debounce แย่ลง (median ช่วงรอคำตอบพร้อมเพิ่มจาก 1.8s เป็น 3.0s) — สาเหตุคือระหว่าง
     // ลูกค้าพูดต่อเนื่อง STT ส่ง interim ใหม่มาเรื่อยๆ แทบไม่หยุดนิ่งเลยจนพูดจบจริง debounce เลย "นิ่ง" แทบไม่ทัน
     // และเสียข้อดีเดิมที่การเดาตัวแรกมักไม่โดนยกเลิก (ขยับทีละน้อยกว่า 4 ตัวอักษร) จึงสะสม head start มาตลอดทั้งประโยคได้
-    function shouldRetriggerPrewarm(oldText, newText) {
+    // L1b: parameterize เป็น retriggerAtMs (แทนอ่าน prewarmRetriggerAt จาก closure ตรงๆ) — ให้ chunked speculation
+    // ใช้ throttle clock ของตัวเอง (chunkedSpecRetriggerAt) ได้โดยไม่ผูกกับ legacy prewarm's clock โดยไม่ตั้งใจ
+    // legacy call site (startPrewarm ด้านล่าง) ยังส่ง prewarmRetriggerAt ตัวเดิมเข้ามาเหมือนเดิมทุกประการ —
+    // พฤติกรรม legacy ไม่เปลี่ยนแม้แต่นิดเดียว
+    function shouldRetriggerPrewarm(oldText, newText, retriggerAtMs) {
       const oldLen = (oldText || '').trim().length
       const newLen = (newText || '').trim().length
       if (newLen - oldLen < 4) return false // เพิ่มขึ้นน้อยไป ไม่คุ้มยิงใหม่ (แค่ STT ขยับคำเล็กน้อย)
-      if (Date.now() < prewarmRetriggerAt) return false // กันยิง Claude รัวๆ ระหว่างลูกค้าพูดยาว
+      if (Date.now() < retriggerAtMs) return false // กันยิง Claude รัวๆ ระหว่างลูกค้าพูดยาว
       return true
     }
 
     function startPrewarm(session, interimText) {
       if (!callActive || isSpeaking || sttProcessing) return
       if (prewarmPromise) {
-        if (!shouldRetriggerPrewarm(prewarmStartText, interimText)) return
+        if (!shouldRetriggerPrewarm(prewarmStartText, interimText, prewarmRetriggerAt)) return
         console.log(`[Prewarm] Re-trigger — interim grew: "${prewarmStartText}" → "${interimText}"`)
         clearPrewarm()
       }
@@ -308,6 +339,46 @@ function registerWebSocket(fastify) {
       if (prewarmAbort) { prewarmAbort.abort(); prewarmAbort = null }
       prewarmPromise = null
       prewarmStartText = null
+    }
+
+    // L1b — เริ่ม chunked speculative Claude call จาก interim text ก่อน final transcript มาถึง สร้าง producer
+    // ผ่าน createChunkedProducer() เท่านั้น (ไม่มี consumer แนบเลย) จนกว่า final จะยืนยันว่าใช้ได้ (adoption ใน
+    // processTranscript ด้านล่าง) — ไม่มี TTS/Twilio side effect ใดๆ เกิดขึ้นได้ก่อนหน้านั้นเลยโดยโครงสร้าง
+    //
+    // getIsValid ของ producer นี้ผูกกับ handle เอง (handle === chunkedPrewarmHandle) ก่อน adoption แล้ว "upgrade"
+    // เป็น generation guard จริง (handle.generationGuard) หลัง adoption — ดู processTranscript สำหรับจุด upgrade
+    // (design correction #2: ต้องคง generation-guard defense-in-depth ไว้ ไม่ใช่พึ่ง AbortSignal อย่างเดียว)
+    function startChunkedSpeculation(session, interimText) {
+      if (!callActive || isSpeaking || sttProcessing) return
+      if (chunkedPrewarmHandle) {
+        if (!shouldRetriggerPrewarm(chunkedPrewarmHandle.transcript, interimText, chunkedSpecRetriggerAt)) return
+        console.log(`[ChunkedPrewarm] Re-trigger — interim grew: "${chunkedPrewarmHandle.transcript}" → "${interimText}"`)
+        abortChunkedSpeculation()
+      }
+      chunkedSpecRetriggerAt = Date.now() + 700
+      const abortController = new AbortController()
+      const handle = { transcript: interimText, abortController, startedAt: performance.now(), adopted: false, generationGuard: null, producer: null }
+      // ต้อง assign chunkedPrewarmHandle = handle ก่อนเรียก createChunkedProducer() เสมอ — ถ้า askClaudeStreamChunked
+      // ตอบแบบ synchronous ล้วนๆ (ไม่มี yield/await เลยก่อน return เช่น end_call ล้วนๆ ไม่มี text) for-await loop
+      // ภายใน createChunkedProducer() จะรัน iteration แรกจบสมบูรณ์ (รวมเรียก emitControl) แบบ synchronous ทันที
+      // ภายใน call เดียวกันนี้เลย ก่อนบรรทัดถัดไปจะได้รันด้วยซ้ำ — ถ้า assign ทีหลัง getIsValid() จะเห็น
+      // chunkedPrewarmHandle เป็นค่าเก่า (null/handle อื่น) ทำให้ end_call แรกสุดหลุดโดนกัน guard ทิ้งอย่างผิดๆ
+      // (บั๊กจริงที่เจอจาก integration test 45 — CONTROL_ONLY_HIT ที่ควร adopt กลับกลายเป็น EMPTY_FRESH)
+      const snap = { ...session, messages: [...session.messages, { role: 'user', content: interimText }] }
+      chunkedPrewarmHandle = handle
+      handle.producer = createChunkedProducer({
+        session: snap,
+        signal: abortController.signal,
+        getIsValid: () => (handle.generationGuard ? handle.generationGuard() : chunkedPrewarmHandle === handle),
+      })
+      console.log(`[ChunkedPrewarm] Starting for: "${interimText}"`)
+    }
+
+    // ยกเลิก speculation ที่ยังไม่ถูก adopt เท่านั้น (adopted handle มีเจ้าของอื่นดูแล lifecycle ต่อแล้ว ผ่าน
+    // bridgeAbort ที่ผูกกับ turn's real signal — ห้ามแตะ abortController ของมันซ้ำที่นี่)
+    function abortChunkedSpeculation() {
+      if (chunkedPrewarmHandle && !chunkedPrewarmHandle.adopted) chunkedPrewarmHandle.abortController.abort()
+      chunkedPrewarmHandle = null
     }
 
     async function handleSilence() {
@@ -367,6 +438,7 @@ function registerWebSocket(fastify) {
       clearSilenceTimer()
       silencePromptCount = 0
       clearPrewarm()
+      abortChunkedSpeculation() // L1b — เหมือน clearPrewarm() ข้างบนทุกประการ แค่คนละ mechanism (chunked speculative producer)
       if (greetingAbortController) { greetingAbortController.abort(); greetingAbortController = null }
       if (ttsAbortController) { ttsAbortController.abort(); ttsAbortController = null }
       if (socket.readyState === socket.OPEN) {
@@ -516,6 +588,13 @@ function registerWebSocket(fastify) {
           const myPrewarmText = prewarmStartText
           const myPrewarmAbort = prewarmAbort
           const myPrewarmStartedAt = prewarmStartedAt
+          // L1b: snapshot เดียวกันเหตุผลเดียวกัน — chunkedPrewarmHandle เป็น mutable global ที่ startChunkedSpeculation()/
+          // abortChunkedSpeculation() เปลี่ยน ref ได้ตลอดเวลา ต้อง snapshot ก่อนเข้า branch ไม่ใช่อ่านซ้ำทีหลัง
+          const mySpecHandle = chunkedPrewarmHandle
+          // Correction #3 (design review รอบ 4): snapshot เวลา "final ถูกยอมรับ" ก่อน grace ใดๆ ทั้งสิ้น — ถ้าคำนวณ
+          // prewarmAgeAtFinalMs หลังผ่าน grace (150ms) แล้ว ค่าจะบวก grace เข้าไปผิดๆ ทั้งที่ field นี้ควรวัด "อายุของ
+          // speculation ณ ตอน final มาถึงจริง" เพื่อใช้ตัดสินว่า speculation ได้ head-start จริงกี่ ms
+          const finalAcceptedAt = performance.now()
 
           // C3a: ตัดสิน branch ก่อน Claude side effect แรกเสมอ — ห้ามมี code เรียก Claude ก่อนจุดนี้ไม่ว่า path ไหน
           // rollout ยัง 0% เสมอตอนนี้ จึงยังไม่มีสายไหนเข้า branch นี้จริงในโปรดักชัน (ดู C0/decideRollout)
@@ -526,6 +605,94 @@ function registerWebSocket(fastify) {
               // (t2→t7) วัดไม่ได้เลย มาร์กตรงนี้ (จุดเดียวกับที่ legacy มาร์ก คือ "กำลังจะเริ่มขอคำตอบ" ก่อนเรียก
               // Claude จริง) ไม่กระทบ branch decision invariant เพราะเป็นแค่ timestamp ไม่ใช่ side effect
               markOnce(turnMetrics, 't2')
+
+              // L1b — ถ้ามี speculation ที่ interim ตรงกับ final แบบ exact (normalized) พยายาม adopt ก่อนเริ่ม
+              // fresh call ใดๆ ทั้งสิ้น — ดู classifyForAdoption()/design lock (รอบ 3-4) สำหรับ state table เต็ม
+              let attempt
+              let usedSpeculation = false
+
+              if (mySpecHandle && isSpeculationMatch(mySpecHandle.transcript, transcript)) {
+                let classification = classifyForAdoption(mySpecHandle)
+
+                if (classification.decision === 'GRACE') {
+                  // เคสเดียวที่เหลือให้รอ pre-adoption: ไม่มี progress อะไรเลย (ไม่มี delta แม้แต่ตัวเดียว) — ถ้ามี
+                  // delta แล้ว (DELTA_ONLY_HIT) classifyForAdoption คืน ADOPT_NOW ทันทีไปแล้ว ไม่มาถึง branch นี้
+                  const graceAttempt = await runAttemptWithWatchdog({
+                    signal,
+                    timeoutMs: CHUNKED_SPEC_PROGRESS_GRACE_TIMEOUT_MS,
+                    reason: 'CHUNKED_SPEC_PROGRESS_GRACE_TIMEOUT',
+                    run: (childSignal) => {
+                      bridgeAbort(childSignal, mySpecHandle.abortController) // Correction #1: ต้องเช็ค childSignal.aborted ก่อนเรียกด้วย ไม่ใช่ addEventListener เพียวๆ
+                      return mySpecHandle.producer.waitForFirstProgress()
+                    },
+                  })
+                  if (graceAttempt.outcome === 'success') {
+                    classification = classifyForAdoption(mySpecHandle)
+                    if (classification.decision === 'ADOPT_NOW') classification = { ...classification, outcome: 'GRACE_HIT' }
+                  } else {
+                    classification = {
+                      decision: 'DROP',
+                      outcome: graceAttempt.outcome === 'timeout' ? 'GRACE_TIMEOUT_FRESH'
+                        : graceAttempt.outcome === 'aborted' ? 'ABORTED' : 'ERROR_FRESH',
+                    }
+                  }
+                }
+
+                recordChunkedPrewarmMetrics(turnMetrics, mySpecHandle, finalAcceptedAt, classification.outcome)
+
+                if (classification.decision === 'ADOPT_NOW') {
+                  usedSpeculation = true
+                  mySpecHandle.adopted = true
+                  // Correction #2 upgrade: หลัง adopt แล้ว producer's getIsValid() ต้องอ้างอิง generation guard จริง
+                  // ของเทิร์นนี้ (ไม่ใช่ "ยัง current handle อยู่ไหม" อีกต่อไป — handle ถูก clear ทิ้งจาก closure แล้ว)
+                  mySpecHandle.generationGuard = () => isCurrentGeneration(callState, generationId)
+                  console.log(`[ChunkedPrewarm] ${classification.outcome} — adopting speculative producer`)
+
+                  if (classification.outcome === 'CONTROL_ONLY_HIT') {
+                    // ไม่มี text ให้พูดเลย (end_call ล้วนๆ) — ไม่มีอะไรให้ watchdog รอ แต่ยัง mark t3 ถ้าเคยมี delta
+                    // จริงมาก่อน (เช่น whitespace เดียวที่ไม่เคยข้าม MIN_CHUNK_LENGTH) เพื่อความถูกต้องของ telemetry
+                    mySpecHandle.producer.onFirstDelta(() => markOnce(turnMetrics, 't3'))
+                    const result = await adoptChunkedProducer({
+                      producer: mySpecHandle.producer, signal, socket, streamSid,
+                      voiceId: currentSession.campaign.voice_id, turnMetrics, turnState, callState, generationId,
+                      onControl: (control) => { if (control?.type === 'end_call') endCallRequested = true },
+                    })
+                    attempt = { outcome: 'success', result }
+                  } else {
+                    // Correction #3: เริ่มที่ Watchdog B เสมอ (ไม่ใช่ C) — ถ้ามี chunk พร้อมอยู่แล้ว onFirstChunk
+                    // replay ทันที (disarm B ในติ๊กเดียวกัน) แล้ว onFirstTtsRequest/onFirstTtsAudio arm/disarm C ที่
+                    // t5/t6 จริงเหมือน fresh path ทุกประการ — ไม่ใช่นับจาก adoption
+                    attempt = await runAttemptWithWatchdog({
+                      signal,
+                      timeoutMs: CHUNK_READY_TIMEOUT_MS,
+                      reason: 'CHUNK_READY_TIMEOUT',
+                      run: (childSignal, armWatchdog) => {
+                        bridgeAbort(childSignal, mySpecHandle.abortController) // Correction #1
+                        mySpecHandle.producer.onFirstDelta(() => markOnce(turnMetrics, 't3'))
+                        mySpecHandle.producer.onFirstChunk(() => { markOnce(turnMetrics, 't4'); armWatchdog() })
+                        return adoptChunkedProducer({
+                          producer: mySpecHandle.producer, signal: childSignal, socket, streamSid,
+                          voiceId: currentSession.campaign.voice_id, turnMetrics, turnState, callState, generationId,
+                          onControl: (control) => { if (control?.type === 'end_call') endCallRequested = true },
+                          onFirstTtsRequest: () => armWatchdog(TTS_FIRST_AUDIO_TIMEOUT_MS, 'TTS_FIRST_AUDIO_TIMEOUT'),
+                          onFirstTtsAudio: () => armWatchdog(),
+                        })
+                      },
+                    })
+                  }
+                } else {
+                  console.log(`[ChunkedPrewarm] ${classification.outcome} — dropping speculation, fresh chunked`)
+                }
+              } else if (mySpecHandle) {
+                recordChunkedPrewarmMetrics(turnMetrics, mySpecHandle, finalAcceptedAt, 'MISMATCH_FRESH')
+                console.log(`[ChunkedPrewarm] Mismatch — interim "${mySpecHandle.transcript}" vs final "${transcript}" — dropping, fresh chunked`)
+              }
+
+              // handle ที่ไม่ถูก adopt (DROP ทุกแบบ รวม mismatch) ต้อง abort ทันที — ไม่รอให้ network cancellation
+              // settle ก่อน (ดู invariant ท้ายบล็อกนี้) และเคลียร์ตัวชี้ออกจาก closure ไม่ว่า adopt หรือไม่ก็ตาม
+              if (mySpecHandle && !mySpecHandle.adopted) mySpecHandle.abortController.abort()
+              if (chunkedPrewarmHandle === mySpecHandle) chunkedPrewarmHandle = null
+
               // C4b: race runChunkedTurn ต่อ watchdog สามวงเรียงกัน (Watchdog A → B → C) ผ่าน child AbortController
               // เดียวที่ compose มาจาก outer signal (barge-in) — barge-in ยังฆ่าทั้งคู่ได้เสมอ แต่ watchdog ฆ่าได้แค่
               // chunked attempt นี้เท่านั้น ไม่แตะ outer signal เลย เพื่อให้ fallback ด้านล่าง (ที่ใช้ outer signal)
@@ -533,27 +700,37 @@ function registerWebSocket(fastify) {
               // ตอน t3, disarm ตอน t4 (ไม่ rearm ทันที — ช่องว่างจนกว่า TTS request แรกจะเริ่มจริงคือ intentional gap),
               // แล้ว rearm เป็น C (TTS_FIRST_AUDIO_TIMEOUT) ตอน t5 (TTS request แรกของทั้งเทิร์นเริ่มจริง ไม่ใช่ตอน
               // chunk ถูก dequeue), disarm ตอน t6 — first-only ทั้งคู่ ไม่ rearm ตาม speech chunk ถัดๆ ไป
-              const attempt = await runAttemptWithWatchdog({
-                signal,
-                timeoutMs: CLAUDE_FIRST_DELTA_TIMEOUT_MS,
-                reason: 'CLAUDE_FIRST_DELTA_TIMEOUT',
-                run: (childSignal, armWatchdog) => runChunkedTurn({
-                  session: currentSession,
-                  signal: childSignal,
-                  socket,
-                  streamSid,
-                  voiceId: currentSession.campaign.voice_id,
-                  turnMetrics,
-                  turnState,
-                  callState,
-                  generationId,
-                  onControl: (control) => { if (control?.type === 'end_call') endCallRequested = true },
-                  onFirstDelta: () => armWatchdog(CHUNK_READY_TIMEOUT_MS, 'CHUNK_READY_TIMEOUT'),
-                  onFirstChunk: () => armWatchdog(),
-                  onFirstTtsRequest: () => armWatchdog(TTS_FIRST_AUDIO_TIMEOUT_MS, 'TTS_FIRST_AUDIO_TIMEOUT'),
-                  onFirstTtsAudio: () => armWatchdog(),
-                }),
-              })
+              //
+              // Correction #4a: ถ้า speculation ไม่ถูก adopt เพราะ grace ถูก barge-in (ABORTED) หรือ turn นี้ stale
+              // ไปแล้วด้วยเหตุผลอื่น ห้ามพยายามเริ่ม fresh call เลย (เหมือน barge-in ธรรมดาทุกประการ — ไม่ใช่ "เริ่ม
+              // แล้วถูก abort ทันที" ซึ่งจะทำให้ debug/invariant ยุ่งขึ้นโดยไม่จำเป็น)
+              if (!usedSpeculation) {
+                if (!signal.aborted && callActive && isCurrentGeneration(callState, generationId)) {
+                  attempt = await runAttemptWithWatchdog({
+                    signal,
+                    timeoutMs: CLAUDE_FIRST_DELTA_TIMEOUT_MS,
+                    reason: 'CLAUDE_FIRST_DELTA_TIMEOUT',
+                    run: (childSignal, armWatchdog) => runChunkedTurn({
+                      session: currentSession,
+                      signal: childSignal,
+                      socket,
+                      streamSid,
+                      voiceId: currentSession.campaign.voice_id,
+                      turnMetrics,
+                      turnState,
+                      callState,
+                      generationId,
+                      onControl: (control) => { if (control?.type === 'end_call') endCallRequested = true },
+                      onFirstDelta: () => armWatchdog(CHUNK_READY_TIMEOUT_MS, 'CHUNK_READY_TIMEOUT'),
+                      onFirstChunk: () => armWatchdog(),
+                      onFirstTtsRequest: () => armWatchdog(TTS_FIRST_AUDIO_TIMEOUT_MS, 'TTS_FIRST_AUDIO_TIMEOUT'),
+                      onFirstTtsAudio: () => armWatchdog(),
+                    }),
+                  })
+                } else {
+                  attempt = { outcome: 'aborted' }
+                }
+              }
 
               if (attempt.outcome === 'success') {
                 fullText = attempt.result.fullText
@@ -1012,11 +1189,12 @@ function registerWebSocket(fastify) {
 
           clearSilenceTimer()
           silencePromptCount = 0
-          // C3c: prewarm ยิง askClaudeStream เดิมเสมอ ไม่เกี่ยวกับ chunked path เลย — สายที่ freeze เป็น chunked
-          // bucket ไม่ควรยิง Claude request ที่ไม่มีทางถูกใช้นี้ (เสียเงิน/เพิ่ม concurrency โดยเปล่าประโยชน์)
-          if (rollout?.useChunkedStreaming) return
+          // C3c/L1b: prewarm เดิม (Promise<string|null>) ใช้กับ legacy เท่านั้น — สายที่ freeze เป็น chunked bucket
+          // ใช้ startChunkedSpeculation() แทน (คนละ mechanism แต่ throttle/guard shape เดียวกัน)
           const session = callSessions.get(callSid)
-          if (session) startPrewarm(session, interimText)
+          if (!session) return
+          if (rollout?.useChunkedStreaming) { startChunkedSpeculation(session, interimText); return }
+          startPrewarm(session, interimText)
         }, { interimFinalizeMs })
 
         // AI ทักทายก่อนเลย — ใช้ pre-generated audio ถ้ามี (ลด latency)
@@ -1096,6 +1274,7 @@ function registerWebSocket(fastify) {
         clearSilenceTimer()
         clearDurationTimer()
         clearPrewarm()
+        abortChunkedSpeculation()
         endCall(callState)
         pendingTranscript = null // C6c follow-up: กัน pending transcript ของสายที่จบไปแล้วถูก drain ทีหลัง (แม้ processTranscript() จะเช็ค callActive ป้องกันไว้อีกชั้นอยู่แล้วก็ตาม)
         bargeInPendingFinal = false
@@ -1107,6 +1286,7 @@ function registerWebSocket(fastify) {
       console.log(`[WS] Disconnected: ${callSid}`)
       callActive = false
       clearPrewarm()
+      abortChunkedSpeculation()
       clearSilenceTimer()
       clearDurationTimer()
       endCall(callState)
