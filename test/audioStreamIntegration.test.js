@@ -5,6 +5,17 @@ const assert = require('node:assert/strict')
 const callSessions = require('../src/utils/callSessions')
 const harness = require('./_audioStreamHarness')
 
+// A2: LEGACY_FRESH_CLAUDE_TIMEOUT_MS production default คือ 6000ms — ต้องตั้ง override ก่อน harness ที่ require
+// audioStream.js ตัวจริงครั้งแรก (module-level const อ่านค่าตอน load ครั้งเดียว) ไม่งั้นเทสที่ต้องการให้ watchdog
+// นี้ timeout จริงจะต้องรอ 6 วินาทีทุกครั้ง ทำให้ suite ช้าขึ้นโดยไม่จำเป็น — audioStream.js เองบังคับด้วย
+// NODE_ENV==='test' ก่อนยอมรับ override ตัวนี้เลย (กัน env ตัวนี้หลงค้างใน production แล้ว legacy ทั้งหมด
+// timeout ที่ 80ms โดยไม่มีใครตั้งใจ) จึงต้องตั้ง NODE_ENV ที่นี่ด้วย ไม่ใช่แค่ค่า override เฉยๆ
+process.env.NODE_ENV = 'test'
+process.env.LEGACY_CLAUDE_TIMEOUT_MS_OVERRIDE = '80'
+
+// ต้องตรงกับ LEGACY_RECOVERY_PHRASE ใน audioStream.js เป๊ะ (ไม่ได้ export ออกมา เป็น internal constant ของโมดูล)
+const LEGACY_RECOVERY_PHRASE = 'ขอโทษค่ะ เมื่อกี้ตอบช้าไปนิดนึง รบกวนพูดอีกครั้งได้ไหมคะ'
+
 function delay(ms) { return new Promise(resolve => setTimeout(resolve, ms)) }
 
 // C4c follow-up (commit-aware fallback watchdog) — จับ [Metrics] log บรรทัดเดียวของเทิร์นนั้น แล้ว parse เป็น
@@ -913,4 +924,153 @@ test('30) Commit A: disconnect ระหว่าง grace wait ต้องไ�
   await turnPromise // ต้องไม่ throw หรือค้างตลอดไป (grace หมดตามธรรมชาติที่ 150ms แล้วจบ turn อย่างปลอดภัย)
 
   assert.ok(true, 'ไม่ throw/ค้าง')
+})
+
+// ===== Commit A2 — legacy fresh-call watchdog + canned recovery phrase =====
+// LEGACY_FRESH_CLAUDE_TIMEOUT_MS ถูก override เป็น 80ms ที่หัวไฟล์ (ผ่าน env var ก่อน harness require audioStream.js
+// ครั้งแรก) — production ยังคง 6000ms เดิม จุดสำคัญที่สุดที่เทสชุดนี้ต้องพิสูจน์ (ตามที่ล็อกไว้ก่อนแก้): barge-in ที่
+// ทำให้ askClaudeStream() throw AbortError ต้องถูกจัดเป็น outcome 'aborted' ไม่ใช่ 'error' ไม่งั้น recovery phrase
+// จะพูดทับเสียงลูกค้าที่กำลังพูดแทรกอยู่จริง
+
+test('31) Commit A2: fresh call ปกติ (เร็วกว่า timeout มาก) → behavior เดิมทุกประการ ไม่มี recovery phrase', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+  state.claudeStreamImpl = async function* () { yield 'คำตอบปกติ' }
+
+  await harness.sendFinalTranscript('สวัสดีค่ะ')
+
+  const lastAssistant = session.messages.filter(m => m.role === 'assistant').at(-1)
+  assert.equal(lastAssistant.content, 'คำตอบปกติ')
+  harness.disconnect(socket)
+})
+
+test('32) Commit A2: fresh call เกิน LEGACY_FRESH_CLAUDE_TIMEOUT_MS (ค้างตลอดไป ไม่สนใจ signal เลย — จำลอง incident เดิมเป๊ะ) → พูด recovery phrase, abort request เดิมจริง', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+
+  let capturedSignal = null
+  state.claudeStreamImpl = async function* (s, isGreeting, signal) {
+    capturedSignal = signal
+    await new Promise(() => {}) // ค้างตลอดไป ไม่สนใจ signal เลย
+  }
+
+  await harness.sendFinalTranscript('สวัสดีค่ะขอสอบถามโปรโมชั่น')
+
+  assert.equal(capturedSignal.aborted, true, 'ต้อง abort request เดิมจริงตอน timeout ไม่ใช่แค่ทิ้ง reference')
+  const lastAssistant = session.messages.filter(m => m.role === 'assistant').at(-1)
+  assert.equal(lastAssistant.content, LEGACY_RECOVERY_PHRASE)
+  const mediaEvents = socket.sent.filter(e => e.event === 'media')
+  assert.ok(mediaEvents.length > 0, 'ต้องมีเสียง recovery phrase ออกไปจริง')
+  harness.disconnect(socket)
+})
+
+test('32b) Commit A2: fresh Claude สำเร็จ (success) แต่ไม่ yield ข้อความเลย (blank/empty result) → ต้องพูด recovery phrase เช่นกัน ไม่ใช่เงียบ', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+
+  let callCount = 0
+  // จำลอง askClaudeStream ของจริงที่ yield เฉพาะ text.length >= 3 — ที่นี่ไม่ yield อะไรเลย (สำเร็จแต่ไม่มีข้อความ)
+  state.claudeStreamImpl = async function* () { callCount++ }
+
+  await harness.sendFinalTranscript('สวัสดีค่ะขอสอบถามโปรโมชั่น')
+
+  assert.equal(callCount, 1, 'ต้องเรียก Claude แค่ครั้งเดียว ไม่ retry ซ้ำ')
+  const assistantMessages = session.messages.filter(m => m.role === 'assistant')
+  assert.equal(assistantMessages.length, 1, 'ห้ามมี blank assistant message ใน history เลย มีแค่ recovery phrase เดียว')
+  assert.equal(assistantMessages[0].content, LEGACY_RECOVERY_PHRASE)
+  const mediaEvents = socket.sent.filter(e => e.event === 'media')
+  assert.ok(mediaEvents.length > 0, 'ต้องมีเสียง recovery phrase ออกไปจริง ไม่ใช่ความเงียบ')
+  harness.disconnect(socket)
+})
+
+test('33) Commit A2: genuine Claude error (throw ทันที ไม่เกี่ยวกับ abort เลย) → พูด recovery phrase เดียวกัน', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+
+  state.claudeStreamImpl = async function* () { throw new Error('Claude API error จริง ไม่เกี่ยวกับ abort เลย') }
+
+  await harness.sendFinalTranscript('สวัสดีค่ะขอสอบถามโปรโมชั่น')
+
+  const lastAssistant = session.messages.filter(m => m.role === 'assistant').at(-1)
+  assert.equal(lastAssistant.content, LEGACY_RECOVERY_PHRASE)
+  harness.disconnect(socket)
+})
+
+test('34) Commit A2 (critical): barge-in ทำให้ askClaudeStream throw AbortError → ต้องจัดเป็น aborted ไม่ใช่ error ห้ามพูด recovery phrase ทับลูกค้า', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+
+  state.claudeStreamImpl = async function* (s, isGreeting, signal) {
+    await new Promise((resolve, reject) => {
+      // จำลอง SDK จริงที่ throw ทันทีเมื่อ signal ถูก abort (ไม่ใช่แค่ hang เฉยๆ แบบเทส 32)
+      signal.addEventListener('abort', () => {
+        const err = new Error('The user aborted a request.')
+        err.name = 'AbortError'
+        reject(err)
+      }, { once: true })
+    })
+  }
+
+  const turnPromise = harness.sendFinalTranscript('สวัสดีค่ะขอสอบถามโปรโมชั่น')
+  await delay(20) // อยู่ในช่วง 80ms timeout window แน่นอน — เทิร์นนี้ isSpeaking=true แล้ว
+
+  let secondTurnCalls = 0
+  state.claudeStreamImpl = async function* () { secondTurnCalls++; yield 'ตอบเรื่องที่พูดแทรก' }
+  harness.sendInterim('เดี๋ยวก่อนครับขอถามเรื่องอื่นก่อน') // ยาวพอ trigger bargeIn()
+
+  const clearEvents = socket.sent.filter(e => e.event === 'clear')
+  assert.ok(clearEvents.length > 0, 'barge-in ต้องยิงจริง')
+
+  await harness.sendFinalTranscript('เดี๋ยวก่อนครับขอถามเรื่องอื่นก่อน')
+  await turnPromise
+
+  const lastAssistant = session.messages.filter(m => m.role === 'assistant').at(-1)
+  assert.notEqual(lastAssistant.content, LEGACY_RECOVERY_PHRASE, 'ห้ามพูด recovery phrase ทับ barge-in — ต้อง classify เป็น aborted ไม่ใช่ error')
+  assert.equal(lastAssistant.content, 'ตอบเรื่องที่พูดแทรก')
+  assert.equal(secondTurnCalls, 1, 'ต้องมีเทิร์นใหม่พอดี 1 ครั้งจาก final ที่ถูก queue ไว้')
+  harness.disconnect(socket)
+})
+
+test('35) Commit A2: barge-in ระหว่างพูด recovery phrase เอง (หลังส่งเสียงไปแล้วบางส่วน) → ห้าม commit recovery phrase เต็มลง history ต้องใช้ partial marker', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+
+  let resumeRecoveryTts
+  const recoveryGate = new Promise(resolve => { resumeRecoveryTts = resolve })
+  state.ttsImpl = async function* () {
+    yield Buffer.from('chunk1') // ก้อนแรกของ recovery phrase ออกไปแล้วจริง
+    await recoveryGate // ค้างตรงนี้ — barge-in จะเกิดตอนนี้
+    yield Buffer.from('GHOST_recovery_chunk2') // ต้องไม่ถูกส่งออกไปเลยหลัง barge-in
+  }
+  state.claudeStreamImpl = async function* () { await new Promise(() => {}) } // fresh call ค้างตลอดไป → timeout → recovery
+
+  const turnPromise = harness.sendFinalTranscript('สวัสดีค่ะขอสอบถามโปรโมชั่น')
+  await delay(120) // ให้ timeout (80ms) ยิงแล้วเริ่มพูด recovery phrase, commit chunk แรกไปแล้วแน่นอน
+
+  const sentBeforeBargeIn = socket.sent.filter(e => e.event === 'media').length
+  assert.ok(sentBeforeBargeIn > 0, 'recovery phrase ต้องเริ่มพูดไปแล้วบางส่วนก่อน barge-in')
+
+  let secondTurnCalls = 0
+  state.claudeStreamImpl = async function* () { secondTurnCalls++; yield 'ตอบเรื่องใหม่' }
+  state.ttsImpl = async function* () { yield Buffer.from('clean-new-turn-chunk') } // reset กัน stub เดิมที่ยังมี GHOST_recovery ค้างอยู่ปนกับเทิร์นใหม่
+  harness.sendInterim('เดี๋ยวก่อนครับขอถามเรื่องอื่นก่อน')
+
+  resumeRecoveryTts() // ปล่อยให้ recovery phrase's TTS พยายามพูดต่อ (ต้องถูก generation guard กันไว้)
+
+  await harness.sendFinalTranscript('เดี๋ยวก่อนครับขอถามเรื่องอื่นก่อน')
+  await turnPromise
+
+  const assistantMessages = session.messages.filter(m => m.role === 'assistant')
+  const oldTurnCommit = assistantMessages.at(-2) // เทิร์นเก่า (recovery ที่ถูกขัดจังหวะ) ต้องมาก่อนเทิร์นใหม่ใน history
+  assert.ok(oldTurnCommit, 'เทิร์นเก่าต้อง commit อะไรบางอย่างเข้า history (partial marker) ไม่ใช่ข้ามไปเฉยๆ')
+  assert.notEqual(oldTurnCommit.content, LEGACY_RECOVERY_PHRASE, 'ห้าม commit recovery phrase เต็มเพราะถูกขัดจังหวะกลางคัน')
+  assert.match(oldTurnCommit.content, /ขัดจังหวะ/, 'ต้องใช้ partial marker เดียวกับที่ fallback partial ใช้')
+
+  const lastAssistant = assistantMessages.at(-1)
+  assert.equal(lastAssistant.content, 'ตอบเรื่องใหม่', 'เทิร์นใหม่หลัง barge-in ต้องตอบถูกต้องปกติ')
+
+  const leaked = socket.sent.filter(e => e.event === 'media').some(e => Buffer.from(e.media.payload, 'base64').toString().includes('GHOST_recovery'))
+  assert.equal(leaked, false, 'ห้ามมี audio ของ recovery เก่าหลุดออกไปหลัง barge-in')
+
+  harness.disconnect(socket)
 })

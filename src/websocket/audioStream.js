@@ -37,10 +37,33 @@ const STT_INTERIM_FINALIZE_MS_CHUNKED = 900
 // แล้ว fall through ไปเรียก fresh call ตามปกติ (เหมือนไม่เคยมี prewarm เลย) — ใช้ runAttemptWithWatchdog ตัวเดิม
 // (ออกแบบมาสำหรับ compose child abort จาก outer signal + แยก success/aborted/timeout/error อยู่แล้วจาก C4b)
 //
-// ยังไม่ใส่ watchdog ให้ fresh legacy call เอง (ตอนไม่มี prewarm ให้ใช้เลย) — ต้องออกแบบ recovery policy ก่อน
-// (retry/hedge/canned response) ไม่ใช่แค่ abort() เฉยๆ ที่จะเปลี่ยน "ช้า 11 วิ" เป็น "เงียบแล้วไม่มีคำตอบ" ซึ่งแย่กว่าเดิม
-// เก็บเป็น Commit A2 แยกต่างหาก
 const PREWARM_GRACE_MS = 150
+
+// Commit A2 — legacy's "fresh" Claude call (ไม่ว่าจะไม่เคยมี prewarm เลย หรือ prewarm miss/timeout จาก Commit A
+// แล้วก็ตาม) ยังเป็น `for await (chunk of askClaudeStream(...))` เปล่าๆ ไม่มี deadline เหมือนกัน — production
+// data (หลัง Commit A ปิด incident เดิมแล้ว) ยืนยันว่า fresh call ปกติใช้เวลา 1.1-3.4s แต่ยังไม่มี upper bound
+// ถ้า Claude เกิด tail latency ซ้ำแบบเดิมอีกจะกลับไปค้างไม่มีขอบเขตเหมือนก่อน Commit A
+//
+// ตั้งใจไม่ใช้ retry/hedge (เพิ่ม Claude call คู่ขนาน) เพราะเพิ่ม cost + race ใหม่ที่ต้องจัดการโดยไม่จำเป็นตอนนี้ —
+// เลือก "timeout แล้วพูด recovery phrase คงที่" แทน (รูปแบบเดียวกับที่ silence-timeout ใช้อยู่แล้ว: บอกลูกค้าตรงๆ
+// แล้วรอฟังใหม่ ดีกว่าปล่อยเงียบไม่มีคำตอบ) — genuine Claude error (ไม่ใช่ timeout ไม่ใช่ barge-in) ก็ใช้ recovery
+// phrase เดียวกัน เพราะจากมุมลูกค้าทั้งสองกรณีคือ "ไม่ได้คำตอบ" เหมือนกัน
+//
+// 6000ms กว้างกว่า chunked's CLAUDE_FIRST_DELTA_TIMEOUT_MS (3000ms) มาก เพราะ legacy รอ "คำตอบเต็มก้อน" ไม่ใช่
+// token แรกเหมือน chunked — เผื่อ margin ~2x เหนือค่าปกติสูงสุดที่เห็นจริง (3.4s) ก่อน ปรับได้ทีหลังจากข้อมูลจริง
+//
+// override ผ่าน env var สำหรับเทสเท่านั้น (ต้องตั้งก่อน require ไฟล์นี้ครั้งแรก) — บังคับด้วย NODE_ENV==='test'
+// จริงๆ ไม่ใช่แค่ "convention ว่าไม่ตั้งใน production" เฉยๆ เพราะถ้า Render มี env ตัวนี้หลงค้างอยู่ (ผิดพลาดจาก
+// การตั้งค่าที่ไหนสักที่) legacy production ทั้งหมดจะ timeout ที่ค่านั้นทันทีโดยไม่มีใครตั้งใจ — validate ว่าต้อง
+// เป็นตัวเลขจำกัดค่าและ > 0 ด้วย กัน override ที่ผิดรูปแบบ (เช่น string ว่าง/ติดลบ) หลุดเข้ามาโดยไม่ได้ตั้งใจ
+const legacyClaudeTimeoutTestOverride = Number(process.env.LEGACY_CLAUDE_TIMEOUT_MS_OVERRIDE)
+const LEGACY_FRESH_CLAUDE_TIMEOUT_MS =
+  process.env.NODE_ENV === 'test' && Number.isFinite(legacyClaudeTimeoutTestOverride) && legacyClaudeTimeoutTestOverride > 0
+    ? legacyClaudeTimeoutTestOverride
+    : 6000
+
+// สั้น เป็นธรรมชาติ ไม่พูดคำว่า "ระบบ"/infrastructure — เป้าหมายคือชวนลูกค้าพูดใหม่ ไม่ใช่อธิบายว่าเกิดอะไรขึ้นข้างใน
+const LEGACY_RECOVERY_PHRASE = 'ขอโทษค่ะ เมื่อกี้ตอบช้าไปนิดนึง รบกวนพูดอีกครั้งได้ไหมคะ'
 
 // Checkpoint C5: % rollout ของ chunked-streaming path มาจาก Google Sheets แล้ว (แท็บ "Streaming Config")
 // ผ่าน background polling ของตัวเอง ไม่ใช่ hardcoded คงที่แบบ C0 อีกต่อไป — start() ครั้งเดียวตอน module load
@@ -704,9 +727,72 @@ function registerWebSocket(fastify) {
             if (prewarmPromise === myPrewarm) clearPrewarm()
 
             if (!aiText && !signal.aborted && callActive && isSpeaking) {
-              for await (const chunk of askClaudeStream(currentSession, false, signal)) {
-                if (signal.aborted || !callActive || !isSpeaking) break
-                aiText = (aiText ? aiText + ' ' : '') + chunk
+              const freshAttempt = await runAttemptWithWatchdog({
+                signal,
+                timeoutMs: LEGACY_FRESH_CLAUDE_TIMEOUT_MS,
+                reason: 'LEGACY_CLAUDE_TIMEOUT',
+                run: async (childSignal) => {
+                  let text = ''
+                  try {
+                    for await (const chunk of askClaudeStream(currentSession, false, childSignal)) {
+                      if (childSignal.aborted) break
+                      text += (text ? ' ' : '') + chunk
+                    }
+                  } catch (err) {
+                    // normalize barge-in/watchdog-driven cancellation: ถ้า childSignal ถูก abort ไปแล้ว ให้ resolve
+                    // แบบ graceful แทนที่จะ throw ต่อ — ไม่งั้น runAttemptWithWatchdog จะจัดเป็น outcome:'error' แทน
+                    // 'aborted' (เพราะ helper คืน 'aborted' เฉพาะตอน run() resolve หลัง child ถูก abort เท่านั้น)
+                    // ทำให้ barge-in ถูกเข้าใจผิดเป็น Claude error แล้วพูด recovery phrase ทับเสียงลูกค้าที่กำลังพูดแทรกอยู่
+                    if (childSignal.aborted) return text
+                    throw err // error จริงที่ไม่เกี่ยวกับ abort ต้อง propagate ต่อให้ outcome:'error' เหมือนเดิม
+                  }
+                  return text
+                },
+              })
+
+              let shouldSpeakRecovery = false
+
+              if (freshAttempt.outcome === 'success' && freshAttempt.result?.trim()) {
+                aiText = freshAttempt.result
+              } else if (freshAttempt.outcome === 'success') {
+                // askClaudeStream() yield ข้อความก็ต่อเมื่อยาวอย่างน้อย 3 ตัวอักษรเท่านั้น (ดูตัวมันเอง) — เรียก
+                // Claude สำเร็จแต่ไม่มีอะไรให้พูดออกไปเลยก็ยังถือว่า "ไม่ได้คำตอบที่ใช้ได้" เหมือน timeout/error ทุก
+                // ประการ ต้องพูด recovery phrase เช่นกัน ไม่งั้นลูกค้าจะเจอความเงียบทั้งที่ API เรียกสำเร็จ
+                console.error('[AI/TTS error] Claude ตอบสำเร็จแต่ไม่มีข้อความให้พูดเลย (empty/blank result), speaking recovery phrase')
+                shouldSpeakRecovery = true
+              } else if (freshAttempt.outcome === 'aborted') {
+                // barge-in — ไม่พูด recovery phrase, ไม่ commit อะไร, ปล่อยไหลลง shared tail ตามปกติ (เหมือน
+                // prewarm's aborted branch ด้านบน) เพื่อให้ pendingTranscript (ถ้ามี) ถูก drain ต่อได้
+                console.log('[AI] Fresh Claude call aborted by barge-in — no recovery phrase, turn ends with no audio')
+              } else if (freshAttempt.outcome === 'timeout') {
+                console.error(`[Watchdog] LEGACY_CLAUDE_TIMEOUT — Claude ไม่ตอบภายใน ${LEGACY_FRESH_CLAUDE_TIMEOUT_MS}ms, speaking recovery phrase`)
+                shouldSpeakRecovery = true
+              } else {
+                console.error('[AI/TTS error]', freshAttempt.error.message)
+                healthMonitor.reportError('ai_tts', freshAttempt.error.message)
+                shouldSpeakRecovery = true
+              }
+
+              // timeout/error จริง/success-แต่ข้อความว่างเปล่า — ทั้งสามแบบพูด recovery phrase เดียวกัน (จากมุม
+              // ลูกค้าคือ "ไม่ได้คำตอบที่ใช้ได้" เหมือนกันหมด)
+              if (shouldSpeakRecovery) {
+                console.log('[Recovery] Speaking canned recovery phrase')
+                const recoveryResult = await speakFixedText({
+                  text: LEGACY_RECOVERY_PHRASE, signal, socket, streamSid,
+                  voiceId: currentSession.campaign.voice_id, turnMetrics, turnState, callState, generationId,
+                  startingSentCount: totalSent,
+                })
+                totalSent += recoveryResult.sentCount
+                if (recoveryResult.sentCount > 0) {
+                  // ห้าม assume ว่าพูดจบครบเพียงเพราะประโยคสั้น — speakFixedText() หยุดกลางทางได้จริงถ้า generation
+                  // stale/signal abort/socket ปิดระหว่างพูด (guard อยู่ใน synthesizeAndSend เอง) sentCount>0 พิสูจน์
+                  // แค่ "เริ่มพูดแล้ว" ไม่ใช่ "พูดจบแล้ว" — ต้องเช็คสถานะ ณ ตอนนี้ (หลัง speakFixedText คืนค่าแล้ว) ด้วย
+                  const deliveredFully = !signal.aborted && isCurrentGeneration(callState, generationId) && callActive && socket.readyState === socket.OPEN
+                  fullText = deliveredFully
+                    ? LEGACY_RECOVERY_PHRASE
+                    : '[ระบบ: คำตอบก่อนหน้าถูกขัดจังหวะหลังเริ่มส่งเสียง ลูกค้าอาจได้ยินเพียงบางส่วน]'
+                }
+                // sentCount === 0 → ไม่ commit อะไรเข้า history เลย (fullText คงเป็น '' เหมือนเดิม)
               }
             }
 
