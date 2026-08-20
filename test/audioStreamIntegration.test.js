@@ -2130,3 +2130,133 @@ test('Design B: Context 2 (post-mark <500ms) — ack ที่รู้จัก
 
   harness.disconnect(socket)
 })
+
+// ===== L2a — legacy Claude instrumentation (design locked 2026-08-20, review rounds 1-3) =====
+// พิสูจน์แค่ wiring ระดับ audioStream.js↔turnMetrics เท่านั้น — behavior จริงของ askClaudeObservedFullResponse()
+// เอง (milestone timing, numeric-protection timer mirror, abort/error propagation) มีเทสละเอียดแยกอยู่แล้วใน
+// test/claude.test.js ไม่ต้องพิสูจน์ซ้ำที่นี่
+
+test('L2a: fresh legacy call ปกติ → turnMetrics มี legacyClaude* fields ครบตามที่ควรมี (requestAt/firstDeltaAt/fullAt ไม่ null, outcome=COMPLETED, derived metrics คำนวณได้จริง) และ canonical t2/t3/t4 เดิมไม่ถูกกระทบ', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+
+  state.claudeStreamImpl = async function* () { yield 'สวัสดีค่ะ มีโปรโมชั่นให้ค่ะ' }
+
+  const metrics = await captureMetrics(() => harness.sendFinalTranscript('มีโปรโมชั่นอะไรบ้างคะ'))
+
+  assert.ok(metrics.legacyClaudeRequestAt != null, 'requestAt ต้องถูกเขียนจริง')
+  assert.ok(metrics.legacyClaudeFirstDeltaAt != null, 'firstDeltaAt ต้องถูกเขียนจริง')
+  assert.ok(metrics.legacyClaudeFullAt != null, 'fullAt ต้องถูกเขียนจริง (turn จบปกติ)')
+  assert.equal(metrics.legacyClaudeOutcome, 'COMPLETED')
+  assert.ok(metrics.legacyClaudeTTFTMs != null && metrics.legacyClaudeTTFTMs >= 0, 'derived TTFT ต้องคำนวณได้จริงจาก field ใหม่')
+  assert.ok(metrics.legacyFullCompletionMs != null && metrics.legacyFullCompletionMs >= 0)
+  // harness stub เริ่มต้น (ไม่ได้ set claudeObservedImpl ตรงๆ) ไม่ยิง firstSafeAt สังเคราะห์ให้ — behavior จริงของ
+  // firstSafeAt ถูกพิสูจน์แยกใน test/claude.test.js แล้ว ที่นี่แค่ยืนยันว่า field มีอยู่ (เป็น null ตามความจริงของ stub)
+  assert.equal(metrics.legacyClaudeFirstSafeAt, null)
+  // round-3 correction 3 (ห้ามปน legacyClaude* กับ canonical t2/t3/t4) — ยืนยันว่า t3/t4 ยังเป็น null ตามเดิมเป๊ะ
+  // สำหรับ legacy (comment เดิมใน turnMetrics.js) ไม่ได้ถูก L2a populate ทับโดยไม่ตั้งใจ
+  assert.equal(metrics.t3, null)
+  assert.equal(metrics.t4, null)
+
+  harness.disconnect(socket)
+})
+
+test('L2a integration (required test 17): fresh legacy Claude ค้างเกิน LEGACY_CLAUDE_TIMEOUT → turnMetrics.legacyClaudeOutcome = TIMEOUT, recovery phrase พูดตามพฤติกรรมเดิมทุกประการ', { timeout: 15000 }, async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+
+  state.claudeStreamImpl = async function* () { await new Promise(() => {}) } // ค้างตลอดไป ไม่เคย resolve — บังคับให้ LEGACY_CLAUDE_TIMEOUT (80ms override ของไฟล์นี้) ทำงานจริง
+
+  const metrics = await captureMetrics(() => harness.sendFinalTranscript('ขอสอบถามโปรโมชั่นหน่อยค่ะ'))
+
+  assert.equal(metrics.legacyClaudeOutcome, 'TIMEOUT')
+  const lastAssistant = session.messages.filter(m => m.role === 'assistant').at(-1)
+  assert.equal(lastAssistant?.content, LEGACY_RECOVERY_PHRASE, 'recovery phrase ต้องพูดเหมือน askClaudeStream() เดิมทุกประการ')
+
+  harness.disconnect(socket)
+})
+
+test('L2a integration (required test 18): fresh legacy Claude error กลางทาง (ไม่ใช่ abort) → turnMetrics.legacyClaudeOutcome = ERROR, recovery phrase พูดตามพฤติกรรมเดิมทุกประการ', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+
+  state.claudeStreamImpl = async function* () { throw new Error('boom — จำลอง Claude API ล้มจริงกลางทาง') }
+
+  const metrics = await captureMetrics(() => harness.sendFinalTranscript('ขอสอบถามโปรโมชั่นหน่อยค่ะ'))
+
+  assert.equal(metrics.legacyClaudeOutcome, 'ERROR')
+  const lastAssistant = session.messages.filter(m => m.role === 'assistant').at(-1)
+  assert.equal(lastAssistant?.content, LEGACY_RECOVERY_PHRASE)
+
+  harness.disconnect(socket)
+})
+
+test('L2a integration (required test 19): fresh legacy Claude สำเร็จแต่ไม่มีข้อความให้พูดเลย (ว่างเปล่า) → turnMetrics.legacyClaudeOutcome = EMPTY, recovery phrase พูดตามพฤติกรรมเดิมทุกประการ', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+
+  state.claudeStreamImpl = async function* () {} // ไม่ yield อะไรเลย
+
+  const metrics = await captureMetrics(() => harness.sendFinalTranscript('ขอสอบถามโปรโมชั่นหน่อยค่ะ'))
+
+  assert.equal(metrics.legacyClaudeOutcome, 'EMPTY')
+  const lastAssistant = session.messages.filter(m => m.role === 'assistant').at(-1)
+  assert.equal(lastAssistant?.content, LEGACY_RECOVERY_PHRASE)
+
+  harness.disconnect(socket)
+})
+
+test('L2a integration (required test 15): barge-in ระหว่าง fresh legacy Claude call กำลังรอ → turnMetrics.legacyClaudeOutcome = ABORTED สำหรับเทิร์นเดิม ไม่มีการพูด recovery phrase ทับ', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+
+  let resumeOldTurn
+  const oldTurnGate = new Promise(resolve => { resumeOldTurn = resolve })
+  state.claudeStreamImpl = async function* () {
+    yield 'กำลังตอบคำถามแรก'
+    await oldTurnGate
+  }
+
+  const originalLog = console.log
+  const logs = []
+  console.log = (...args) => { logs.push(args.join(' ')); originalLog(...args) }
+
+  const oldTurnPromise = harness.sendFinalTranscript('คำถามแรกครับ')
+  await delay(30) // ให้เทิร์นแรกเข้าสู่ fresh-call แล้วจริง (isSpeaking=true, sttProcessing=true, ผ่าน askClaudeObservedFullResponse ไปแล้ว)
+
+  state.claudeStreamImpl = async function* () { yield 'ตอบเรื่องถอนเงิน' } // สำหรับเทิร์นใหม่หลัง barge-in
+  await harness.sendFinalTranscript('เดี๋ยวก่อนครับ ขอถามเรื่องถอนเงินก่อน') // ยาวพอ trigger bargeIn จริง
+
+  resumeOldTurn()
+  await oldTurnPromise
+  await delay(20)
+  console.log = originalLog
+
+  const oldMetricsLine = logs.find(l => l.includes('[Metrics]') && l.includes('"generationId":1,'))
+  assert.ok(oldMetricsLine, 'ต้องเจอ [Metrics] log ของเทิร์นแรก (generationId=1)')
+  const oldMetrics = JSON.parse(oldMetricsLine.slice(oldMetricsLine.indexOf('{')))
+  assert.equal(oldMetrics.legacyClaudeOutcome, 'ABORTED')
+  assert.ok(oldMetrics.legacyClaudeFirstDeltaAt != null, 'firstDeltaAt ที่มาถึงก่อน barge-in ต้องยังถูกเก็บไว้')
+  assert.equal(oldMetrics.legacyClaudeFullAt, null, 'fullAt ต้องเป็น null เพราะเทิร์นถูก abort ก่อนจบจริง (ไม่ใช่ full completion)')
+
+  harness.disconnect(socket)
+})
+
+test('L2a: prewarm HIT (grace success) → ไม่มี fresh legacyClaude* timestamp ใดๆ ถูก fabricate เลย เพราะ fresh-call branch ไม่เคยทำงานจริง', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+
+  state.claudeStreamImpl = async function* () { yield 'คำตอบจาก prewarm' } // resolve เร็วมาก ไม่มี await ค้าง — prewarm เองก็ใช้ askClaudeStream() เดิมไม่เปลี่ยน
+
+  harness.sendInterim('อยากทราบโปรโมชั่นสมาชิกใหม่') // trigger startPrewarm() ด้วย interim ยาวพอ
+  await delay(30) // ให้ prewarm resolve จริงก่อน final มาถึง (เร็วกว่า PREWARM_GRACE_MS=150ms มาก)
+
+  const metrics = await captureMetrics(() => harness.sendFinalTranscript('อยากทราบโปรโมชั่นสมาชิกใหม่ครับ')) // isPrewarmUsable ต้อง match กับ interim (final.includes(interim))
+
+  assert.equal(metrics.legacyClaudeRequestAt, null, 'prewarm HIT ต้องไม่เคยเข้า fresh-call branch เลย — ห้าม fabricate requestAt')
+  assert.equal(metrics.legacyClaudeFirstDeltaAt, null)
+  assert.equal(metrics.legacyClaudeFullAt, null)
+  assert.equal(metrics.legacyClaudeOutcome, null, 'ต้องเป็น null เพราะไม่เคยมี fresh attempt เกิดขึ้นจริง')
+
+  harness.disconnect(socket)
+})

@@ -1,6 +1,6 @@
 const callSessions = require('../utils/callSessions')
 const { transcribeStream } = require('../services/googleSTT')
-const { askClaude, askClaudeStream } = require('../services/claude')
+const { askClaude, askClaudeStream, askClaudeObservedFullResponse } = require('../services/claude')
 const { synthesizeSpeechStream } = require('../services/tts')
 const healthMonitor = require('../utils/healthMonitor')
 const { createCallState, bumpGeneration, isCurrentGeneration, endCall } = require('../utils/generationGuard')
@@ -1025,8 +1025,22 @@ function registerWebSocket(fastify) {
                 reason: 'LEGACY_CLAUDE_TIMEOUT',
                 run: async (childSignal) => {
                   let text = ''
+                  // L2a — swap เฉพาะจุดนี้จุดเดียว (fresh legacy call) เป็น askClaudeObservedFullResponse() แทน
+                  // askClaudeStream() เดิม — prewarm (:389) และ runLegacyFallback (:205) ยังเรียก askClaudeStream()
+                  // เหมือนเดิมทุกประการ ไม่ถูกกระทบเลย onLegacyClaudeMilestone เขียนเข้า turnMetrics ทันทีที่แต่ละ
+                  // milestone มาถึงจริง (ไม่รอ callback เดียวตอนจบ) กัน turn ที่ abort/timeout/error กลางทางเสีย data
+                  const onLegacyClaudeMilestone = (key, value) => {
+                    const fieldMap = {
+                      requestAt: 'legacyClaudeRequestAt',
+                      firstDeltaAt: 'legacyClaudeFirstDeltaAt',
+                      firstSafeAt: 'legacyClaudeFirstSafeAt',
+                      fullAt: 'legacyClaudeFullAt',
+                    }
+                    const field = fieldMap[key]
+                    if (field && turnMetrics[field] == null) turnMetrics[field] = value
+                  }
                   try {
-                    for await (const chunk of askClaudeStream(currentSession, false, childSignal)) {
+                    for await (const chunk of askClaudeObservedFullResponse(currentSession, childSignal, onLegacyClaudeMilestone)) {
                       if (childSignal.aborted) break
                       text += (text ? ' ' : '') + chunk
                     }
@@ -1044,25 +1058,31 @@ function registerWebSocket(fastify) {
 
               let shouldSpeakRecovery = false
 
+              // L2a — legacyClaudeOutcome แยกจาก legacyClaudeFirstSafeAt=null โดยตั้งใจ (ดู comment ที่ turnMetrics.js)
               if (freshAttempt.outcome === 'success' && freshAttempt.result?.trim()) {
                 aiText = freshAttempt.result
+                turnMetrics.legacyClaudeOutcome = 'COMPLETED'
               } else if (freshAttempt.outcome === 'success') {
                 // askClaudeStream() yield ข้อความก็ต่อเมื่อยาวอย่างน้อย 3 ตัวอักษรเท่านั้น (ดูตัวมันเอง) — เรียก
                 // Claude สำเร็จแต่ไม่มีอะไรให้พูดออกไปเลยก็ยังถือว่า "ไม่ได้คำตอบที่ใช้ได้" เหมือน timeout/error ทุก
                 // ประการ ต้องพูด recovery phrase เช่นกัน ไม่งั้นลูกค้าจะเจอความเงียบทั้งที่ API เรียกสำเร็จ
                 console.error('[AI/TTS error] Claude ตอบสำเร็จแต่ไม่มีข้อความให้พูดเลย (empty/blank result), speaking recovery phrase')
                 shouldSpeakRecovery = true
+                turnMetrics.legacyClaudeOutcome = 'EMPTY'
               } else if (freshAttempt.outcome === 'aborted') {
                 // barge-in — ไม่พูด recovery phrase, ไม่ commit อะไร, ปล่อยไหลลง shared tail ตามปกติ (เหมือน
                 // prewarm's aborted branch ด้านบน) เพื่อให้ pendingTranscript (ถ้ามี) ถูก drain ต่อได้
                 console.log('[AI] Fresh Claude call aborted by barge-in — no recovery phrase, turn ends with no audio')
+                turnMetrics.legacyClaudeOutcome = 'ABORTED'
               } else if (freshAttempt.outcome === 'timeout') {
                 console.error(`[Watchdog] LEGACY_CLAUDE_TIMEOUT — Claude ไม่ตอบภายใน ${LEGACY_FRESH_CLAUDE_TIMEOUT_MS}ms, speaking recovery phrase`)
                 shouldSpeakRecovery = true
+                turnMetrics.legacyClaudeOutcome = 'TIMEOUT'
               } else {
                 console.error('[AI/TTS error]', freshAttempt.error.message)
                 healthMonitor.reportError('ai_tts', freshAttempt.error.message)
                 shouldSpeakRecovery = true
+                turnMetrics.legacyClaudeOutcome = 'ERROR'
               }
 
               // timeout/error จริง/success-แต่ข้อความว่างเปล่า — ทั้งสามแบบพูด recovery phrase เดียวกัน (จากมุม

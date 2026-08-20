@@ -1,4 +1,6 @@
 const Anthropic = require('@anthropic-ai/sdk')
+const { performance } = require('perf_hooks')
+const { findChunkBoundary, getNumericProtectionRemainingMs } = require('../utils/speechChunker')
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
 
@@ -286,4 +288,116 @@ async function* askClaudeStreamChunked(session, signal = null, onControl = null)
   }
 }
 
-module.exports = { askClaude, askClaudeStream, askClaudeStreamChunked, summarizeCall }
+// ==========================================================================
+// askClaudeObservedFullResponse — L2a (legacy Claude instrumentation, design locked 2026-08-20)
+// ==========================================================================
+// askClaudeStream() ด้านบน "ไม่ได้ streaming จริง" — เรียก client.messages.create() (blocking, รอเต็มก้อน)
+// แล้ว yield ข้อความเต็มครั้งเดียว จึงไม่มีทางวัด first-delta/first-safe-sentence จริงได้เลย แต่ askClaudeStream()
+// ถูกใช้ร่วมกันถึง 3 จุด (fresh legacy :1029, legacy prewarm :389, runLegacyFallback :205 ของ chunked-path) —
+// ห้ามแก้ transport ของฟังก์ชันเดิมเด็ดขาด เพราะจะเปลี่ยน abort/error/timing semantics ของทั้ง 3 จุดพร้อมกันทั้งที่
+// ตั้งใจ isolate แค่ fresh-call site เดียวเพื่อสังเกตการณ์ (design review round 2, ยืนยันจาก grep จริง)
+//
+// ฟังก์ชันนี้จึงแยกต่างหากสมบูรณ์ — clone config จาก askClaudeStream() ทุกจุด (model/max_tokens/thinking/effort/
+// system prompt/cache_control/messages) เปลี่ยนแค่ transport เป็น client.messages.stream() แล้วยัง yield ข้อความ
+// เต็มครั้งเดียวตอนจบเหมือนเดิมทุกประการ — ผู้เรียก (audioStream.js) ยังเริ่ม TTS หลัง full completion เท่านั้น
+// ไม่มีการเริ่มพูดเร็วขึ้นเลยจาก L2a — เป็น instrumentation ล้วนๆ
+//
+// onMilestone(key, value) ถูกเรียกทันทีที่แต่ละเหตุการณ์เกิดขึ้นจริง (ไม่รอ callback เดียวตอนจบ) เพื่อไม่ให้ turn
+// ที่ abort/timeout/error กลางทางเสีย TTFT/first-safe data ไปทั้งหมด (dataset bias ไปทาง successful turns) —
+// pattern เดียวกับ onChunkTelemetry ที่ L1c2a ใช้อยู่แล้ว: key ที่เป็นไปได้คือ requestAt/firstDeltaAt/firstSafeAt/
+// fullAt — fullAt ถูกเรียกเฉพาะตอน stream จบตามปกติเท่านั้น (ไม่เรียกถ้า abort/error — ปล่อย null ตามจริง)
+//
+// firstSafeAt ใช้ findChunkBoundary()/getNumericProtectionRemainingMs() จาก speechChunker.js ตรงๆ (import only,
+// ไม่แก้ไฟล์นั้นเลย) — elapsedMs คำนวณจาก firstDeltaAt (เวลาที่ตัวอักษรแรกของ buffer นี้มาถึงจริง) ตาม contract
+// ของ speechChunker.js ("เวลานับจากตัวอักษรแรกของ buffer ปัจจุบันมาถึง") ไม่ใช่จาก request start — ถ้าใช้ request
+// start จะทำให้ turn ที่ Claude TTFT ช้าอยู่แล้ว (เช่น 900ms) ดูเหมือนมี "safe chunk พร้อมเร็ว" เกินจริงทันทีที่
+// delta แรกมาถึง ทั้งที่ buffer เพิ่งเริ่มสะสมจริงๆ แค่เสี้ยววินาที
+//
+// mirror wall-clock numeric-protection re-check ของ createChunkedProducer()'s drainReadyChunks() (chunkedTurn.js)
+// ด้วย — ถ้า buffer ลงท้ายด้วยตัวเลข (เช่น "รับ 2,000") findChunkBoundary() จะคืน null จนกว่าจะครบ HARD_MAX_MS แต่
+// ถ้าไม่มี delta ใหม่มาปลุกเลย (Claude เงียบ) จะไม่มีใครมา re-check เอง — arm setTimeout ผ่าน
+// getNumericProtectionRemainingMs() เหมือนกันเป๊ะ ต่างจาก producer จริงตรงที่ L2a สนใจแค่ safe boundary "ตัวแรก"
+// เท่านั้น หยุด watch ทันทีที่เจอ ไม่ต้อง loop/drain หลายก้อนต่อแบบ producer จริงที่ดูแลทั้งเทิร์น
+async function* askClaudeObservedFullResponse(session, signal = null, onMilestone = null) {
+  const { name, campaign, messages } = session
+  const systemPrompt = buildSystemPrompt(campaign.script || campaign.system_prompt, name)
+  const history = messages.slice(-MAX_HISTORY)
+
+  if (!history.length) { yield 'สวัสดีค่ะ'; return }
+
+  const cachedMsgs = history.map((m, i) =>
+    i === history.length - 1
+      ? { role: m.role, content: [{ type: 'text', text: m.content, cache_control: { type: 'ephemeral' } }] }
+      : m
+  )
+
+  const requestAt = performance.now()
+  onMilestone?.('requestAt', requestAt)
+
+  const stream = client.messages.stream({
+    model: 'claude-sonnet-4-6',
+    max_tokens: 200,
+    thinking: { type: 'disabled' },
+    output_config: { effort: 'low' },
+    system: [
+      { type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } }
+    ],
+    messages: cachedMsgs,
+  }, { signal })
+
+  let text = ''
+  let firstDeltaAt = null
+  let firstSafeAt = null
+  let numericProtectionTimer = null
+
+  function clearNumericProtectionTimer() {
+    if (numericProtectionTimer) { clearTimeout(numericProtectionTimer); numericProtectionTimer = null }
+  }
+
+  function checkFirstSafe() {
+    if (firstSafeAt !== null || firstDeltaAt === null) return
+    const elapsedMs = performance.now() - firstDeltaAt
+    const result = findChunkBoundary(text, elapsedMs)
+    if (result) {
+      firstSafeAt = performance.now()
+      onMilestone?.('firstSafeAt', firstSafeAt)
+      clearNumericProtectionTimer()
+      return
+    }
+    clearNumericProtectionTimer()
+    const remainingMs = getNumericProtectionRemainingMs(text, elapsedMs)
+    if (remainingMs != null) {
+      numericProtectionTimer = setTimeout(() => {
+        numericProtectionTimer = null
+        if (signal?.aborted) return
+        checkFirstSafe()
+      }, remainingMs)
+    }
+  }
+
+  try {
+    for await (const event of stream) {
+      if (signal?.aborted) return
+      if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
+        if (firstDeltaAt === null) {
+          firstDeltaAt = performance.now()
+          onMilestone?.('firstDeltaAt', firstDeltaAt)
+        }
+        text += event.delta.text
+        checkFirstSafe()
+      }
+    }
+  } finally {
+    clearNumericProtectionTimer() // stream จบแล้ว (ปกติหรือ error/abort) — ไม่ต้องรอ expiry timer อีกต่อไป
+  }
+
+  if (signal?.aborted) return
+
+  const fullAt = performance.now()
+  onMilestone?.('fullAt', fullAt)
+
+  const trimmed = text.trim()
+  if (trimmed.length >= 3) yield trimmed
+}
+
+module.exports = { askClaude, askClaudeStream, askClaudeStreamChunked, askClaudeObservedFullResponse, summarizeCall }

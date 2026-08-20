@@ -20,6 +20,12 @@ function ensureStubbed() {
     claudeStreamImpl: async function* () { yield 'default legacy response.' }, // askClaudeStream(session, isGreeting, signal)
     claudeStreamChunkedImpl: async function* () {}, // askClaudeStreamChunked(session, signal, onControl)
     askClaudeImpl: async () => 'สวัสดีค่ะ',
+    // L2a — askClaudeObservedFullResponse(session, signal, onMilestone) ที่ fresh legacy call site ใช้จริงตอนนี้
+    // (แทน askClaudeStream() เฉพาะจุดนั้น) ค่า default เป็น null: ให้ stub ด้านล่าง delegate ไปที่ claudeStreamImpl
+    // ตัวเดียวกับที่เทสเดิมทั้งหมดใช้คุม legacy fresh-call behavior อยู่แล้ว (ยิง synthetic milestone ประกอบไปด้วย
+    // เทสเดิมไม่สนใจ field พวกนี้จึงไม่กระทบ) — เทสที่ต้องการคุม milestone/behavior ของ L2a โดยเฉพาะค่อย set
+    // claudeObservedImpl ตรงๆ แทน
+    claudeObservedImpl: null,
     ttsImpl: async function* () { yield Buffer.from('audio') }, // synthesizeSpeechStream(text, voiceId, signal)
     rolloutPercent: 0,
     lastSttCallbacks: null, // { onTranscript, onInterim } — set สดทุกครั้งที่มี connection ใหม่เปิด sttStream
@@ -32,6 +38,23 @@ function ensureStubbed() {
       askClaude: (...args) => state.askClaudeImpl(...args),
       askClaudeStream: (session, isGreeting, signal) => state.claudeStreamImpl(session, isGreeting, signal),
       askClaudeStreamChunked: (session, signal, onControl) => state.claudeStreamChunkedImpl(session, signal, onControl),
+      askClaudeObservedFullResponse: (session, signal, onMilestone) => {
+        if (state.claudeObservedImpl) return state.claudeObservedImpl(session, signal, onMilestone)
+        return (async function* () {
+          onMilestone?.('requestAt', Date.now())
+          let first = true
+          for await (const chunk of state.claudeStreamImpl(session, false, signal)) {
+            if (first) { onMilestone?.('firstDeltaAt', Date.now()); first = false }
+            yield chunk
+          }
+          // mirror guard เดียวกับ askClaudeObservedFullResponse() จริงที่ claude.js (ก่อน commit gate เจอ gap:
+          // stub เดิมไม่มี guard นี้ ทำให้ turn ที่ barge-in/abort ระหว่างรอ state.claudeStreamImpl ค้างอยู่ กลับยิง
+          // fullAt ทั้งที่ signal อาจ abort ไปแล้วก่อนหน้า — ไม่ตรงกับพฤติกรรมจริงที่มี explicit signal.aborted check
+          // ก่อน record fullAt เสมอ) ต้อง mirror ให้ตรงเพื่อให้เทสที่ผ่าน stub นี้สะท้อนพฤติกรรมจริงได้ถูกต้อง
+          if (signal?.aborted) return
+          onMilestone?.('fullAt', Date.now())
+        })()
+      },
     },
   }
 

@@ -33,6 +33,19 @@ function createTurnMetrics({ callSid, generationId, path, rolloutBucket, rollout
     prewarmAgeAtFinalMs: null, // อายุของ speculation ณ ตอน final transcript มาถึงจริง (snapshot ก่อน grace ใดๆ)
     prewarmOutcome: null, // BUFFERED_HIT/READY_HIT/CONTROL_ONLY_HIT/DELTA_ONLY_HIT/GRACE_HIT/GRACE_TIMEOUT_FRESH/MISMATCH_FRESH/EMPTY_FRESH/ERROR_FRESH/ABORTED
     prewarmBufferedChunks: null, // จำนวน chunk ที่ค้างใน queue ตอน adopt (หรือ null ถ้าไม่มี speculation)
+    // L2a (legacy Claude instrumentation, design locked 2026-08-20) — แยกจาก canonical t2/t3/t4 โดยตั้งใจ ห้ามปน
+    // กัน: t2 เดิม mark ก่อนรอ prewarm grace (150ms) เสมอ ถ้า populate t3 แล้วคำนวณ t3-t2 จะได้ "grace + provider
+    // TTFT" ปนกัน ไม่ใช่ Claude TTFT จริงล้วนๆ — field ชุดนี้ผูกกับ askClaudeObservedFullResponse() เท่านั้น (fresh
+    // legacy call path เดียว) เขียนค่าทันทีที่แต่ละ milestone มาถึงจริง ไม่รอ callback เดียวตอนจบ เพื่อไม่ให้ turn
+    // ที่ abort/timeout/error กลางทางเสีย data ไปทั้งหมด (ยังคง null ตามจริงถ้าไม่ถึง milestone นั้น ไม่ fabricate)
+    legacyClaudeRequestAt: null,
+    legacyClaudeFirstDeltaAt: null,
+    legacyClaudeFirstSafeAt: null,
+    legacyClaudeFullAt: null,
+    // COMPLETED/ABORTED/TIMEOUT/ERROR/EMPTY — แยกจาก legacyClaudeFirstSafeAt=null โดยตั้งใจ เพราะ "ไม่มี early
+    // boundary เลย" (Claude ตอบสั้นจนจบก่อนเจอ boundary) กับ "transport ล้มเหลวก่อนตอบ" เป็นคนละคำถามกัน — ไม่งั้น
+    // วิเคราะห์ทีหลังจะแยกไม่ออกว่า null เพราะอะไร
+    legacyClaudeOutcome: null,
   }
 }
 
@@ -52,6 +65,13 @@ function computeDerivedMetrics(metrics) {
     chunkDelay: duration(metrics.t3, metrics.t4),
     ttsTTFB: duration(metrics.t5, metrics.t6),
     requestToAudio: duration(metrics.t2, metrics.t7),
+    // L2a — คนละ namespace จาก t2-t7 โดยตั้งใจ (ดู comment ที่ createTurnMetrics) legacyEarlyOpportunityMs คือ
+    // ตัวเลขหลักที่ใช้ตัดสิน L2b: ช่วงเวลาที่ TTS "อาจจะ" เริ่มพูดได้เร็วกว่าที่เป็นอยู่ตอนนี้ ถ้ามี first-safe-sentence
+    // TTS architecture จริง (ยังไม่มีตอนนี้ — L2a วัดเฉยๆ ไม่เริ่มพูดเร็วขึ้นเลย)
+    legacyClaudeTTFTMs: duration(metrics.legacyClaudeRequestAt, metrics.legacyClaudeFirstDeltaAt),
+    legacyFirstSafeMs: duration(metrics.legacyClaudeRequestAt, metrics.legacyClaudeFirstSafeAt),
+    legacyFullCompletionMs: duration(metrics.legacyClaudeRequestAt, metrics.legacyClaudeFullAt),
+    legacyEarlyOpportunityMs: duration(metrics.legacyClaudeFirstSafeAt, metrics.legacyClaudeFullAt),
   }
 }
 
