@@ -579,14 +579,19 @@ test('L1c2a) chunk แรกของเทิร์น → previousText เป�
   assert.equal(previousTexts[0], null)
 })
 
-test('L1c2a) chunk ที่สอง → previousText ตรงกับข้อความ chunk แรกที่เพิ่งพูดจบไปเป๊ะ', async () => {
+// L1c2a incident hotfix (production 2026-08-20) — ENABLE_PREVIOUS_TEXT_CONTINUITY ถูกปิดไว้ชั่วคราวใน
+// chunkedTurn.js (ElevenLabs ตอบ 400 ทันทีตอนมี previous_text — ยังไม่ยืนยัน root cause แน่ชัด) ดังนั้น chunk ที่
+// สองต้องได้ previousText=null เสมอ ไม่ใช่เพราะ previousChunkText ไม่ถูก track (ยัง track อยู่ครบ) แต่เพราะ caller
+// ตั้งใจไม่ส่งออกไปจนกว่าจะ flip ค่านี้กลับเป็น true — เทสนี้เคย assert ว่า previousText ตรงกับ chunk ก่อนหน้า
+// เป๊ะ (ตอน kill-switch ยังไม่มี) ต้อง restore assertion เดิมกลับมาพร้อมกับตอนที่ flip กลับเป็น true
+test('L1c2a) chunk ที่สอง → previousText ที่ส่งจริงเข้า TTS เป็น null ขณะ kill-switch ปิดอยู่ (ไม่ใช่เพราะ track ไม่ได้)', async () => {
   state.claudeImpl = fakeClaude(['Hello. ', 'World.'])
   const previousTexts = []
   state.ttsImpl = async function* (text, voiceId, signal, previousText) { previousTexts.push(previousText); yield Buffer.from('a') }
   const socket = makeSocket()
   const { turnMetrics, turnState, callState, generationId } = makeMetricsAndState()
   await runChunkedTurn({ session: {}, signal: null, socket, streamSid: 'SS1', voiceId: 'v1', turnMetrics, turnState, callState, generationId })
-  assert.equal(previousTexts[1], 'Hello.')
+  assert.equal(previousTexts[1], null, 'kill-switch ปิดอยู่ — ห้ามส่ง previous_text ไป ElevenLabs เลยจนกว่าจะยืนยัน root cause แล้วเปิดกลับ')
 })
 
 test('L1c2a) chunk ที่ไม่เคยถูกพูดจริง (sentCount=0 เพราะ socket ปิดกลางทาง) → ไม่กลายเป็น previousText ของ chunk ถัดไป', async () => {

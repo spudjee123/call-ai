@@ -316,6 +316,14 @@ function createChunkedProducer({ session, signal, getIsValid = () => true }) {
 // TTS → Twilio เหมือน consumer loop เดิมทุกประการ (C3b boundary 3/4+5 ยังอยู่ครบ ผ่าน isCurrent ที่ผูกกับ
 // generationId/callState จริงเสมอ — จุดนี้ไม่เคยเสีย generation guard เลยตั้งแต่แรก เพราะ generationId/callState
 // มีให้ใช้แค่ตอน adopt เท่านั้นอยู่แล้ว)
+// L1c2a incident hotfix (production 2026-08-20) — chunk ที่ 2 ของเทิร์นแรกที่มี previous_text พัง ElevenLabs
+// ด้วย "Request failed with status code 400" ทันที (~30ms, ไม่ใช่ timeout) chunk แรก (ไม่มี previous_text) สำเร็จ
+// ปกติทุกครั้ง — correlation ชัดพอที่จะปิด previous_text ไว้ก่อนชั่วคราว จนกว่าจะยืนยัน root cause แน่ชัดด้วย
+// [TTSProviderError] telemetry ใหม่ (ดู elevenlabs.js) เป็น reversible kill-switch ที่ caller layer เท่านั้น —
+// ไม่ลบ previousChunkText state หรือ API parameter ออกจาก TTS/ElevenLabs เด็ดขาด (นั่นคือ rollback ทั้ง L1c2a
+// architecture ซึ่งเกินสโคปของ incident นี้) — flip กลับเป็น true ได้ทันทีเมื่อยืนยัน root cause แล้วแก้ต้นตอจริง
+const ENABLE_PREVIOUS_TEXT_CONTINUITY = false
+
 async function adoptChunkedProducer({ producer, signal, socket, streamSid, voiceId, turnMetrics, turnState, callState, generationId, onControl, onFirstAudioSent, onAudioSent, onFirstTtsRequest, onFirstTtsAudio }) {
   const isCurrent = () => isCurrentGeneration(callState, generationId)
   producer.attachForwarder(control => { if (control?.type === 'end_call') onControl?.(control) })
@@ -343,7 +351,7 @@ async function adoptChunkedProducer({ producer, signal, socket, streamSid, voice
       const sent = await synthesizeAndSend({
         text: chunk, signal, socket, streamSid, voiceId, turnMetrics, turnState, isCurrent,
         startingSentCount: totalSent, onFirstAudioSent, onAudioSent, onFirstTtsRequest, onFirstTtsAudio,
-        previousText: previousChunkText,
+        previousText: ENABLE_PREVIOUS_TEXT_CONTINUITY ? previousChunkText : null,
         onChunkTelemetry: (telemetry) => {
           console.log('[ChunkMetrics]', JSON.stringify({
             callSid: turnMetrics.callSid,

@@ -10,6 +10,86 @@ const DEFAULT_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || 'GolXPCpsnS5QBmdAYjj
 // แล้วเรา downsample 16k→8k เอง ได้คุณภาพดีกว่า
 const OUTPUT_FORMAT = 'pcm_16000'
 
+// L1c2a incident follow-up (production 2026-08-20) — err.message ของ axios ("Request failed with status code
+// 400") ไม่บอกสาเหตุจริงเลย ทำให้ incident แรกวิเคราะห์ root cause ได้แค่จาก correlation ไม่มี response body จริง
+// มายืนยัน — readErrorResponseBody() อ่าน err.response.data แบบ defensive เพราะ responseType:'stream' ทำให้
+// data เป็น readable stream แม้ตอน error ก็ตาม (ไม่ใช่ parsed JSON/string อัตโนมัติเหมือน request ปกติ) bounded
+// ไว้ที่ MAX_ERROR_BODY_BYTES กัน body ใหญ่ผิดปกติหลุดเข้า log เต็มก้อน
+const MAX_ERROR_BODY_BYTES = 8192
+
+// byte cap (break ที่ MAX_ERROR_BODY_BYTES) กัน "อ่านเยอะเกินไป" แต่ไม่ได้กัน "อ่านนานเกินไป" — ถ้า connection
+// ค้างกลางทาง (ไม่มี data/error/end event เพิ่มมาเลย) for-await จะรอ next() เฉยๆ ไม่มีที่สิ้นสุด ซึ่งจะไปบล็อก
+// throw err ตัวเดิมใน synthesizeSpeechStream ด้วย — ทำให้ observability (telemetry) กลายเป็น availability
+// dependency ของ error path จริง จึงต้องมี wall-clock timeout คู่กับ byte cap เสมอ
+const ERROR_BODY_READ_TIMEOUT_MS = 2000
+
+async function readBoundedStream(stream) {
+  let timeoutHandle
+  const timeoutPromise = new Promise((resolve) => {
+    timeoutHandle = setTimeout(() => {
+      try { stream.destroy?.() } catch { /* best-effort cleanup เท่านั้น ไม่ให้ throw ทับ timeout result */ }
+      resolve(null)
+    }, ERROR_BODY_READ_TIMEOUT_MS)
+    timeoutHandle.unref?.()
+  })
+
+  const readPromise = (async () => {
+    try {
+      const parts = []
+      let total = 0
+      for await (const chunk of stream) {
+        const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+        parts.push(buf)
+        total += buf.length
+        if (total >= MAX_ERROR_BODY_BYTES) break
+      }
+      return Buffer.concat(parts).subarray(0, MAX_ERROR_BODY_BYTES).toString('utf8')
+    } catch {
+      return null
+    }
+  })()
+
+  try {
+    return await Promise.race([readPromise, timeoutPromise])
+  } finally {
+    clearTimeout(timeoutHandle)
+  }
+}
+
+async function readErrorResponseBody(err) {
+  const data = err.response?.data
+  if (data == null) return null
+  if (typeof data === 'string') return data.slice(0, MAX_ERROR_BODY_BYTES)
+  if (Buffer.isBuffer(data)) return data.subarray(0, MAX_ERROR_BODY_BYTES).toString('utf8')
+  if (typeof data[Symbol.asyncIterator] === 'function' || typeof data.on === 'function') {
+    return readBoundedStream(data)
+  }
+  try { return JSON.stringify(data).slice(0, MAX_ERROR_BODY_BYTES) } catch { return null }
+}
+
+// ไม่เคย throw จาก path นี้เอง (ห้าม logging ทำให้ error path ของ caller พังซ้ำ) และไม่เคยสร้าง error ใหม่ — แค่
+// log แล้วให้ caller เป็นคน rethrow err ตัวเดิมเป๊ะ เพราะ upstream (chunkedTurn.js/audioStream.js) ใช้ err.source/
+// error object เดิมในการจัดหมวด fallback อยู่แล้ว ห้าม log headers/api key หรือ axios config ทั้งก้อนเด็ดขาด
+async function logElevenLabsProviderError(err, { modelId, hasPreviousText, textLength, previousTextLength }) {
+  let responseData = 'unavailable'
+  try {
+    const body = await readErrorResponseBody(err)
+    if (body != null) responseData = body
+  } catch {
+    // เก็บ 'unavailable' ไว้ตามเดิม
+  }
+  console.error('[TTSProviderError]', JSON.stringify({
+    provider: 'elevenlabs',
+    status: err.response?.status ?? null,
+    statusText: err.response?.statusText ?? null,
+    modelId,
+    hasPreviousText,
+    textLength,
+    previousTextLength,
+    responseData,
+  }))
+}
+
 // Downsample 16kHz PCM → 8kHz PCM โดย average ทุก 2 samples
 // integer ratio 2:1 = clean, ไม่มี interpolation artifact
 // การ average เป็น low-pass filter ตัด frequency > 4kHz (Nyquist สำหรับ 8kHz)
@@ -91,18 +171,34 @@ async function* synthesizeSpeechStream(text, voiceId, signal, previousText) {
   }
   if (previousText) body.previous_text = previousText
 
-  const response = await axios.post(
-    `${BASE_URL}/text-to-speech/${voiceId}/stream?output_format=${OUTPUT_FORMAT}`,
-    body,
-    {
-      headers: {
-        'xi-api-key': API_KEY,
-        'Content-Type': 'application/json',
-      },
-      responseType: 'stream',
-      signal,  // AbortController signal สำหรับ barge-in
+  let response
+  try {
+    response = await axios.post(
+      `${BASE_URL}/text-to-speech/${voiceId}/stream?output_format=${OUTPUT_FORMAT}`,
+      body,
+      {
+        headers: {
+          'xi-api-key': API_KEY,
+          'Content-Type': 'application/json',
+        },
+        responseType: 'stream',
+        signal,  // AbortController signal สำหรับ barge-in
+      }
+    )
+  } catch (err) {
+    // barge-in ที่ยกเลิก request กลางทางไม่ใช่ provider error จริง — ไม่ log เป็น [TTSProviderError] (จะกลาย
+    // เป็น log noise มหาศาลเพราะ barge-in เกิดเป็นปกติทุกสาย) ใช้ convention เดียวกับที่อื่นในโค้ดฐาน (audioStream.js)
+    // ที่กัน ERR_CANCELED/CanceledError ไว้แล้วก่อน log เป็น error จริง
+    if (err.code !== 'ERR_CANCELED' && err.name !== 'CanceledError') {
+      await logElevenLabsProviderError(err, {
+        modelId: 'eleven_v3',
+        hasPreviousText: Boolean(previousText),
+        textLength: text?.length ?? 0,
+        previousTextLength: previousText?.length ?? 0,
+      })
     }
-  )
+    throw err
+  }
 
   let pcmBuffer = Buffer.alloc(0)   // incomplete 4-byte PCM frames
   let mulawBuffer = Buffer.alloc(0) // incomplete 160-byte μ-law chunks
