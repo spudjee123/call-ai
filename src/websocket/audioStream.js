@@ -125,6 +125,68 @@ function recordChunkedPrewarmMetrics(metrics, handle, finalAcceptedAt, outcome) 
   metrics.prewarmBufferedChunks = handle.producer.queue.length
 }
 
+// Design B (short-ack lifecycle fix, production incident 2026-08-20, design rounds 1-6) — คำรับคำสั้นที่ลูกค้า
+// พูดจริง (ครับ/ค่ะ/โอเค/ok ฯลฯ) เคยหายไปเงียบๆ เพราะ echo/short-fragment filter ที่ตั้งใจกัน PSTN echo ของ AI
+// เอง — แก้ด้วย whitelist ที่แยก 2 tier ตามโครงสร้างคำ (ไม่ใช่ความยาว เพราะภาษาไทยไม่มี space ระหว่างคำ ทำให้
+// wordCount เดิมไม่มีความหมาย): Tier 1 (คำผสม เช่น "โอเคครับ") เสี่ยง false-echo ต่ำกว่า อนุญาต bargeIn ทันทีได้
+// แม้ระหว่าง AI พูดอยู่ ส่วน Tier 2 (particle เดี่ยว เช่น "ครับ"/"ค่ะ") คือคำที่ AI เองพูดลงท้ายประโยคบ่อยที่สุด
+// จึงเสี่ยง false-echo สูงสุด — ต้อง defer ไว้จนกว่าจะยืนยันได้ว่า AI พูดจบจริง (ผ่าน owned mark หรือ no-audio
+// completion) ก่อนค่อยส่งเป็น turn ใหม่ ไม่ bargeIn ทันทีเด็ดขาด
+//
+// normalizeForClassification ใช้เปรียบเทียบกับ whitelist เท่านั้น — ค่าที่เก็บใน pendingShortAck/ส่งเข้า Claude
+// ยังเป็น raw text จาก STT เป๊ะเสมอ ไม่ตัด punctuation/case ทิ้งจากข้อความจริง
+function normalizeForClassification(text) {
+  return text
+    .trim()
+    .replace(/[.!?,]+$/, '')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, '')
+}
+
+const TIER1_ACKS = new Set(
+  ['โอเคครับ', 'โอเคค่ะ', 'ใช่ครับ', 'ใช่ค่ะ', 'ไม่ครับ', 'ไม่ค่ะ', 'ไม่มีแล้ว', 'ok ครับ', 'ok ค่ะ']
+    .map(normalizeForClassification)
+)
+const TIER2_ACKS = new Set(
+  ['ครับ', 'ค่ะ', 'ใช่', 'ไม่', 'โอเค', 'ok']
+    .map(normalizeForClassification)
+)
+
+function classifyAck(rawText) {
+  const norm = normalizeForClassification(rawText)
+  if (TIER1_ACKS.has(norm)) return 'TIER1'
+  if (TIER2_ACKS.has(norm)) return 'TIER2'
+  return null
+}
+
+// Owned-mark encoding (design round 5-6) — mark เดิมเป็นแค่ชื่อ (เช่น "ai_done") ไม่มี owner identity เลย ทำให้
+// mark ที่มาช้า (จาก pipeline เก่าที่ถูก barge-in ไปแล้ว หรือ turn อื่นที่เพิ่งจบ) มา unlock isSpeaking/consume
+// pendingShortAck ของ pipeline ปัจจุบันผิดตัวได้ (race จริงที่ยืนยันจาก code review) — ฝัง owner id (activePipelineId
+// ตอนที่ mark session เริ่ม) ต่อท้ายชื่อ mark เป็น "kind:ownerId" แล้วตรวจตอนรับกลับว่าตรงกับ activePipelineId
+// ปัจจุบันจริงก่อนทำ side effect ใดๆ — KNOWN_MARK_KINDS + positive-integer-only owner กัน mark ที่ผิดรูปแบบ
+// (mismatched kind, "0", ลบ, ทศนิยม, ไม่ใช่ตัวเลข) หลุดเข้ามาโดยไม่ตั้งใจ
+const KNOWN_MARK_KINDS = new Set(['ai_done', 'greeting_done', 'silence_done'])
+
+function ownedMarkName(kind, ownerId) {
+  return `${kind}:${ownerId}`
+}
+
+function parseMarkName(name) {
+  if (typeof name !== 'string') return { kind: null, ownerId: null }
+  const idx = name.lastIndexOf(':')
+  const kind = idx === -1 ? name : name.slice(0, idx)
+  if (!KNOWN_MARK_KINDS.has(kind)) return { kind: null, ownerId: null }
+  const ownerIdStr = idx === -1 ? '' : name.slice(idx + 1)
+  if (!/^[1-9]\d*$/.test(ownerIdStr)) return { kind, ownerId: null }
+  const ownerId = Number(ownerIdStr)
+  // regex เดียวยอมให้เลขยาวเกิน Number.MAX_SAFE_INTEGER ผ่านมาได้ (เช่น "9007199254740992" ยัง match ^[1-9]\d*$)
+  // แต่ Number(...) จะปัดเศษ/สูญเสีย precision จริง ทำให้ ownerId ที่ได้อาจไม่ตรงกับ activePipelineId ที่ตั้งใจ
+  // ส่งมาเป๊ะ ต้องเช็ค safe-integer ซ้ำอีกชั้นหลังแปลงแล้วเสมอ
+  if (!Number.isSafeInteger(ownerId) || ownerId <= 0) return { kind, ownerId: null }
+  return { kind, ownerId }
+}
+
 function shouldBlockEndCall(session, aiResponse) {
   const userMessages = session.messages.filter(m => m.role === 'user')
   const lastUserMsg = userMessages.at(-1)?.content ?? ''
@@ -203,6 +265,8 @@ function registerWebSocket(fastify) {
     let pendingTranscript = null  // C6c follow-up: barge-in ที่มาถึงตอนเทิร์นเดิมยังไม่ปล่อย sttProcessing — ช่องเดียว, latest-wins (ดูหมายเหตุที่ processTranscript())
     let bargeInPendingFinal = false  // C6c follow-up (STT listening): true หลัง interim trigger bargeIn() ไปแล้ว — บอก onTranscript ว่า final ตัวถัดไปคือประโยคที่พูดแทรกจริง (ดูหมายเหตุที่ onTranscript ด้านล่าง)
     let activePipelineId = 0
+    let pendingShortAck = null       // Design B: { text, pipelineId, capturedAt } — Tier2 ack ที่ deferred ไว้ระหว่าง AI พูด รอ owned mark/no-audio completion ของ pipeline เดียวกัน
+    let processTranscriptDispatch = null  // Design B: ref ไปยัง processTranscript (ประกาศใน start block) ให้ mark handler/no-audio sites อื่นที่อยู่นอก scope นั้นเรียกได้ โดยไม่ต้อง hoist ฟังก์ชันใหญ่ทั้งก้อน
     let prewarmPromise = null    // pre-warmed Claude response Promise<string|null>
     let prewarmStartText = null  // interim text that triggered prewarm
     let prewarmAbort = null      // AbortController for prewarm call
@@ -381,6 +445,42 @@ function registerWebSocket(fastify) {
       chunkedPrewarmHandle = null
     }
 
+    // Design B — จุดเดียวที่ consume pendingShortAck จริง เรียกจาก 4 ที่ (mark handler, processTranscript tail,
+    // speakAndWait's sent===0, handleSilence's totalSent===0) ทุกจุดต้อง await เสมอ (ไม่ fire-and-forget) เพราะ
+    // sttProcessing/ownership guard ต้องยัง valid ตลอดจน dispatch จริงเสร็จ ไม่ใช่แค่ตอนเริ่มเรียก
+    //
+    // เช็ค requestedPipelineId === activePipelineId ซ้ำอีกชั้น (นอกจาก pendingShortAck.pipelineId === requestedPipelineId)
+    // เป็น defense-in-depth กัน race ระหว่างตอน caller ตัดสินใจเรียกกับตอน helper รันจริง (โดยเฉพาะ mark handler
+    // ที่เป็น async event แยกจาก call site อื่นๆ) — ทั้งสอง check ต้อง pass พร้อมกันเสมอก่อน consume
+    //
+    // dispatch failure (Claude/TTS error จริงระหว่าง turn ใหม่ที่เพิ่งเปิด) ไม่ retry — ack ถูก claim ไปครั้งเดียว
+    // แล้ว (pendingShortAck = null ไปแล้วก่อน dispatch) retry จะกลายเป็น turn ซ้ำที่ไม่มีใครขอ แค่ log แล้วปล่อย
+    async function tryDeliverPendingShortAck(requestedPipelineId, session) {
+      if (!pendingShortAck) return
+      if (pendingShortAck.pipelineId !== requestedPipelineId) return
+      if (requestedPipelineId !== activePipelineId) return
+      const ackText = pendingShortAck.text
+      pendingShortAck = null
+      if (!callActive || pendingEndCall || sttProcessing || socket.readyState !== socket.OPEN) return
+      if (typeof processTranscriptDispatch !== 'function') return
+      try {
+        await processTranscriptDispatch(session, ackText)
+      } catch (err) {
+        console.error('[ShortAck] Dispatch failed — dropping (no retry):', err.message)
+        // ต้อง reset state ให้สายทำงานต่อได้ ไม่ใช่แค่ log เฉยๆ — ถ้า exception เกิดก่อนถึง finally หลักของ
+        // processTranscript() เอง (เช่น throw ระหว่าง setup ก่อนเข้า try/catch ของ Claude/TTS) sttProcessing/
+        // isSpeaking จะค้าง true ตลอดไป ทุก transcript ถัดไปจะถูกทิ้งเป็น "busy" ตลอดกาล สายฟังไม่ได้อีกเลย
+        // (พิสูจน์จริงจาก code review ที่จำลอง failure แล้วเจอ nextCalls=0) — ownership ยังเป็นของ pipeline นี้
+        // แน่นอนตอนนี้ (sttProcessing gate กันทุก entry point อื่นไว้แล้วตลอดที่ await ค้างอยู่ ไม่มีใครอื่นบุกมาตั้ง
+        // activePipelineId ใหม่ได้ระหว่างนี้) เช็คซ้ำไว้เพื่อความชัดเจน/สอดคล้องกับจุดอื่นในฟังก์ชันนี้ที่ paranoid เหมือนกัน
+        if (activePipelineId === requestedPipelineId) {
+          sttProcessing = false
+          isSpeaking = false
+          startSilenceTimer()
+        }
+      }
+    }
+
     async function handleSilence() {
       silenceTimer = null
       if (!callActive || isSpeaking || sttProcessing) return
@@ -391,6 +491,7 @@ function registerWebSocket(fastify) {
       console.log(`[Silence] Timeout #${silencePromptCount}`)
       isSpeaking = true
       sttProcessing = true
+      const pipelineId = ++activePipelineId  // Design B: silence prompt เป็น speaking session ของตัวเอง ต้อง bump owner แยกจาก pipeline ก่อนหน้า (เดิมไม่ bump เลย ทำให้ ack ที่พูดระหว่าง silence ผูกกับ owner เก่าผิดตัว)
       ttsAbortController = new AbortController()
       const signal = ttsAbortController.signal
       let totalSent = 0
@@ -415,8 +516,9 @@ function registerWebSocket(fastify) {
         sttProcessing = false
       }
 
-      if (totalSent > 0 && isSpeaking && socket.readyState === socket.OPEN) {
-        socket.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'silence_done' } }))
+      const hasAudio = totalSent > 0 && isSpeaking && socket.readyState === socket.OPEN
+      if (hasAudio) {
+        socket.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: ownedMarkName('silence_done', pipelineId) } }))
       } else {
         isSpeaking = false
         if (silencePromptCount < 2) startSilenceTimer()
@@ -428,6 +530,12 @@ function registerWebSocket(fastify) {
         const closeDelay = totalSent * 20 + 4000
         setTimeout(() => { if (socket.readyState === socket.OPEN) socket.close() }, closeDelay)
       }
+
+      // Design B: no-audio completion — เฉพาะกรณีไม่มี audio ส่งเลย (ไม่มี mark ที่จะกลับมาจริง) ต้องเรียกหลัง
+      // pendingEndCall ถูกกำหนดค่าสุดท้ายแล้วเท่านั้น (ไม่ใช่ก่อนหน้า) ไม่งั้น ack อาจถูก deliver ไปแล้วก่อนที่ turn
+      // นี้จะรู้ตัวว่ากลายเป็น terminal จริง — กรณีมี audio (hasAudio=true) ต้องรอ owned mark กลับมาจริงเท่านั้น
+      // ไม่ใช่ deliver ทันทีตรงนี้ (เสียงยังไม่ได้เล่นจบบนโทรศัพท์ลูกค้าเลย)
+      if (!hasAudio) await tryDeliverPendingShortAck(pipelineId, currentSession)
     }
 
     // หยุด AI พูดทันที เมื่อลูกค้าพูดแทรก
@@ -439,6 +547,7 @@ function registerWebSocket(fastify) {
       silencePromptCount = 0
       clearPrewarm()
       abortChunkedSpeculation() // L1b — เหมือน clearPrewarm() ข้างบนทุกประการ แค่คนละ mechanism (chunked speculative producer)
+      pendingShortAck = null // Design B: bargeIn() คือ central supersession point — turn ที่แข็งแรงกว่ากำลังมาแทนที่ ack สั้นที่ค้างไว้ก่อนหน้าต้องถูกทิ้งเสมอ ไม่พึ่งให้ caller แต่ละจุดจำ clear เอง
       if (greetingAbortController) { greetingAbortController.abort(); greetingAbortController = null }
       if (ttsAbortController) { ttsAbortController.abort(); ttsAbortController = null }
       if (socket.readyState === socket.OPEN) {
@@ -480,10 +589,16 @@ function registerWebSocket(fastify) {
 
       // ถ้า barge-in เกิดขึ้นระหว่างส่ง → ไม่ส่ง mark (isSpeaking=false แล้ว)
       if (!isSpeaking) return
-      if (sent === 0) { isSpeaking = false; return }
+      if (sent === 0) {
+        isSpeaking = false
+        // Design B: greeting fallback ที่ TTS คืน 0 chunks — ไม่มี mark ที่จะกลับมาจริง ต้อง hand off ทันที
+        // ไม่งั้น ack ที่ capture ระหว่าง generate จะรอ mark ที่ไม่มีวันมา (ownedMarkName ไม่ถูกส่งเลยในกรณีนี้)
+        await tryDeliverPendingShortAck(pipelineId, session)
+        return
+      }
 
       if (socket.readyState === socket.OPEN) {
-        socket.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: markName } }))
+        socket.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: ownedMarkName(markName, pipelineId) } }))
       }
 
       const playbackMs = sent * 20 + 1500
@@ -1049,8 +1164,9 @@ function registerWebSocket(fastify) {
           markDone(turnState) // ทุก pre-terminal phase ไปจบที่ DONE ได้ตรงๆ (turnState.js ไม่ guard transition นี้) — ครอบคลุมทุกทางจบของ legacy turn
           console.log('[Metrics]', JSON.stringify({ ...turnMetrics, ...computeDerivedMetrics(turnMetrics) }))
 
-          if (!signal?.aborted && isSpeaking && socket.readyState === socket.OPEN && totalSent > 0) {
-            socket.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'ai_done' } }))
+          const hasAudio = !signal?.aborted && isSpeaking && socket.readyState === socket.OPEN && totalSent > 0
+          if (hasAudio) {
+            socket.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: ownedMarkName('ai_done', pipelineId) } }))
           } else if (totalSent === 0) {
             isSpeaking = false
           }
@@ -1072,6 +1188,11 @@ function registerWebSocket(fastify) {
             setTimeout(() => { if (socket.readyState === socket.OPEN) socket.close() }, fallbackDelay)
           }
 
+          // Design B: no-audio completion — ต้องเรียกหลัง pendingEndCall ถูกกำหนดค่าสุดท้ายของ turn นี้แล้วเท่านั้น
+          // (บรรทัดข้างบน) ไม่ใช่ก่อนหน้า ไม่งั้น ack อาจถูก deliver ไปแล้วก่อนที่ turn จะรู้ตัวว่ากลายเป็น terminal
+          // จริง — กรณีมี audio (hasAudio=true) ต้องรอ owned mark กลับมาจริง ไม่ deliver ตรงนี้
+          if (!hasAudio) await tryDeliverPendingShortAck(pipelineId, currentSession)
+
           // C6c follow-up: sttProcessing ถูกปล่อยไปแล้วจริง (ใน finally ของ branch ด้านบน) ณ จุดนี้ — ถ้ามี
           // transcript ที่พูดแทรกเข้ามาระหว่างเทิร์นนี้ยังทำงานอยู่ (เก็บไว้ใน pendingTranscript โดย onTranscript)
           // ให้ process ต่อทันทีในฐานะเทิร์นใหม่ปกติ — เช็ค callActive กันไม่ให้ process ต่อหลังสายวางไปแล้ว
@@ -1081,6 +1202,7 @@ function registerWebSocket(fastify) {
             await processTranscript(next.session, next.text)
           }
         }
+        processTranscriptDispatch = processTranscript // Design B: ref สำหรับ mark handler/no-audio sites ที่อยู่นอก scope นี้ (mark handler เป็น sibling if-block, ไม่ hoist ฟังก์ชันใหญ่ทั้งก้อน)
 
         // เริ่ม STT stream
         sttStream = transcribeStream(async (transcript) => {
@@ -1096,8 +1218,10 @@ function registerWebSocket(fastify) {
             return
           }
           // Post-mark echo filter: short fragment ภายใน 500ms ของ mark = delayed PSTN echo
+          // Design B: คำรับคำสั้นที่รู้จัก (ครับ/ค่ะ/โอเค/ok ฯลฯ ทั้ง 2 tier) ได้รับการยกเว้นจาก filter นี้ — mark
+          // ยืนยันแล้วว่า playback คิวเดิมเล่นจบจริง ความเสี่ยง echo ต่ำกว่าตอน isSpeaking=true มาก ไม่ต้องแยก tier
           const msSinceMark = Date.now() - lastMarkTime
-          if (msSinceMark < 500) {
+          if (msSinceMark < 500 && !classifyAck(transcript)) {
             const wc = transcript.trim().split(/\s+/).length
             if (wc < 3 && transcript.length < 10) {
               console.log(`[STT] Echo suppressed (${msSinceMark}ms after mark): "${transcript}"`)
@@ -1114,8 +1238,18 @@ function registerWebSocket(fastify) {
 
           // Barge-in: ต้องเช็คก่อน sttProcessing เสมอ (ดูหมายเหตุที่ processTranscript() ด้านบน)
           if (isSpeaking) {
+            // Design B: Tier2 ack (ครับ/ค่ะ/ใช่/ไม่/โอเค/ok เดี่ยวๆ) คือ particle ที่ AI เองพูดลงท้ายประโยคบ่อย
+            // ที่สุด เสี่ยง false-echo สูงสุด — ไม่ bargeIn ทันที เก็บไว้รอ owned mark/no-audio completion ของ
+            // pipeline นี้ก่อน (ดู tryDeliverPendingShortAck) Tier1 (คำผสม เช่น "โอเคครับ") เสี่ยง false-echo ต่ำกว่า
+            // มาก ปล่อยผ่านไป bargeIn() ตามปกติด้านล่างได้เลย
+            const ackTier = classifyAck(transcript)
+            if (ackTier === 'TIER2') {
+              pendingShortAck = { text: transcript, pipelineId: activePipelineId, capturedAt: Date.now() }
+              console.log(`[STT] Tier2 ack deferred during AI speech: "${transcript}"`)
+              return
+            }
             const wordCount = transcript.trim().split(/\s+/).length
-            if (wordCount < 2 && transcript.length < 8) {
+            if (ackTier !== 'TIER1' && wordCount < 2 && transcript.length < 8) {
               // Fragment สั้น = echo หรือ noise → ไม่ barge-in
               console.log(`[STT] Short fragment during AI speech — ignoring echo: "${transcript}"`)
               return
@@ -1219,7 +1353,7 @@ function registerWebSocket(fastify) {
               greetingAbortController = null
               if (!isSpeaking) return  // barge-in happened during greeting
               if (socket.readyState === socket.OPEN) {
-                socket.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'greeting_done' } }))
+                socket.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: ownedMarkName('greeting_done', pipelineId) } }))
               }
               const playbackMs = sent * 20 + 1500
               setTimeout(() => { if (activePipelineId === pipelineId && isSpeaking) { console.log('[Audio] Fallback unlock (greeting)'); isSpeaking = false; startSilenceTimer() } }, playbackMs)
@@ -1255,13 +1389,26 @@ function registerWebSocket(fastify) {
       }
 
       if (msg.event === 'mark') {
-        console.log(`[WS] Mark received: ${msg.mark?.name}`)
+        const { kind, ownerId } = parseMarkName(msg.mark?.name)
+        console.log(`[WS] Mark received: kind=${kind} ownerId=${ownerId}`)
+
+        // Design B (round 6 correction) — mark ที่ไม่ผ่านการยืนยัน owner (ไม่ตรงกับ activePipelineId ปัจจุบัน หรือ
+        // ไม่มี owner encode มาเลย) ต้องไม่ทำ side effect ใดๆ เลยแม้แต่ข้อเดียว รวมถึง pendingEndCall close-scheduling
+        // ด้วย (bug ที่พบใน round 5: เดิม unlock ถูกกันแล้วแต่ close ยังหลุดผ่านไปได้ทำให้ stale mark ตัดสายที่ owner
+        // ใหม่ยังพูดไม่จบได้จริง) — ต้อง return ก่อนแตะ state ใดๆ ทั้งสิ้น ไม่ใช่กันทีละจุด
+        if (ownerId === null || ownerId !== activePipelineId) {
+          console.log(`[WS] Mark ignored — no verified current owner (kind=${kind}, ownerId=${ownerId}, active=${activePipelineId})`)
+          return
+        }
+
         isSpeaking = false
         lastMarkTime = Date.now()
         if (pendingEndCall) {
           setTimeout(() => { if (socket.readyState === socket.OPEN) socket.close() }, 1000)
           return
         }
+        const markSession = callSessions.get(callSid)
+        if (markSession) await tryDeliverPendingShortAck(activePipelineId, markSession)
         // C6c follow-up (STT listening): ไม่ reset() STT stream ที่นี่อีกต่อไป — googleSTT.js rotate stream ให้
         // ฟัง utterance ถัดไปทันทีตั้งแต่ตอน utterance ก่อนหน้า deliver แล้ว (ไม่รอ mark) ถ้า reset() ซ้ำตรงนี้อีก
         // จะเสี่ยงทำลาย stream ที่กำลังฟังลูกค้าพูดอยู่จริง (เช่น ลูกค้าเริ่มพูดพอดีตอน mark มาถึง) โดยไม่จำเป็น
@@ -1277,6 +1424,8 @@ function registerWebSocket(fastify) {
         abortChunkedSpeculation()
         endCall(callState)
         pendingTranscript = null // C6c follow-up: กัน pending transcript ของสายที่จบไปแล้วถูก drain ทีหลัง (แม้ processTranscript() จะเช็ค callActive ป้องกันไว้อีกชั้นอยู่แล้วก็ตาม)
+        pendingShortAck = null // Design B: mirror pendingTranscript เดียวกัน — กันสายที่จบไปแล้วมี ack ค้างถูก deliver ทีหลัง
+        processTranscriptDispatch = null // Design B: กัน stray reference ถูกเรียกหลัง teardown
         bargeInPendingFinal = false
         if (sttStream) { sttStream.end(); sttStream = null }
       }
@@ -1291,6 +1440,8 @@ function registerWebSocket(fastify) {
       clearDurationTimer()
       endCall(callState)
       pendingTranscript = null // C6c follow-up: เช่นเดียวกับ 'stop' — กัน reference ค้างถ้าปิดสายจาก close โดยไม่มี stop event มาก่อน
+      pendingShortAck = null // Design B: mirror pendingTranscript เดียวกัน
+      processTranscriptDispatch = null // Design B: กัน stray reference ถูกเรียกหลัง teardown
       bargeInPendingFinal = false
       if (sttStream) { sttStream.end(); sttStream = null }
       // ถ้ายังไม่มีเหตุผลปิดสายถูก tag ไว้เลย (ไม่ใช่ AI ปิดปกติ/หมดเวลาเงียบ) แปลว่าอีกฝั่งวางสายเอง

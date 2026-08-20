@@ -97,8 +97,9 @@ test('smoke: connect + start + final transcript ที่ rollout 0% → ได�
   assert.ok(mediaEvents.length > 0, 'ต้องมี media event ถูกส่งจริงจาก legacy TTS path')
   assert.equal(chunkedCalled, false, 'rollout 0% ต้องไม่เรียก askClaudeStreamChunked เลย')
 
+  // Design B: mark name เปลี่ยนจาก bare "ai_done" เป็น owned "ai_done:<pipelineId>" — ยืนยัน kind ถูกต้องด้วย prefix match
   const markEvents = socket.sent.filter(e => e.event === 'mark')
-  assert.ok(markEvents.some(e => e.mark?.name === 'ai_done'), 'ต้องมี mark ai_done ปิดท้ายเทิร์นด้วย')
+  assert.ok(markEvents.some(e => /^ai_done:\d+$/.test(e.mark?.name)), 'ต้องมี owned mark ai_done:<id> ปิดท้ายเทิร์นด้วย')
 
   harness.disconnect(socket)
 })
@@ -1548,6 +1549,584 @@ test('54) L1c1 follow-up (commit-gate review): buffer ที่ถูก numeric
 
   const lastAssistant = session.messages.filter(m => m.role === 'assistant').at(-1)
   assert.equal(lastAssistant.content.trim(), 'ตอนนี้สมาชิกใหม่ฝาก 100 บาท รับ 2,000') // fullTextAccum เป็น raw concatenation ของ delta ไม่ trim เอง (พฤติกรรมเดิม ไม่เกี่ยวกับ L1c1)
+
+  harness.disconnect(socket)
+})
+
+// ===== Design B — short-ack lifecycle (production incident 2026-08-20, design rounds 1-6) =====
+// คำรับคำสั้นที่ลูกค้าพูดจริง (ครับ/ค่ะ/โอเค/ok ฯลฯ) เคยหายเงียบจากทั้ง echo-during-speech filter และ post-mark
+// echo filter — เทสชุดนี้พิสูจน์ owner-scoped lifecycle เต็มวง: STT candidate → classification → speaking owner
+// (activePipelineId ร่วมกันทั้ง normal turn/greeting/silence) → owned mark/no-audio completion → exactly-once dispatch
+
+test('Design B: Tier2 ack ("ครับ") ระหว่าง AI กำลัง generate อยู่จริง → ไม่ bargeIn ทันที ไม่มี clear event ไม่เริ่มเทิร์นใหม่ทันที', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+
+  let resumeOldTurn
+  const oldTurnGate = new Promise(resolve => { resumeOldTurn = resolve })
+  state.claudeStreamImpl = async function* () { yield 'คำตอบหลักที่กำลังตอบอยู่'; await oldTurnGate }
+
+  const oldTurnPromise = harness.sendFinalTranscript('ขอสอบถามโปรโมชั่นหน่อยค่ะ')
+  await delay(30) // isSpeaking=true ตั้งแต่ต้น processTranscript() แล้ว แม้ Claude ยังไม่ตอบเสร็จเลยด้วยซ้ำ
+
+  let newTurnCalls = 0
+  state.claudeStreamImpl = async function* () { newTurnCalls++; yield 'ตอบรับทราบ' }
+
+  await harness.sendFinalTranscript('ครับ')
+
+  assert.equal(newTurnCalls, 0, 'Tier2 ack ต้องไม่ trigger เทิร์นใหม่ทันที')
+  assert.equal(socket.sent.filter(e => e.event === 'clear').length, 0, 'ต้องไม่มี clear event — ไม่ตัดเสียง AI กลางประโยคจาก particle เดี่ยว')
+
+  resumeOldTurn()
+  await oldTurnPromise
+  harness.disconnect(socket)
+})
+
+test('Design B: Tier2 ack ที่ deferred ไว้ระหว่าง AI พูดจริง (มี audio ส่งแล้ว) → deliver เป็นเทิร์นใหม่หลัง owned mark กลับมาตรง owner เท่านั้น', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+
+  let resumeTts
+  const ttsGate = new Promise(resolve => { resumeTts = resolve })
+  state.claudeStreamImpl = async function* () { yield 'คำตอบหลักที่กำลังพูดอยู่' }
+  state.ttsImpl = async function* () { yield Buffer.from('chunk1'); await ttsGate }
+
+  const oldTurnPromise = harness.sendFinalTranscript('ขอสอบถามโปรโมชั่นหน่อยค่ะ')
+  await delay(30) // isSpeaking=true, มี audio ส่งไปแล้วจริง (totalSent>0) แต่ turn ยังไม่จบ (TTS ค้างอยู่)
+
+  let newTurnCalls = 0
+  state.claudeStreamImpl = async function* () { newTurnCalls++; yield 'ตอบรับทราบ' }
+  await harness.sendFinalTranscript('ครับ') // Tier2 capture
+
+  resumeTts()
+  await oldTurnPromise
+
+  const markSent = socket.sent.filter(e => e.event === 'mark').at(-1)
+  assert.match(markSent.mark.name, /^ai_done:\d+$/, 'ต้องเป็น owned mark')
+  assert.equal(newTurnCalls, 0, 'ยังไม่ควร deliver จนกว่า mark จะกลับมาจริง (ไม่ใช่แค่ตอน turn จบ)')
+
+  socket.emit('message', JSON.stringify({ event: 'mark', mark: markSent.mark })) // จำลอง Twilio echo mark กลับมา
+  await delay(20)
+
+  assert.equal(newTurnCalls, 1, 'หลัง owned mark กลับมาตรง owner ต้อง deliver ack เป็นเทิร์นใหม่')
+  const lastUserMsg = session.messages.filter(m => m.role === 'user').at(-1)
+  assert.equal(lastUserMsg.content, 'ครับ', 'ข้อความที่ deliver ต้องเป็น raw text เดิมเป๊ะ')
+
+  harness.disconnect(socket)
+})
+
+test('Design B: Tier1 ack ("โอเคครับ") ระหว่าง AI พูดอยู่ → bargeIn ทันทีเหมือน transcript ยาวทั่วไป (ไม่ defer)', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+
+  let resumeOldTurn
+  const oldTurnGate = new Promise(resolve => { resumeOldTurn = resolve })
+  state.claudeStreamImpl = async function* () { yield 'คำตอบหลัก'; await oldTurnGate }
+
+  const oldTurnPromise = harness.sendFinalTranscript('ขอสอบถามโปรโมชั่นหน่อยค่ะ')
+  await delay(30)
+
+  let newTurnCalls = 0
+  state.claudeStreamImpl = async function* () { newTurnCalls++; yield 'ตอบเรื่องใหม่' }
+
+  await harness.sendFinalTranscript('โอเคครับ')
+
+  assert.ok(socket.sent.filter(e => e.event === 'clear').length > 0, 'Tier1 ต้อง bargeIn ทันที (มี clear event)')
+  assert.equal(newTurnCalls, 0, 'เทิร์นเดิมยังไม่ปล่อย sttProcessing — เทิร์นใหม่ยังไม่เริ่มจนกว่าจะปล่อย')
+
+  resumeOldTurn()
+  await oldTurnPromise
+  assert.equal(newTurnCalls, 1)
+  const lastUserMsg = session.messages.filter(m => m.role === 'user').at(-1)
+  assert.equal(lastUserMsg.content, 'โอเคครับ')
+
+  harness.disconnect(socket)
+})
+
+test('Design B (round 6): mark ที่ owner ไม่ตรง (stale) มาถึงระหว่าง pendingEndCall=true → ต้องไม่ schedule ปิดสาย ไม่ unlock isSpeaking เลย', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+
+  state.claudeStreamImpl = async function* () { yield 'ขอบคุณค่ะ [END_CALL]' }
+  await harness.sendFinalTranscript('ไม่สนใจค่ะ') // จบด้วย pendingEndCall=true จริง, ai_done:<N> ถูกส่งออกไป
+
+  const realMark = socket.sent.filter(e => e.event === 'mark').at(-1)
+  const realOwnerId = Number(realMark.mark.name.split(':')[1])
+  const staleMarkName = `ai_done:${realOwnerId - 1}` // owner เก่ากว่า (เช่น ของ greeting) จงใจไม่ตรง activePipelineId ปัจจุบัน
+
+  socket.emit('message', JSON.stringify({ event: 'mark', mark: { name: staleMarkName } }))
+  await delay(1100) // เกิน setTimeout(close, 1000) ที่ pendingEndCall branch เดิมจะตั้งถ้า mark ผ่าน guard ไปได้
+
+  assert.equal(socket.closed, undefined, 'stale mark ต้องไม่ schedule ปิดสายเลย แม้ pendingEndCall จะเป็น true อยู่ก่อนแล้วก็ตาม')
+
+  harness.disconnect(socket)
+})
+
+test('Design B (round 6): unowned bare mark (ไม่มี ":ownerId" เลย) ระหว่าง AI กำลังพูดอยู่จริง → ไม่ unlock isSpeaking (ต่างจาก policy เดิมที่ยัง unlock)', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+
+  let resumeTts
+  const ttsGate = new Promise(resolve => { resumeTts = resolve })
+  state.claudeStreamImpl = async function* () { yield 'คำตอบหลัก' }
+  state.ttsImpl = async function* () { yield Buffer.from('chunk1'); await ttsGate }
+
+  const oldTurnPromise = harness.sendFinalTranscript('ขอสอบถามโปรโมชั่นหน่อยค่ะ')
+  await delay(30) // isSpeaking=true, audio กำลังส่งอยู่จริง
+
+  socket.emit('message', JSON.stringify({ event: 'mark', mark: { name: 'ai_done' } })) // legacy/unowned bare mark
+  await delay(20)
+
+  // ยืนยันว่ายัง isSpeaking=true อยู่ทางอ้อม: interim สั้น ("ครับ") ที่ส่งตอนนี้ต้องยังเข้า Tier2-defer path
+  // (ต้องผ่าน `if (isSpeaking)` เท่านั้นถึงจะไปถึงจุด classify/defer — ถ้า unowned mark unlock ไปแล้วจริง
+  // transcript นี้จะตกไปที่ branch อื่นแทน ไม่ใช่ defer)
+  await harness.sendFinalTranscript('ครับ')
+  const clearEvents = socket.sent.filter(e => e.event === 'clear')
+  assert.equal(clearEvents.length, 0, 'ยังไม่ควรมี clear event ใดๆ (Tier2 defer ไม่ bargeIn อยู่แล้ว แต่ค่านี้ยืนยันว่าไม่ได้ตกไป branch อื่นที่ไม่ใช่ isSpeaking branch)')
+
+  resumeTts()
+  await oldTurnPromise
+  harness.disconnect(socket)
+})
+
+test('Design B (round 6): unowned bare mark ระหว่าง pendingEndCall=true → ต้องไม่ schedule ปิดสาย', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+
+  state.claudeStreamImpl = async function* () { yield 'ขอบคุณค่ะ [END_CALL]' }
+  await harness.sendFinalTranscript('ไม่สนใจค่ะ') // pendingEndCall=true
+
+  socket.emit('message', JSON.stringify({ event: 'mark', mark: { name: 'ai_done' } })) // ไม่มี owner เลย
+  await delay(1100)
+
+  assert.equal(socket.closed, undefined, 'unowned mark ต้องไม่ schedule ปิดสายเลยเช่นกัน')
+
+  harness.disconnect(socket)
+})
+
+test('Design B (round 5-6): รูปแบบ owned mark ที่ผิด (ai_done:, ai_done:0, ai_done:-1, ai_done:1.5, ai_done:abc, unknown:12, เลขเกิน MAX_SAFE_INTEGER) → ทุกอันถูกปฏิเสธ ไม่มี side effect ใดๆ เลย', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+
+  let resumeTts
+  const ttsGate = new Promise(resolve => { resumeTts = resolve })
+  state.claudeStreamImpl = async function* () { yield 'คำตอบหลัก' }
+  state.ttsImpl = async function* () { yield Buffer.from('chunk1'); await ttsGate }
+
+  harness.sendFinalTranscript('ขอสอบถามโปรโมชั่นหน่อยค่ะ')
+  await delay(30) // isSpeaking=true ค้างอยู่ (TTS gate ยังไม่ปล่อย)
+
+  // round 6 correction: regex ^[1-9]\d*$ เดิมยอมให้เลขเกิน Number.MAX_SAFE_INTEGER ผ่านได้ (ตัวเลขยาวถูกต้องตาม
+  // pattern) แต่ Number(...) สูญเสีย precision จริง — ต้องเช็ค Number.isSafeInteger() ซ้ำหลังแปลงเสมอ
+  const invalidNames = ['ai_done:', 'ai_done:0', 'ai_done:-1', 'ai_done:1.5', 'ai_done:abc', 'unknown:12', 'ai_done:9007199254740992']
+  for (const name of invalidNames) {
+    socket.emit('message', JSON.stringify({ event: 'mark', mark: { name } }))
+  }
+  await delay(20)
+
+  // ถ้า mark ใดหลุดผ่าน guard ไปได้จะ unlock isSpeaking แล้ว startSilenceTimer() — ตรวจทางอ้อมผ่าน Tier2 defer
+  // ยังทำงานปกติ (แปลว่ายัง isSpeaking=true อยู่จริง ไม่มี mark ไหนหลุดผ่านไป unlock ได้เลย)
+  let newTurnCalls = 0
+  state.claudeStreamImpl = async function* () { newTurnCalls++; yield 'x' }
+  await harness.sendFinalTranscript('ครับ')
+  assert.equal(socket.sent.filter(e => e.event === 'clear').length, 0, 'ต้องยัง isSpeaking=true อยู่ — ไม่มี mark รูปแบบผิดหลุดผ่าน guard ไป unlock ได้เลย')
+
+  resumeTts()
+  await delay(30)
+  harness.disconnect(socket)
+})
+
+test('Design B (round 6): parseMarkName boundary — 9007199254740991 (MAX_SAFE_INTEGER พอดี) parse เป็น ownerId ตัวเลขจริง, 9007199254740992 (เกิน 1) ถูกปฏิเสธเป็น ownerId=null เหมือน mark รูปแบบผิดอื่น', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+
+  const originalLog = console.log
+  const logs = []
+  console.log = (...args) => { logs.push(args.join(' ')); originalLog(...args) }
+  try {
+    socket.emit('message', JSON.stringify({ event: 'mark', mark: { name: 'ai_done:9007199254740991' } }))
+    socket.emit('message', JSON.stringify({ event: 'mark', mark: { name: 'ai_done:9007199254740992' } }))
+    await delay(20)
+  } finally {
+    console.log = originalLog
+  }
+
+  assert.ok(logs.some(l => l.includes('ownerId=9007199254740991')), 'เลขที่เท่ากับ MAX_SAFE_INTEGER พอดีต้อง parse เป็นตัวเลขจริง ไม่ใช่ null (แค่บังเอิญไม่ตรง activePipelineId ปัจจุบันเลยไม่ trigger side effect)')
+  const rejectedLogs = logs.filter(l => l.includes('kind=ai_done') && l.includes('ownerId=null'))
+  assert.ok(rejectedLogs.length > 0, 'เลขที่เกิน MAX_SAFE_INTEGER ต้องถูกปฏิเสธเป็น ownerId=null เหมือน mark รูปแบบผิดอื่นๆ ไม่ใช่แปลงเป็นตัวเลขที่ precision เพี้ยนแล้วปล่อยผ่าน')
+
+  harness.disconnect(socket)
+})
+
+// หมายเหตุจากรอบก่อน — ทดสอบ dispatcher rejection ด้วยการทำให้ Claude throw พบว่า legacy path มี recovery-phrase
+// safety net ของตัวเอง (LEGACY_RECOVERY_PHRASE) ที่จับ Claude error ไว้ก่อนถึง tryDeliverPendingShortAck's catch
+// เสมอ (processTranscriptDispatch resolve สำเร็จด้วยการพูด recovery phrase แทน ไม่ reject) เทสนี้จึงต้องทำให้
+// dispatch failure เกิด "นอก" safety net นั้นจริงๆ — currentSession.messages.push() เป็นบรรทัดแรกสุดของ
+// processTranscript() อยู่นอก try/catch ของ Claude/TTS ทั้งหมด (ยืนยันด้วย node -e ว่า push บน frozen array
+// throw TypeError เสมอไม่ว่า caller จะ strict mode หรือไม่) — แต่ freeze ทั้ง array แบบเปลือยๆ พังใส่ main turn
+// เองด้วย (main turn เองก็ push 2 ครั้ง: user message ตอนต้น + assistant message ตอนท้าย) รอบแรกที่เขียนเทสนี้
+// freeze ก่อน resumeClaude() เร็วเกินไป ดันไปพัง main turn's เอง assistant-push แทน (บั๊กในเทสเอง ไม่ใช่ production
+// code — เจอจาก stack trace ที่ throw จาก onTranscript โดยตรง ไม่ใช่จาก tryDeliverPendingShortAck) — แก้ด้วยการ
+// นับจำนวน push แทนการ freeze เปลือย: ปล่อยให้ 2 push แรกของ main turn (user + assistant) สำเร็จตามปกติ แล้วให้
+// push ที่ 3 (ของ ack's own processTranscript() ซึ่งเป็นบรรทัดแรกสุดของมันพอดี) throw แทน — ไม่ใช่ production-only
+// test hook ใหม่ (เป็นการ mock dependency มาตรฐานเดียวกับที่ state.claudeStreamImpl/ttsImpl ทำอยู่แล้วทั้งไฟล์)
+test('Design B: tryDeliverPendingShortAck — dispatcher reject จากจุดที่หลุด internal Claude/TTS recovery safety net จริง (session.messages เขียนไม่ได้) → catch/log ไม่ throw ไม่ retry ไม่มี duplicate turn', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+
+  let pushCount = 0
+  const originalPush = session.messages.push.bind(session.messages)
+  session.messages.push = (...args) => {
+    pushCount++
+    if (pushCount === 3) throw new Error('simulated session.messages write failure') // เฉพาะ push ที่ 3 (ack's own user-message push) — push ที่ 4 เป็นต้นไป (turn ใหม่หลัง recover) ต้องสำเร็จปกติ
+    return originalPush(...args)
+  }
+
+  let resumeClaude
+  const claudeGate = new Promise(resolve => { resumeClaude = resolve })
+  state.claudeStreamImpl = async function* () { yield 'คำตอบหลัก'; await claudeGate }
+  state.ttsImpl = async function* () {} // 0 chunks → no-audio hand-off ทันทีตอน turn หลักจบ
+
+  const oldTurnPromise = harness.sendFinalTranscript('ขอสอบถามโปรโมชั่นหน่อยค่ะ') // push #1 (user) สำเร็จ
+  await delay(30)
+
+  await harness.sendFinalTranscript('ครับ') // Tier2 capture — ไม่แตะ session.messages เลย (แค่ตั้ง pendingShortAck)
+
+  let claudeCalledForAck = false
+  state.claudeStreamImpl = async function* () { claudeCalledForAck = true; yield 'ไม่ควรถูกเรียกถึงตรงนี้เลย' }
+
+  const originalError = console.error
+  const errorLogs = []
+  console.error = (...args) => { errorLogs.push(args.join(' ')) }
+  try {
+    resumeClaude() // main turn จบ → push #2 (assistant) สำเร็จ → TTS 0 chunks → no-audio hand-off เรียก dispatcher → ack's push #3 throw
+    await oldTurnPromise
+    await delay(50)
+  } finally {
+    console.error = originalError
+  }
+
+  assert.equal(claudeCalledForAck, false, 'dispatch ต้อง throw ก่อนถึง Claude เลยด้วยซ้ำ (บรรทัดแรกสุดของ processTranscript())')
+  assert.ok(errorLogs.some(l => l.includes('[ShortAck] Dispatch failed')), 'ต้อง catch/log ผ่าน tryDeliverPendingShortAck จริง ไม่ throw ออกไปเป็น unhandled rejection (main turn เองก็ต้องไม่ crash — oldTurnPromise ต้อง resolve ปกติ ไม่ reject)')
+
+  await delay(50) // เผื่อ retry อัตโนมัติที่ไม่ควรมี
+  assert.equal(claudeCalledForAck, false, 'ต้องไม่ retry เองอัตโนมัติ — ack ถูก claim (pendingShortAck=null) ไปแล้วตั้งแต่ก่อน dispatch ครั้งแรก')
+  assert.equal(pushCount, 3, 'ต้องมี push พยายามแค่ 3 ครั้งเป๊ะ (user+assistant ของ main turn, user ของ ack ที่ fail) ไม่ใช่ 4+ ที่แปลว่ามี retry หรือ duplicate turn')
+
+  // Round-7 correction (code review finding P1) — dispatch failure ที่เกิดก่อนถึง finally หลักของ processTranscript()
+  // เอง (เช่น exception ตอน setup ก่อนเข้า try/catch ของ Claude/TTS) จะทำให้ sttProcessing/isSpeaking ค้าง true
+  // ตลอดไปถ้า catch ของ tryDeliverPendingShortAck ไม่ reset state เอง — พิสูจน์ว่าสาย "ฟื้น" ได้จริงหลัง failure
+  // ไม่ใช่แค่ไม่ throw/ไม่ retry เฉยๆ: turn ใหม่ปกติหลังจากนี้ต้องไม่ถูกทิ้งเป็น busy และต้องเรียก Claude ได้จริง
+  let claudeCalledForRecoveryTurn = false
+  state.claudeStreamImpl = async function* () { claudeCalledForRecoveryTurn = true; yield 'ตอบเทิร์นใหม่หลัง recover' }
+  state.ttsImpl = async function* () { yield Buffer.from('chunk') }
+
+  const originalLog = console.log
+  const dropLogs = []
+  console.log = (...args) => { dropLogs.push(args.join(' ')); originalLog(...args) }
+  try {
+    await harness.sendFinalTranscript('เทิร์นใหม่หลัง dispatch failure ต้องทำงานได้ปกติ')
+  } finally {
+    console.log = originalLog
+  }
+
+  assert.equal(dropLogs.some(l => l.includes('Transcript dropped (busy')), false, 'สายต้องไม่ค้างเป็น busy ตลอดกาลหลัง dispatch failure')
+  assert.equal(claudeCalledForRecoveryTurn, true, 'turn ใหม่หลัง failure ต้องเรียก Claude ได้ปกติ — สายต้อง recover ไม่ใช่ค้างฟังไม่ได้อีกเลย')
+  const lastUserMsg = session.messages.filter(m => m.role === 'user').at(-1)
+  assert.equal(lastUserMsg.content, 'เทิร์นใหม่หลัง dispatch failure ต้องทำงานได้ปกติ')
+
+  harness.disconnect(socket)
+})
+
+test('Design B: no-audio completion — เทิร์นปกติที่ TTS คืน 0 chunks + Tier2 ack ที่ capture ไว้ก่อนหน้า → deliver ทันที ไม่รอ mark ที่ไม่มีวันมา', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+
+  let resumeClaude
+  const claudeGate = new Promise(resolve => { resumeClaude = resolve })
+  state.claudeStreamImpl = async function* () { yield 'คำตอบหลัก'; await claudeGate }
+  state.ttsImpl = async function* () {} // 0 chunks เสมอ — totalSent จะเป็น 0
+
+  const oldTurnPromise = harness.sendFinalTranscript('ขอสอบถามโปรโมชั่นหน่อยค่ะ')
+  await delay(30) // isSpeaking=true, Claude ยังไม่ตอบเสร็จ
+
+  let newTurnCalls = 0
+  const dispatchedTexts = []
+  await harness.sendFinalTranscript('ครับ') // Tier2 capture ระหว่าง Claude ยัง generate อยู่ (pipeline เดียวกับ turn หลัก)
+
+  resumeClaude() // ปล่อยให้ turn หลักตอบจบ → TTS คืน 0 chunks → totalSent=0 → no-audio hand-off ต้องทำงานทันที
+  await oldTurnPromise
+
+  const markEvents = socket.sent.filter(e => e.event === 'mark')
+  assert.equal(markEvents.length, 0, 'totalSent=0 ต้องไม่มี mark ส่งออกเลย')
+
+  const userMsgs = session.messages.filter(m => m.role === 'user').map(m => m.content)
+  assert.ok(userMsgs.includes('ครับ'), 'ack ต้องถูก deliver แล้วผ่าน no-audio hand-off โดยไม่ต้องรอ mark ที่ไม่มีวันมา')
+
+  harness.disconnect(socket)
+})
+
+test('Design B: no-audio completion — greeting fallback (askClaude) ที่ TTS คืน 0 chunks + Tier2 ack ระหว่าง greeting → deliver ทันที', async () => {
+  const callSid = nextCallSid()
+  const state = harness.getState()
+  state.rolloutPercent = 0
+  let resumeGreeting
+  const greetingGate = new Promise(resolve => { resumeGreeting = resolve })
+  state.askClaudeImpl = async () => { await greetingGate; return 'สวัสดีค่ะ' }
+  state.ttsImpl = async function* () {} // greeting fallback ก็คืน 0 chunks เช่นกัน
+
+  const session = makeSession() // ไม่มี greetingChunks เลย → บังคับเข้า fallback-generate path (askClaude)
+  callSessions.set(callSid, session)
+  const socket = harness.connect({ callSid })
+  harness.sendStart(socket)
+  await delay(320) // ผ่าน setTimeout(playGreeting, 300) ให้ playGreeting เริ่มทำงานแล้ว เข้าสู่ isSpeaking=true, กำลังรอ askClaude (ค้างที่ greetingGate)
+
+  await harness.sendFinalTranscript('ครับ') // Tier2 ระหว่าง greeting กำลัง generate อยู่ (isSpeaking=true จาก playGreeting)
+
+  resumeGreeting() // ปล่อยให้ askClaude คืนค่า → speakAndWait → TTS 0 chunks → sent===0 → no-audio hand-off
+  await delay(50)
+
+  const userMsgs = session.messages.filter(m => m.role === 'user').map(m => m.content)
+  assert.ok(userMsgs.includes('ครับ'), 'ack ระหว่าง greeting fallback ต้อง deliver ได้โดยไม่ต้องรอ mark')
+
+  harness.disconnect(socket)
+})
+
+test('Design B (round 6): silence prompt เป็น speaking owner ของตัวเอง (bump activePipelineId แยกจาก turn ก่อนหน้า) และ deliver Tier2 ack ผ่าน owned silence_done mark ได้ถูกต้อง', { timeout: 15000 }, async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+
+  state.claudeStreamImpl = async function* () { yield 'คำตอบสั้น' }
+  await harness.sendFinalTranscript('สวัสดีค่ะ')
+  const prevMark = socket.sent.filter(e => e.event === 'mark').at(-1)
+  const prevOwner = Number(prevMark.mark.name.split(':')[1])
+  socket.emit('message', JSON.stringify({ event: 'mark', mark: prevMark.mark })) // unlock ให้ silence timer เริ่มนับจริง
+  await delay(20)
+  socket.sent.length = 0
+
+  let resumeSilenceTts
+  const silenceGate = new Promise(resolve => { resumeSilenceTts = resolve })
+  state.ttsImpl = async function* () { yield Buffer.from('silence-audio'); await silenceGate }
+
+  await delay(8050) // รอ silenceTimer (8000ms) จริง trigger handleSilence()
+
+  let newTurnCalls = 0
+  state.claudeStreamImpl = async function* () { newTurnCalls++; yield 'ตอบรับทราบ' }
+  await harness.sendFinalTranscript('ครับ') // Tier2 ระหว่าง silence prompt กำลังพูด ("ได้ยินอยู่ไหมคะ")
+  assert.equal(newTurnCalls, 0, 'ไม่ควร bargeIn ทันทีระหว่าง silence prompt กำลังพูด')
+
+  resumeSilenceTts()
+  await delay(50)
+
+  const silenceMark = socket.sent.filter(e => e.event === 'mark').at(-1)
+  assert.match(silenceMark.mark.name, /^silence_done:\d+$/, 'ต้องเป็น owned silence_done mark')
+  const silenceOwner = Number(silenceMark.mark.name.split(':')[1])
+  assert.ok(silenceOwner > prevOwner, 'handleSilence() ต้อง bump activePipelineId เป็นของตัวเอง ไม่ใช้ owner เดิมของ turn ก่อนหน้า (round 6 fix หลัก)')
+
+  socket.emit('message', JSON.stringify({ event: 'mark', mark: silenceMark.mark }))
+  await delay(20)
+
+  assert.equal(newTurnCalls, 1, 'หลัง silence_done mark กลับมาตรง owner ต้อง deliver ack')
+  const lastUserMsg = session.messages.filter(m => m.role === 'user').at(-1)
+  assert.equal(lastUserMsg.content, 'ครับ')
+
+  harness.disconnect(socket)
+})
+
+test('Design B: mark เก่าจาก pipeline ที่ถูกทิ้งไปแล้ว (ผ่าน fallback-unlock timer ไม่ใช่ bargeIn) มาถึงช้า → ต้องไม่ consume ack ของ pipeline นั้นเข้า pipeline ใหม่ที่ไม่เกี่ยวข้อง', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+
+  let resumeClaude
+  const claudeGate = new Promise(resolve => { resumeClaude = resolve })
+  state.claudeStreamImpl = async function* () { yield 'คำตอบหลัก'; await claudeGate }
+  state.ttsImpl = async function* () { yield Buffer.from('chunk1') } // 1 chunk → playbackMs = 20+1500 = 1520ms
+
+  const turnPromise = harness.sendFinalTranscript('ขอสอบถามโปรโมชั่นหน่อยค่ะ')
+  await delay(30)
+  await harness.sendFinalTranscript('ครับ') // Tier2 capture ผูกกับ pipeline นี้
+
+  resumeClaude()
+  await turnPromise // turn จบ ส่ง mark ออกไปแล้ว (ยังไม่ echo กลับ) sttProcessing ปล่อยแล้ว
+
+  const pendingOldMark = socket.sent.filter(e => e.event === 'mark').at(-1)
+
+  await delay(1550) // เกิน playbackMs (1520ms) จริง → fallback-unlock timer flip isSpeaking=false เอง โดยไม่ผ่าน mark/bargeIn เลย
+
+  let newTurnCalls = 0
+  state.claudeStreamImpl = async function* () { newTurnCalls++; yield 'ตอบเทิร์นใหม่' }
+  await harness.sendFinalTranscript('เทิร์นใหม่ปกติที่ไม่เกี่ยวกับ ack เลย') // isSpeaking=false อยู่แล้ว → ตรง processTranscript() ทันที ไม่ผ่าน bargeIn()
+  assert.equal(newTurnCalls, 1, 'pipeline ใหม่ต้องเริ่มได้ปกติ')
+
+  socket.emit('message', JSON.stringify({ event: 'mark', mark: pendingOldMark.mark })) // mark เก่ามาถึงตอนนี้ (activePipelineId ขยับไปแล้ว)
+  await delay(20)
+
+  assert.equal(newTurnCalls, 1, 'mark เก่าต้องไม่ trigger เทิร์นเพิ่มอีก (ownerId ไม่ตรง activePipelineId ปัจจุบันแล้ว)')
+  const userMsgs = session.messages.filter(m => m.role === 'user').map(m => m.content)
+  assert.ok(!userMsgs.includes('ครับ'), 'ack "ครับ" ของ pipeline ที่ถูกทิ้งไปแล้วต้องไม่ถูก deliver เข้า session เลย')
+
+  harness.disconnect(socket)
+})
+
+test('Design B: bargeIn() คือ central supersession — Tier2 ack ที่ pending อยู่ถูกทิ้งทันทีเมื่อมี turn ที่แข็งแรงกว่าเข้ามาแทน', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+
+  let resumeOldTurn
+  const oldTurnGate = new Promise(resolve => { resumeOldTurn = resolve })
+  state.claudeStreamImpl = async function* () { yield 'คำตอบหลัก'; await oldTurnGate }
+
+  const oldTurnPromise = harness.sendFinalTranscript('ขอสอบถามโปรโมชั่นหน่อยค่ะ')
+  await delay(30)
+
+  await harness.sendFinalTranscript('ครับ') // Tier2 capture ก่อน
+
+  let newTurnCalls = 0
+  const dispatchedTexts = []
+  state.claudeStreamImpl = async function* () { newTurnCalls++; yield 'ตอบเรื่องถอนเงิน' }
+  await harness.sendFinalTranscript('เดี๋ยวก่อนครับ ขอถามเรื่องถอนเงินก่อน') // ยาวพอ trigger bargeIn() จริง — ต้อง supersede ack ที่ pending อยู่
+
+  assert.ok(socket.sent.filter(e => e.event === 'clear').length > 0, 'ต้อง bargeIn จริงจาก transcript ที่แข็งแรงกว่า')
+
+  resumeOldTurn()
+  await oldTurnPromise
+  await delay(20)
+
+  assert.equal(newTurnCalls, 1, 'ต้องมีแค่เทิร์นเดียวจาก transcript ที่แข็งแรงกว่า ไม่ใช่สองเทิร์น')
+  const lastUserMsg = session.messages.filter(m => m.role === 'user').at(-1)
+  assert.equal(lastUserMsg.content, 'เดี๋ยวก่อนครับ ขอถามเรื่องถอนเงินก่อน', 'ack "ครับ" ที่ pending อยู่ก่อนหน้าต้องถูกทิ้งไป ไม่ใช่ deliver เป็น turn แยก')
+  const userMsgs = session.messages.filter(m => m.role === 'user').map(m => m.content)
+  assert.equal(userMsgs.filter(t => t === 'ครับ').length, 0, 'ack "ครับ" ต้องไม่ถูก deliver เลยไม่ว่าจุดไหน')
+
+  harness.disconnect(socket)
+})
+
+test('Design B: pendingShortAck ที่ค้างอยู่ถูกเคลียร์เมื่อสายจบ (stop/close) → ไม่มี delivery ใดๆ เกิดขึ้นหลังสายจบ ไม่ crash', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+
+  let resumeTts
+  const ttsGate = new Promise(resolve => { resumeTts = resolve })
+  state.claudeStreamImpl = async function* () { yield 'คำตอบหลัก' }
+  state.ttsImpl = async function* () { yield Buffer.from('chunk1'); await ttsGate }
+
+  harness.sendFinalTranscript('ขอสอบถามโปรโมชั่นหน่อยค่ะ')
+  await delay(30)
+  await harness.sendFinalTranscript('ครับ') // Tier2 capture ค้างไว้
+
+  harness.disconnect(socket) // ปิดสายทันทีโดยที่ ack ยังค้างอยู่ (ยังไม่มี mark กลับมาเลย)
+  resumeTts() // ปล่อย TTS ที่ค้างอยู่ทีหลัง (จำลอง timing จริงที่ cleanup อาจมาก่อน async work เดิมจะ settle)
+  await delay(30)
+
+  // ไม่ throw / ไม่ crash คือเงื่อนไขหลักของเทสนี้ (assert ผ่านแค่ถึงตรงนี้ก็พิสูจน์แล้ว) — ยืนยันเพิ่มว่าไม่มี ack หลุดเข้า session
+  const userMsgs = session.messages.filter(m => m.role === 'user').map(m => m.content)
+  assert.ok(!userMsgs.includes('ครับ'), 'ack ต้องไม่ถูก deliver เลยหลังสายจบไปแล้ว')
+})
+
+// หมายเหตุสำคัญที่เจอตอนรัน: legacy path มี recovery-phrase safety net ของตัวเองอยู่แล้วสำหรับ Claude error
+// (LEGACY_RECOVERY_PHRASE, ดู audioStream.js:1044-1057) — Claude throw ระหว่าง fresh call จึงไม่ใช่ "unhandled
+// dispatch failure" ที่ tryDeliverPendingShortAck's catch จะเห็นเลย (processTranscriptDispatch resolve สำเร็จ
+// ด้วยการพูด recovery phrase แทน ไม่ reject) เทสนี้จึงพิสูจน์สิ่งที่เกิดขึ้นจริง: ack dispatch ที่เจอ Claude error
+// ยังต้อง resilient เหมือน turn ปกติทุกประการ (recovery phrase, exactly-once, ไม่ crash) ไม่ใช่พิสูจน์ catch
+// block ของ tryDeliverPendingShortAck โดยตรง (branch นั้นเป็น defense-in-depth สำหรับความล้มเหลวที่หลุดจาก
+// safety net ชั้นในสุดจริงๆ เท่านั้น เช่น exception ก่อนเข้า try/catch ของ processTranscript เอง)
+test('Design B: dispatch turn ใหม่จาก short-ack ที่เจอ Claude error ระหว่างทาง → ใช้ recovery-phrase safety net เดิมของ legacy ได้ปกติ ไม่ crash ไม่ retry ซ้ำ', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+
+  let resumeClaude
+  const claudeGate = new Promise(resolve => { resumeClaude = resolve })
+  state.claudeStreamImpl = async function* () { yield 'คำตอบหลัก'; await claudeGate }
+  // main turn ต้อง 0 chunks (trigger no-audio hand-off) แต่ recovery-phrase ของ ack's own turn ต้องมีอย่างน้อย
+  // 1 chunk ไม่งั้น speakFixedText().sentCount===0 จะทำให้ fullText ไม่ถูก commit เข้า session.messages เลยตาม
+  // design เดิม ("ห้ามพูดจบครบเพียงเพราะประโยคสั้น" — sentCount>0 เท่านั้นถึง commit) — ใช้ call-count แยกสอง
+  // behavior แทนการ reassign state.ttsImpl กลางทาง (reassign ก่อน resumeClaude() จะไปกระทบ main turn's TTS call
+  // ที่ยังไม่เกิดขึ้นจริงด้วย เพราะ harness อ่าน state.ttsImpl แบบ dynamic ต่อ call ไม่ capture ตอนเริ่ม — บั๊กที่
+  // เจอจริงตอนรันเทสนี้ครั้งแรก)
+  let ttsCallCount = 0
+  state.ttsImpl = async function* () {
+    ttsCallCount++
+    if (ttsCallCount === 1) return // main turn: 0 chunks
+    yield Buffer.from('recovery-audio') // ack's recovery-phrase turn: มีเสียงจริง
+  }
+
+  const oldTurnPromise = harness.sendFinalTranscript('ขอสอบถามโปรโมชั่นหน่อยค่ะ')
+  await delay(30)
+  await harness.sendFinalTranscript('ครับ') // Tier2 capture
+
+  let dispatchCalls = 0
+  state.claudeStreamImpl = async function* () {
+    dispatchCalls++
+    throw new Error('boom — จำลอง Claude ล้มระหว่าง dispatch turn ใหม่จาก ack')
+  }
+
+  resumeClaude() // turn หลักจบ → TTS 0 chunks → no-audio hand-off เรียก dispatcher ที่ Claude จะ throw
+  await oldTurnPromise
+  await delay(150) // LEGACY_CLAUDE_TIMEOUT_MS_OVERRIDE=80ms ในไฟล์นี้ — ให้เวลาพอสำหรับ watchdog/recovery พูดจบ
+
+  assert.equal(dispatchCalls, 1, 'ต้องพยายาม dispatch แค่ครั้งเดียว ไม่ retry ซ้ำ')
+  const userMsgs = session.messages.filter(m => m.role === 'user').map(m => m.content)
+  assert.equal(userMsgs.filter(t => t === 'ครับ').length, 1, 'ack ต้องถูก push เข้า session แค่ครั้งเดียว ไม่ซ้ำ')
+  const lastAssistant = session.messages.filter(m => m.role === 'assistant').at(-1)
+  assert.equal(lastAssistant?.content, LEGACY_RECOVERY_PHRASE, 'ต้อง fallback ไปใช้ recovery phrase เดิมของ legacy ได้ปกติ ไม่ crash ไม่หลุดออกไปเป็น unhandled rejection')
+
+  harness.disconnect(socket)
+})
+
+test('Design B: classifier — "OK"/"OK." classify Tier2, "ok ครับ"/"okครับ"/"OK ครับ." classify Tier1 (whitespace/punctuation-insensitive) โดย raw text ที่ deliver ไม่ถูกแก้เลย', async () => {
+  const cases = [
+    { text: 'OK', expectTier1: false },
+    { text: 'OK.', expectTier1: false },
+    { text: 'ok ครับ', expectTier1: true },
+    { text: 'okครับ', expectTier1: true },
+    { text: 'OK ครับ.', expectTier1: true },
+  ]
+
+  for (const { text, expectTier1 } of cases) {
+    const callSid = nextCallSid()
+    const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+
+    let resumeOldTurn
+    const oldTurnGate = new Promise(resolve => { resumeOldTurn = resolve })
+    state.claudeStreamImpl = async function* () { yield 'คำตอบหลัก'; await oldTurnGate }
+    const oldTurnPromise = harness.sendFinalTranscript('ขอสอบถามโปรโมชั่นหน่อยค่ะ')
+    await delay(30)
+
+    let newTurnCalls = 0
+    state.claudeStreamImpl = async function* () { newTurnCalls++; yield 'ตอบ' }
+    await harness.sendFinalTranscript(text)
+
+    const bargedInImmediately = socket.sent.filter(e => e.event === 'clear').length > 0
+    assert.equal(bargedInImmediately, expectTier1, `"${text}" ควร ${expectTier1 ? 'Tier1 (bargeIn ทันที)' : 'Tier2 (defer)'} — ได้ clear=${bargedInImmediately}`)
+
+    resumeOldTurn()
+    await oldTurnPromise
+    await delay(20)
+
+    if (expectTier1) {
+      const lastUserMsg = session.messages.filter(m => m.role === 'user').at(-1)
+      assert.equal(lastUserMsg.content, text, `raw text ที่ deliver ต้องเป็น "${text}" เป๊ะ ไม่ถูก normalize/lowercase ทิ้ง`)
+    }
+
+    harness.disconnect(socket)
+  }
+})
+
+test('Design B: Context 2 (post-mark <500ms) — ack ที่รู้จัก (ทั้ง Tier1/Tier2) ผ่าน echo filter ได้ ไม่ถูก suppress เหมือน fragment ทั่วไป', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+
+  state.claudeStreamImpl = async function* () { yield 'คำตอบสั้น' }
+  await harness.sendFinalTranscript('สวัสดีค่ะ')
+  const mark = socket.sent.filter(e => e.event === 'mark').at(-1)
+  socket.emit('message', JSON.stringify({ event: 'mark', mark: mark.mark }))
+  await delay(10) // unlock แล้ว lastMarkTime ถูกตั้งใหม่ — อยู่ในหน้าต่าง <500ms แน่นอน
+
+  let newTurnCalls = 0
+  state.claudeStreamImpl = async function* () { newTurnCalls++; yield 'ตอบรับทราบ' }
+  await harness.sendFinalTranscript('ครับ') // สั้นกว่า threshold เดิม (wc<3, len<10) แต่เป็น whitelist → ต้องผ่าน
+
+  assert.equal(newTurnCalls, 1, 'ack ที่รู้จักภายใน 500ms หลัง mark ต้องผ่าน echo filter ได้ ไม่ถูก suppress')
 
   harness.disconnect(socket)
 })

@@ -26,6 +26,25 @@ const STT_CONFIG = {
   enableAutomaticPunctuation: true,
 }
 
+// Design A (interim regression protection, production incident 2026-08-20) — production call ยืนยันว่า Google
+// ส่ง interim เดินหน้า/ถอยหลังสลับกันได้จริง ("ok" → "ok ครับ" → "ok") เดิม interimText ถูก overwrite แบบไม่มี
+// เงื่อนไขทุกครั้งที่ interim ใหม่มา ทำให้ 900ms timer หยิบค่าล่าสุดไปเสมอแม้จะเป็น candidate ที่ "ถอยหลัง" จริง —
+// ป้องกันเฉพาะกรณี strict-prefix regression เท่านั้น (candidate ใหม่สั้นกว่าและเป็น prefix ของ candidate เดิม
+// เป๊ะ หลัง normalize) ไม่ใช้ naive "longest-wins" เพราะ recognizer แก้คำผิดจริงได้ (เช่น "สงคราม"→"สนใจครับ" ไม่ใช่
+// prefix relation เลย ต้องยอม overwrite ตามปกติ) — normalize ใช้เพื่อเปรียบเทียบเท่านั้น ค่าที่เก็บ/deliver จริง
+// ยังเป็นข้อความดิบจาก Google เป๊ะ ไม่ lowercase/trim ทิ้ง
+function normalizeCandidate(text) {
+  return text.trim().replace(/\s+/g, ' ').toLowerCase()
+}
+
+function isInterimRegression(previous, candidate) {
+  if (!previous) return false
+  const prevNorm = normalizeCandidate(previous)
+  const candNorm = normalizeCandidate(candidate)
+  if (candNorm.length >= prevNorm.length) return false
+  return prevNorm.startsWith(candNorm)
+}
+
 // L1a (latency optimization, rollout-scoped STT endpoint experiment): interimFinalizeMs รับจากภายนอกได้แล้ว
 // default 900ms เดิมทุกประการถ้า caller ไม่ส่งอะไรมา — googleSTT.js เป็น STT ตัวเดียวที่ legacy และ chunked
 // path ใช้ร่วมกัน เปลี่ยนค่า default ตรงๆ จะกระทบ legacy production ทุกสายทันทีโดยไม่ผูกกับ chunked rollout เลย
@@ -150,8 +169,13 @@ function transcribeStream(onTranscript, onInterim, { interimFinalizeMs = 900 } =
         if (!text || utteranceClosed) return
 
         console.log(`[STT interim] "${text}"`)
-        interimText = text
         onInterim?.(text)
+
+        if (isInterimRegression(interimText, text)) {
+          console.log(`[STT] Interim regression ignored: "${interimText}" <- "${text}"`)
+        } else {
+          interimText = text
+        }
 
         if (!nextStream && !destroyed) createStream(true)
 

@@ -176,6 +176,106 @@ test('L1a: rotation ยังเกิดหลัง transcript deliver แม�
   sttStream.end()
 })
 
+// ===== Design A — interim regression protection (production incident 2026-08-20) =====
+// production call จริงยืนยัน Google ส่ง interim ถอยหลังได้: "ok" → "ok ครับ" → "ok" แล้ว 900ms timer หยิบ "ok"
+// (ค่าล่าสุด) ไปเป็น final ทั้งที่ "ok ครับ" คือคำตอบที่ถูกต้องจริง — ป้องกันเฉพาะ strict-prefix regression เท่านั้น
+// (candidate ใหม่สั้นกว่าและเป็น prefix ของ candidate เดิมเป๊ะ หลัง normalize) ไม่ใช่ naive longest-wins
+
+test('Design A: interim ถอยหลังแบบ strict-prefix ("ok"→"ok ครับ"→"ok") → deliver ค่าที่แข็งแรงกว่า "ok ครับ" ไม่ใช่ "ok"', async () => {
+  createdStreams = []
+  const transcripts = []
+  const sttStream = transcribeStream((t) => transcripts.push(t), () => {})
+  const first = createdStreams[0]
+
+  emitInterim(first, 'ok')
+  emitInterim(first, 'ok ครับ')
+  emitInterim(first, 'ok') // regression — ต้องไม่ทับ "ok ครับ" ที่เก็บไว้
+
+  await delay(950)
+  assert.deepEqual(transcripts, ['ok ครับ'], 'ต้อง deliver candidate ที่แข็งแรงกว่า ไม่ใช่ regression ล่าสุด')
+
+  sttStream.end()
+})
+
+test('Design A: interim เติบโตต่อเนื่อง (ไม่มี regression เลย) → deliver ค่าล่าสุดตามปกติ ไม่ถูกกระทบ', async () => {
+  createdStreams = []
+  const transcripts = []
+  const sttStream = transcribeStream((t) => transcripts.push(t), () => {})
+  const first = createdStreams[0]
+
+  emitInterim(first, 'ok ครับ')
+  emitInterim(first, 'ok ครับ ค่ะ')
+
+  await delay(950)
+  assert.deepEqual(transcripts, ['ok ครับ ค่ะ'], 'growth ปกติต้องไม่ถูกบล็อก')
+
+  sttStream.end()
+})
+
+test('Design A: correction จริงที่ไม่ใช่ prefix relation (คำหลอน "สงคราม" → คำถูกต้อง "สนใจครับ") → ยอม overwrite ปกติ ไม่ใช่ regression', async () => {
+  createdStreams = []
+  const transcripts = []
+  const sttStream = transcribeStream((t) => transcripts.push(t), () => {})
+  const first = createdStreams[0]
+
+  emitInterim(first, 'สงคราม')
+  emitInterim(first, 'สนใจครับ')
+
+  await delay(950)
+  assert.deepEqual(transcripts, ['สนใจครับ'], 'correction ที่ไม่ใช่ prefix ต้องไม่ถูกปฏิเสธ (ไม่ใช่ naive longest-wins)')
+
+  sttStream.end()
+})
+
+test('Design A: whitespace/case variation ระหว่าง candidate เดิมกับใหม่ ยังตรวจ regression ถูกต้อง (normalize เพื่อเปรียบเทียบเท่านั้น)', async () => {
+  createdStreams = []
+  const transcripts = []
+  const sttStream = transcribeStream((t) => transcripts.push(t), () => {})
+  const first = createdStreams[0]
+
+  emitInterim(first, 'OK  ครับ') // เว้นวรรคซ้อน + ตัวพิมพ์ใหญ่
+  emitInterim(first, 'ok') // regression (หลัง normalize: "ok ครับ" เทียบกับ "ok")
+
+  await delay(950)
+  assert.deepEqual(transcripts, ['OK  ครับ'], 'ค่าที่ deliver ต้องเป็นข้อความดิบเดิม ไม่ถูก normalize/lowercase ทิ้ง')
+
+  sttStream.end()
+})
+
+test('Design A: real isFinal จาก Google มาแทนที่ระหว่างมี regression-protected state ค้างอยู่ → isFinal ชนะเสมอ', async () => {
+  createdStreams = []
+  const transcripts = []
+  const sttStream = transcribeStream((t) => transcripts.push(t), () => {})
+  const first = createdStreams[0]
+
+  emitInterim(first, 'ok ครับ')
+  emitInterim(first, 'ok') // regression protected — "ok ครับ" ยังถูกเก็บไว้
+  emitFinal(first, 'ok ค่ะ ครับ') // isFinal จริงจาก Google ต้องชนะไม่ว่า protected state จะเป็นอะไร
+
+  assert.deepEqual(transcripts, ['ok ค่ะ ครับ'])
+
+  sttStream.end()
+})
+
+test('Design A: protected state ต้องไม่รั่วข้าม utterance หลัง rotate', async () => {
+  createdStreams = []
+  const transcripts = []
+  const sttStream = transcribeStream((t) => transcripts.push(t), () => {})
+  const first = createdStreams[0]
+
+  emitInterim(first, 'ok ครับ')
+  emitInterim(first, 'ok') // regression protected ภายใน utterance แรก
+  await delay(950) // deliver "ok ครับ" แล้ว rotate ไป utterance ใหม่
+
+  const second = createdStreams[1]
+  emitInterim(second, 'ทดสอบ') // utterance ใหม่ต้องเริ่มจาก state สะอาด ไม่มี "ok ครับ" ค้างมาปน
+  await delay(950)
+
+  assert.deepEqual(transcripts, ['ok ครับ', 'ทดสอบ'])
+
+  sttStream.end()
+})
+
 test('L1a: end() ระหว่าง timer ยังรอ (ก่อนครบ interimFinalizeMs) ต้อง cancel timer ไม่ deliver อะไรเลยหลัง end', async () => {
   createdStreams = []
   const transcripts = []
