@@ -77,7 +77,16 @@ beforeEach(() => {
   state.claudeStreamChunkedImpl = async function* () {}
   state.ttsImpl = async function* () { yield Buffer.from('audio') }
   state.rolloutPercent = 0
+  // L2a production exposure gate (design revision 2026-08-20) — reset ทุกเทสเหมือน rolloutPercent ข้างบน กัน
+  // ค่าที่เทสก่อนหน้าตั้งไว้หลุดข้ามมาปนเทสถัดไปโดยไม่ตั้งใจ default fail-closed เหมือน production cold start
+  state.legacyObservedConfig = { percent: 0, campaignId: null }
 })
+
+// L2a exposure gate tests — campaign id คงที่ใช้ร่วมกันเพื่อจำลอง "dedicated test campaign" ตามแผน production จริง
+const L2A_CAMPAIGN_ID = 'CAMPAIGN_L2A_TEST'
+function l2aCampaign(overrides = {}) {
+  return { voice_id: 'voice1', script: 'ระบบทดสอบ', id: L2A_CAMPAIGN_ID, ...overrides }
+}
 
 test('smoke: connect + start + final transcript ที่ rollout 0% → ได้ media event ส่งออกจริงจาก legacy path', async () => {
   const callSid = nextCallSid()
@@ -2138,7 +2147,8 @@ test('Design B: Context 2 (post-mark <500ms) — ack ที่รู้จัก
 
 test('L2a: fresh legacy call ปกติ → turnMetrics มี legacyClaude* fields ครบตามที่ควรมี (requestAt/firstDeltaAt/fullAt ไม่ null, outcome=COMPLETED, derived metrics คำนวณได้จริง) และ canonical t2/t3/t4 เดิมไม่ถูกกระทบ', async () => {
   const callSid = nextCallSid()
-  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+  harness.getState().legacyObservedConfig = { percent: 100, campaignId: L2A_CAMPAIGN_ID } // OBSERVED — ต้องเปิดกลุ่มไว้ก่อน test นี้จึงจะเห็น telemetry
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0, sessionOverrides: { campaign: l2aCampaign() } })
 
   state.claudeStreamImpl = async function* () { yield 'สวัสดีค่ะ มีโปรโมชั่นให้ค่ะ' }
 
@@ -2163,7 +2173,8 @@ test('L2a: fresh legacy call ปกติ → turnMetrics มี legacyClaude* f
 
 test('L2a integration (required test 17): fresh legacy Claude ค้างเกิน LEGACY_CLAUDE_TIMEOUT → turnMetrics.legacyClaudeOutcome = TIMEOUT, recovery phrase พูดตามพฤติกรรมเดิมทุกประการ', { timeout: 15000 }, async () => {
   const callSid = nextCallSid()
-  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+  harness.getState().legacyObservedConfig = { percent: 100, campaignId: L2A_CAMPAIGN_ID }
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0, sessionOverrides: { campaign: l2aCampaign() } })
 
   state.claudeStreamImpl = async function* () { await new Promise(() => {}) } // ค้างตลอดไป ไม่เคย resolve — บังคับให้ LEGACY_CLAUDE_TIMEOUT (80ms override ของไฟล์นี้) ทำงานจริง
 
@@ -2178,7 +2189,8 @@ test('L2a integration (required test 17): fresh legacy Claude ค้างเก
 
 test('L2a integration (required test 18): fresh legacy Claude error กลางทาง (ไม่ใช่ abort) → turnMetrics.legacyClaudeOutcome = ERROR, recovery phrase พูดตามพฤติกรรมเดิมทุกประการ', async () => {
   const callSid = nextCallSid()
-  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+  harness.getState().legacyObservedConfig = { percent: 100, campaignId: L2A_CAMPAIGN_ID }
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0, sessionOverrides: { campaign: l2aCampaign() } })
 
   state.claudeStreamImpl = async function* () { throw new Error('boom — จำลอง Claude API ล้มจริงกลางทาง') }
 
@@ -2193,7 +2205,8 @@ test('L2a integration (required test 18): fresh legacy Claude error กลาง
 
 test('L2a integration (required test 19): fresh legacy Claude สำเร็จแต่ไม่มีข้อความให้พูดเลย (ว่างเปล่า) → turnMetrics.legacyClaudeOutcome = EMPTY, recovery phrase พูดตามพฤติกรรมเดิมทุกประการ', async () => {
   const callSid = nextCallSid()
-  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+  harness.getState().legacyObservedConfig = { percent: 100, campaignId: L2A_CAMPAIGN_ID }
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0, sessionOverrides: { campaign: l2aCampaign() } })
 
   state.claudeStreamImpl = async function* () {} // ไม่ yield อะไรเลย
 
@@ -2208,7 +2221,8 @@ test('L2a integration (required test 19): fresh legacy Claude สำเร็จ
 
 test('L2a integration (required test 15): barge-in ระหว่าง fresh legacy Claude call กำลังรอ → turnMetrics.legacyClaudeOutcome = ABORTED สำหรับเทิร์นเดิม ไม่มีการพูด recovery phrase ทับ', async () => {
   const callSid = nextCallSid()
-  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+  harness.getState().legacyObservedConfig = { percent: 100, campaignId: L2A_CAMPAIGN_ID }
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0, sessionOverrides: { campaign: l2aCampaign() } })
 
   let resumeOldTurn
   const oldTurnGate = new Promise(resolve => { resumeOldTurn = resolve })
@@ -2242,9 +2256,10 @@ test('L2a integration (required test 15): barge-in ระหว่าง fresh l
   harness.disconnect(socket)
 })
 
-test('L2a: prewarm HIT (grace success) → ไม่มี fresh legacyClaude* timestamp ใดๆ ถูก fabricate เลย เพราะ fresh-call branch ไม่เคยทำงานจริง', async () => {
+test('L2a (required test 28/29): prewarm HIT (grace success) → ไม่มี fresh legacyClaude* timestamp ใดๆ ถูก fabricate เลย แม้ legacyObserved=true ก็ตาม เพราะ fresh-call branch ไม่เคยทำงานจริง (prewarm ยังใช้ askClaudeStream() เดิมเสมอ ไม่ขึ้นกับ gate นี้)', async () => {
   const callSid = nextCallSid()
-  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+  harness.getState().legacyObservedConfig = { percent: 100, campaignId: L2A_CAMPAIGN_ID } // ตั้งใจเปิด OBSERVED ไว้ — พิสูจน์ว่า prewarm HIT ยังบายพาสได้แม้ gate เปิดอยู่
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0, sessionOverrides: { campaign: l2aCampaign() } })
 
   state.claudeStreamImpl = async function* () { yield 'คำตอบจาก prewarm' } // resolve เร็วมาก ไม่มี await ค้าง — prewarm เองก็ใช้ askClaudeStream() เดิมไม่เปลี่ยน
 
@@ -2257,6 +2272,171 @@ test('L2a: prewarm HIT (grace success) → ไม่มี fresh legacyClaude* t
   assert.equal(metrics.legacyClaudeFirstDeltaAt, null)
   assert.equal(metrics.legacyClaudeFullAt, null)
   assert.equal(metrics.legacyClaudeOutcome, null, 'ต้องเป็น null เพราะไม่เคยมี fresh attempt เกิดขึ้นจริง')
+
+  harness.disconnect(socket)
+})
+
+// ===== L2a production exposure gate (design revision 2026-08-20, round 4 corrections) =====
+// bucket ที่ใช้ในเทสด้านล่างคำนวณไว้ล่วงหน้าจริงจาก getLegacyObservedBucket() (verified — ดู test/rolloutBucket.test.js
+// fixture เดียวกัน): CA_L2A_Q1=44, CA_L2A_NQ1=50, CA_L2A_WRONGCAMP=15, CA_L2A_MISSCAMP=9, CA_L2A_CHUNK=45, CA_L2A_MID=69, CA_L2A_KILL=43
+
+test('L2a exposure (required test 18/26/27): matching campaign + qualifying bucket → OBSERVED, telemetry populates, [Metrics] มี frozen assignment metadata ครบ', async () => {
+  const callSid = 'CA_L2A_Q1' // bucket=44
+  harness.getState().legacyObservedConfig = { percent: 50, campaignId: L2A_CAMPAIGN_ID } // 44 < 50 → qualifies
+  const { socket, state } = await connectPastGreeting(callSid, { rolloutPercent: 0, sessionOverrides: { campaign: l2aCampaign() } })
+
+  let observedCalls = 0, streamCalls = 0
+  state.claudeObservedImpl = async function* (session, signal, onMilestone) {
+    observedCalls++
+    onMilestone?.('requestAt', Date.now())
+    onMilestone?.('firstDeltaAt', Date.now())
+    onMilestone?.('fullAt', Date.now())
+    yield 'observed response'
+  }
+  state.claudeStreamImpl = async function* () { streamCalls++; yield 'ไม่ควรถูกเรียก' }
+
+  const metrics = await captureMetrics(() => harness.sendFinalTranscript('ทดสอบ'))
+
+  assert.equal(observedCalls, 1, 'legacyObserved=true ต้องเรียก askClaudeObservedFullResponse (required test 24)')
+  assert.equal(streamCalls, 0, 'ต้องไม่เรียก askClaudeStream เลยตอน OBSERVED')
+  assert.equal(metrics.legacyObserved, true)
+  assert.equal(metrics.legacyObservedBucket, 44)
+  assert.equal(metrics.legacyObservedPercentAtStart, 50)
+  assert.equal(metrics.legacyObservedCampaignMatched, true)
+  assert.ok(metrics.legacyClaudeRequestAt != null && metrics.legacyClaudeFullAt != null, 'OBSERVED ต้อง populate telemetry จริง')
+  assert.equal(metrics.legacyClaudeOutcome, 'COMPLETED')
+
+  harness.disconnect(socket)
+})
+
+test('L2a exposure (required test 19/23/25): matching campaign แต่ bucket ไม่ผ่านเกณฑ์ → CONTROL, ใช้ askClaudeStream, legacyClaude* fields ทั้งหมดเป็น null', async () => {
+  const callSid = 'CA_L2A_NQ1' // bucket=50
+  harness.getState().legacyObservedConfig = { percent: 50, campaignId: L2A_CAMPAIGN_ID } // 50 < 50 = false → ไม่ qualify
+  const { socket, state } = await connectPastGreeting(callSid, { rolloutPercent: 0, sessionOverrides: { campaign: l2aCampaign() } })
+
+  let observedCalls = 0, streamCalls = 0
+  state.claudeObservedImpl = async function* () { observedCalls++; yield 'ไม่ควรถูกเรียก' }
+  state.claudeStreamImpl = async function* () { streamCalls++; yield 'CONTROL response' }
+
+  const metrics = await captureMetrics(() => harness.sendFinalTranscript('ทดสอบ'))
+
+  assert.equal(streamCalls, 1, 'CONTROL ต้องเรียก askClaudeStream (required test 23)')
+  assert.equal(observedCalls, 0, 'ต้องไม่เรียก askClaudeObservedFullResponse เลยตอน CONTROL')
+  assert.equal(metrics.legacyObserved, false)
+  assert.equal(metrics.legacyObservedCampaignMatched, true, 'campaign match ได้ แต่ bucket ไม่ผ่านเกณฑ์ยังคง CONTROL')
+  assert.equal(metrics.legacyClaudeRequestAt, null)
+  assert.equal(metrics.legacyClaudeFirstDeltaAt, null)
+  assert.equal(metrics.legacyClaudeFullAt, null)
+  assert.equal(metrics.legacyClaudeOutcome, null, 'required test 25 — CONTROL ต้อง null ทุก legacyClaude* field ไม่ใช่แค่ timestamp')
+
+  harness.disconnect(socket)
+})
+
+test('L2a exposure (required test 20): bucket ผ่านเกณฑ์แต่ campaign ไม่ตรง → CONTROL เสมอ', async () => {
+  const callSid = 'CA_L2A_WRONGCAMP' // bucket=15
+  harness.getState().legacyObservedConfig = { percent: 50, campaignId: L2A_CAMPAIGN_ID } // 15 < 50 qualifies bucket-wise
+  const { socket, state } = await connectPastGreeting(callSid, { rolloutPercent: 0, sessionOverrides: { campaign: l2aCampaign({ id: 'SOME_OTHER_CAMPAIGN' }) } })
+
+  const metrics = await captureMetrics(() => harness.sendFinalTranscript('ทดสอบ'))
+
+  assert.equal(metrics.legacyObservedCampaignMatched, false)
+  assert.equal(metrics.legacyObserved, false, 'campaign ไม่ตรง ต้อง CONTROL แม้ bucket จะผ่านเกณฑ์ก็ตาม')
+  assert.equal(metrics.legacyClaudeOutcome, null)
+
+  harness.disconnect(socket)
+})
+
+test('L2a exposure (required test 21): session.campaign ไม่มี id เลย (missing) → CONTROL — "ไม่มี campaign_id" ต้องไม่แปลว่า "ทุก campaign"', async () => {
+  const callSid = 'CA_L2A_MISSCAMP' // bucket=9
+  harness.getState().legacyObservedConfig = { percent: 50, campaignId: L2A_CAMPAIGN_ID } // 9 < 50 qualifies bucket-wise
+  // sessionOverrides.campaign ไม่มี field id เลย (จำลอง session ที่ campaign ไม่ผูก id ใดๆ)
+  const { socket, state } = await connectPastGreeting(callSid, { rolloutPercent: 0, sessionOverrides: { campaign: { voice_id: 'voice1', script: 'ระบบทดสอบ' } } })
+
+  const metrics = await captureMetrics(() => harness.sendFinalTranscript('ทดสอบ'))
+
+  assert.equal(metrics.legacyObservedCampaignMatched, false)
+  assert.equal(metrics.legacyObserved, false)
+  assert.equal(metrics.legacyClaudeOutcome, null)
+
+  harness.disconnect(socket)
+})
+
+test('L2a exposure (required test 22): chunked=true (rollout_percent สูง) → legacyObserved=false เสมอ ไม่ว่า observed config จะเป็นอะไร', async () => {
+  const callSid = 'CA_L2A_CHUNK'
+  harness.getState().legacyObservedConfig = { percent: 100, campaignId: L2A_CAMPAIGN_ID } // เปิด observed 100% ตั้งใจ — พิสูจน์ว่า chunked ยัง override เป็น false เสมอ
+  const { socket, state } = await connectPastGreeting(callSid, { rolloutPercent: 100, sessionOverrides: { campaign: l2aCampaign() } })
+
+  state.claudeStreamChunkedImpl = async function* () { yield 'ตอบจาก chunked path' }
+
+  const metrics = await captureMetrics(() => harness.sendFinalTranscript('ทดสอบ'))
+
+  assert.equal(metrics.path, 'chunked')
+  assert.equal(metrics.legacyObserved, false, 'chunked=true ต้อง override legacyObserved เป็น false เสมอ (required test 22)')
+  assert.equal(metrics.legacyClaudeOutcome, null)
+
+  harness.disconnect(socket)
+})
+
+test('L2a exposure (required test 31): config เปลี่ยนกลางสาย ไม่กระทบ decision ที่ freeze ไปแล้วตอน WS start (sticky ต่อสายเหมือน rollout)', async () => {
+  const callSid = 'CA_L2A_MID' // bucket=69
+  harness.getState().legacyObservedConfig = { percent: 100, campaignId: L2A_CAMPAIGN_ID } // 69 < 100 qualifies ตอนเริ่มสาย
+  const { socket, state } = await connectPastGreeting(callSid, { rolloutPercent: 0, sessionOverrides: { campaign: l2aCampaign() } })
+
+  const metricsA = await captureMetrics(() => harness.sendFinalTranscript('เทิร์นแรก'))
+  assert.equal(metricsA.legacyObserved, true, 'เทิร์นแรกต้อง OBSERVED ตาม config ตอน start')
+
+  // เปลี่ยน config "กลางสาย" (จำลอง admin แก้ Sheets แล้ว background refresh อัปเดตแล้ว) — ห้ามกระทบสายนี้ที่ freeze ไปแล้ว
+  harness.getState().legacyObservedConfig = { percent: 0, campaignId: null }
+  await delay(20)
+
+  const metricsB = await captureMetrics(() => harness.sendFinalTranscript('เทิร์นที่สอง'))
+  assert.equal(metricsB.legacyObserved, true, 'เทิร์นที่สองในสายเดียวกันต้องยัง OBSERVED เหมือนเดิม — decision freeze ตอน start ครั้งเดียว ไม่ re-evaluate ทุกเทิร์น')
+  assert.equal(metricsB.legacyObservedBucket, 69)
+  assert.equal(metricsB.legacyObservedPercentAtStart, 100, 'percentAtStart ต้องเป็นค่า ณ ตอน start ไม่ใช่ค่าที่เปลี่ยนไปกลางสาย')
+
+  harness.disconnect(socket)
+})
+
+test('L2a exposure (required test 32): kill switch — สายใหม่หลัง config refresh กลับเป็น 0 ต้องได้ CONTROL (ไม่กระทบสายเก่าที่ freeze OBSERVED ไปแล้ว)', async () => {
+  const oldCallSid = 'CA_L2A_KILL' // bucket=43
+  harness.getState().legacyObservedConfig = { percent: 100, campaignId: L2A_CAMPAIGN_ID }
+  const { socket: oldSocket } = await connectPastGreeting(oldCallSid, { rolloutPercent: 0, sessionOverrides: { campaign: l2aCampaign() } })
+  const oldMetrics = await captureMetrics(() => harness.sendFinalTranscript('สายเก่า'))
+  assert.equal(oldMetrics.legacyObserved, true, 'สายเก่าต้อง OBSERVED ตาม config ตอนที่มันเริ่ม')
+
+  // kill switch: แก้ Sheets เป็น 0 แล้ว refresh สำเร็จแล้ว (จำลองด้วยการ set state ตรงๆ — harness ไม่มี polling delay จริง)
+  harness.getState().legacyObservedConfig = { percent: 0, campaignId: null }
+
+  const newCallSid = nextCallSid()
+  const { socket: newSocket, state: newState } = await connectPastGreeting(newCallSid, { rolloutPercent: 0, sessionOverrides: { campaign: l2aCampaign() } })
+  const newMetrics = await captureMetrics(() => harness.sendFinalTranscript('สายใหม่หลัง kill switch'))
+  assert.equal(newMetrics.legacyObserved, false, 'สายใหม่ที่เริ่มหลัง kill switch ต้องได้ CONTROL ทันที')
+  assert.equal(newMetrics.legacyClaudeOutcome, null)
+
+  // สายเก่าที่ปิดไปแล้วไม่เกี่ยว — ยืนยันแค่ค่าที่ capture ไว้ตอนสายเก่ายังเปิดอยู่ (oldMetrics) ไม่ถูกเขียนทับย้อนหลัง
+  assert.equal(oldMetrics.legacyObserved, true)
+
+  harness.disconnect(oldSocket)
+  harness.disconnect(newSocket)
+})
+
+test('L2a exposure (required test 30): runLegacyFallback (chunked path fallback-to-legacy) ไม่ถูกกระทบจาก exposure gate เลย — ยังใช้ askClaudeStream เสมอไม่ว่า legacyObservedConfig จะเป็นอะไร', async () => {
+  const callSid = nextCallSid()
+  harness.getState().legacyObservedConfig = { percent: 100, campaignId: L2A_CAMPAIGN_ID } // เปิด observed 100% ตั้งใจ — runLegacyFallback ต้องไม่แตะเลย
+  const { socket, state } = await connectPastGreeting(callSid, { rolloutPercent: 100, sessionOverrides: { campaign: l2aCampaign() } }) // chunked path
+
+  let observedCalls = 0, streamCalls = 0
+  state.claudeStreamChunkedImpl = async function* () { throw new Error('chunked boom') } // ล้มทันที → เข้า runLegacyFallback
+  state.claudeObservedImpl = async function* () { observedCalls++; yield 'ไม่ควรถูกเรียกเลย' }
+  state.claudeStreamImpl = async function* () { streamCalls++; yield 'คำตอบจาก fallback' }
+
+  const metrics = await captureMetrics(() => harness.sendFinalTranscript('ทดสอบ'))
+
+  assert.equal(streamCalls, 1, 'runLegacyFallback ต้องเรียก askClaudeStream เหมือนเดิมทุกประการ')
+  assert.equal(observedCalls, 0, 'runLegacyFallback ต้องไม่ถูก gate เปลี่ยนไปเรียก askClaudeObservedFullResponse เลย (นอกขอบเขตของ L2a gate ทั้งหมด)')
+  assert.equal(metrics.legacyClaudeOutcome, null, 'fallback ไม่ใช่ fresh-call branch ที่ gate แตะ — legacyClaude* ต้องยัง null')
+  const mediaEvents = socket.sent.filter(e => e.event === 'media')
+  assert.ok(mediaEvents.length > 0, 'fallback ต้องพูดออกมาได้จริง')
 
   harness.disconnect(socket)
 })

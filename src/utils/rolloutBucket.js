@@ -20,4 +20,14 @@ function decideRollout(callSid, rolloutPercent) {
   }
 }
 
-module.exports = { getRolloutBucket, decideRollout }
+// L2a exposure gate — dedicated helper (ไม่ใช่ generic getNamespacedBucket) ตั้งใจลดโอกาส caller ใส่ namespace
+// ผิดใน production โดยรวม "legacy-observed:" prefix เข้าไปใน hash input โดยตรง ทำให้ bucket assignment ของ
+// experiment นี้ independent จาก getRolloutBucket() (chunked rollout) อย่างสมบูรณ์ แม้ callSid เดียวกัน — สอง
+// ค่านี้อาจบังเอิญเท่ากันได้ (%100 ชนกันได้เป็นปกติ) นั่นไม่ได้แปลว่า independence เสีย ห้าม assert ว่าต้องต่างกัน
+// getRolloutBucket() เดิมไม่ถูกแก้แม้แต่บรรทัดเดียว — chunked production bucket assignment ไม่เปลี่ยน
+function getLegacyObservedBucket(callSid) {
+  const hex = crypto.createHash('sha256').update(`legacy-observed:${String(callSid)}`).digest('hex').slice(0, 8)
+  return parseInt(hex, 16) % 100
+}
+
+module.exports = { getRolloutBucket, decideRollout, getLegacyObservedBucket }

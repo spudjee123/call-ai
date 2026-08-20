@@ -36,12 +36,58 @@ function parseRolloutPercent(rows) {
   return classifyRolloutPercent(rows).value
 }
 
+// L2a production exposure gate — คนละ fail-safe policy จาก rollout_percent โดยตั้งใจ (design revision 2026-08-20):
+// rollout_percent ใช้ last-known-good เพราะเป็น production feature rollout ปกติ แต่ legacy_observed_percent เป็น
+// experimental transport switch ที่แตะ fresh legacy call site ตรงๆ ("เบรก" ให้ a982fdf ก่อนขึ้น production) จึงต้อง
+// fail CLOSED เป็น 0 เสมอทุกกรณีที่ไม่ใช่ "parse สำเร็จและถูกต้องครบ" — ไม่มี LKG ไม่มี cold-start "ยังไม่รู้ค่า"
+//
+// กติกาสำคัญที่สุด: "ไม่มี campaign_id" ต้องไม่แปลว่า "ทุก campaign" — ยังไม่มี all-campaign mode ใน L2a นี้เลย
+// ดังนั้น percent>0 ต้องมี campaignId ที่ valid ไม่ว่างเปล่าคู่กันเสมอ ไม่งั้นทั้งคู่ fail-closed กลับเป็น {0, null}
+// (เช่น คนแก้ชีตใส่ legacy_observed_percent=100 แต่ลืมใส่ campaign_id — ต้องได้ CONTROL ทุกสาย ไม่ใช่ observed 100%)
+//
+// คืนเป็น atomic snapshot เดียว {percent, campaignId} เสมอ (ไม่ใช่ getter แยก 2 ตัว) กัน caller ในอนาคตอ่านค่า
+// สอง field จากคนละรอบ refresh กันโดยไม่ตั้งใจ แม้ตอนนี้ background poll จะ single-threaded ก็ตาม
+function classifyLegacyObservedConfig(rows) {
+  const percentRows = rows.filter(r => r.key === 'legacy_observed_percent')
+  const campaignRows = rows.filter(r => r.key === 'legacy_observed_campaign_id')
+
+  let percent = 0
+  if (percentRows.length === 1) {
+    const raw = String(percentRows[0].value ?? '').trim()
+    if (/^\d+$/.test(raw)) {
+      const n = Number(raw)
+      if (n >= 0 && n <= 100) percent = n
+    }
+  }
+  // percentRows.length === 0 (missing) หรือ > 1 (duplicate) หรือ format ผิด → percent คง 0 (fail-closed default)
+
+  let campaignId = null
+  let campaignIdValid = true
+  if (campaignRows.length === 1) {
+    const raw = String(campaignRows[0].value ?? '').trim()
+    campaignId = raw || null // ค่าว่างเปล่าถือเป็น "ไม่มี" เหมือน missing แถวไปเลย
+  } else if (campaignRows.length > 1) {
+    campaignIdValid = false // duplicate แถว → invalid เสมอ ไม่เดาว่าจะใช้แถวไหน
+  }
+
+  if (percent > 0 && (campaignId == null || !campaignIdValid)) {
+    return { percent: 0, campaignId: null } // fail-closed: percent>0 ต้องมี campaign ที่ valid คู่กันเสมอ
+  }
+  // percent=0 → คืน campaignId เป็น null เสมอด้วย แม้แถว campaign_id จะมีค่าอยู่ก็ตาม (atomic snapshot ต้องสอดคล้อง
+  // กันเอง: percent=0 แปลว่า "ไม่มี exposure" เต็มที ไม่ควรมี campaignId ค้างอยู่ให้อ่านผิดความหมายทีหลังได้)
+  if (percent === 0) return { percent: 0, campaignId: null }
+  return { percent, campaignId }
+}
+
 function createRolloutConfig({ getRows = () => sheetsService.getStreamingConfig(), refreshIntervalMs = DEFAULT_REFRESH_INTERVAL_MS } = {}) {
   let cachedPercent = null // null = cold start, ยังไม่เคย fetch สำเร็จเลย
   let lastAttemptAt = null
   let lastSuccessAt = null
   let refreshInFlight = null
   let timer = null
+  // L2a — fail-closed เสมอ (ไม่มี "cold start ยังไม่รู้ค่า" แบบ cachedPercent) เริ่มต้นที่ {0, null} ตรงๆ ตั้งแต่
+  // ก่อน fetch ครั้งแรกเลย — ถ้า Sheets ยังไม่เคยเพิ่มแถว legacy_observed_percent เลย นี่คือค่าที่ปลอดภัยอยู่แล้ว
+  let cachedObservedConfig = { percent: 0, campaignId: null }
 
   // C6b — log แบบ state-change เท่านั้น ไม่ log ทุกรอบ poll (30s) เพราะจะ spam production logs โดยไม่มีประโยชน์
   // log signature เปลี่ยนเมื่อไหร่ก็ต่อเมื่อผลลัพธ์เปลี่ยนจริง (success→success ค่าเดิม ไม่ log ซ้ำ, error เดิมซ้ำๆ
@@ -51,6 +97,15 @@ function createRolloutConfig({ getRows = () => sheetsService.getStreamingConfig(
   function logOnChange(signature, logFn) {
     if (signature === lastLogSignature) return
     lastLogSignature = signature
+    logFn()
+  }
+
+  // แยก signature tracking คนละตัวจาก rollout_percent เจตนา — สอง config เปลี่ยนคนละจังหวะกัน ถ้าใช้ signature
+  // ร่วมกันจะกดข้าม log ของอีกฝั่งไปเงียบๆ โดยไม่ตั้งใจ (เช่น rollout เปลี่ยนค่าพอดีจังหวะเดียวกับ observed ไม่เปลี่ยน)
+  let lastObservedLogSignature = null
+  function logOnChangeObserved(signature, logFn) {
+    if (signature === lastObservedLogSignature) return
+    lastObservedLogSignature = signature
     logFn()
   }
 
@@ -69,9 +124,21 @@ function createRolloutConfig({ getRows = () => sheetsService.getStreamingConfig(
           // ไม่มีแถว/ซ้ำ/format ผิด → ไม่แตะ cachedPercent เดิมเลย ถือเป็น refresh failed เหมือน error (last-known-good)
           logOnChange(`invalid:${reason}`, () => console.warn(`[RolloutConfig] refresh invalid reason=${reason} using_lkg=${cachedPercent ?? 0}`))
         }
+
+        // L2a — เขียนทับ cachedObservedConfig ทุกรอบ refresh ที่ fetch สำเร็จ ไม่ว่าผลจะเป็นอะไร (fail-closed
+        // ไม่ใช่ LKG) — rows ชุดเดียวกับที่ใช้ parse rollout_percent ด้านบน ไม่ fetch ซ้ำ
+        const observedResult = classifyLegacyObservedConfig(rows)
+        cachedObservedConfig = observedResult
+        logOnChangeObserved(
+          `observed:${observedResult.percent}:${observedResult.campaignId}`,
+          () => console.log(`[RolloutConfig] observed config percent=${observedResult.percent} campaignId=${observedResult.campaignId ?? 'null'}`)
+        )
       } catch (err) {
-        // ใช้ last-known-good ต่อไป ไม่ throw ให้กระทบ caller (ทั้ง background poll และ manual call)
+        // ใช้ last-known-good ต่อไปเฉพาะ rollout_percent ไม่ throw ให้กระทบ caller (ทั้ง background poll และ manual call)
         logOnChange(`failure:${err.message}`, () => console.error(`[RolloutConfig] refresh failed error=${JSON.stringify(err.message)} using_lkg=${cachedPercent ?? 0}`))
+        // L2a — fetch ล้มเหลวเอง (ไม่ใช่แค่ parse ล้มเหลว) ก็ fail-closed เหมือนกัน ไม่ preserve ค่าเดิม
+        cachedObservedConfig = { percent: 0, campaignId: null }
+        logOnChangeObserved('observed:fetch_failed', () => console.warn('[RolloutConfig] observed config fetch failed — fail-closed percent=0'))
       } finally {
         refreshInFlight = null
       }
@@ -102,7 +169,14 @@ function createRolloutConfig({ getRows = () => sheetsService.getStreamingConfig(
     return cachedPercent ?? 0
   }
 
-  return { getCurrentRolloutPercent, start, stop, refresh }
+  // L2a — atomic snapshot เดียว {percent, campaignId} จาก refresh รอบเดียวกันเสมอ (ไม่ใช่ getter แยก 2 ตัว) กัน
+  // caller ในอนาคตอ่านค่าคนละ field จากคนละรอบ refresh กันโดยไม่ตั้งใจ
+  function getCurrentLegacyObservedConfig() {
+    refreshIfStale()
+    return cachedObservedConfig
+  }
+
+  return { getCurrentRolloutPercent, getCurrentLegacyObservedConfig, start, stop, refresh }
 }
 
-module.exports = { createRolloutConfig, parseRolloutPercent }
+module.exports = { createRolloutConfig, parseRolloutPercent, classifyLegacyObservedConfig }

@@ -4,7 +4,7 @@ const { askClaude, askClaudeStream, askClaudeObservedFullResponse } = require('.
 const { synthesizeSpeechStream } = require('../services/tts')
 const healthMonitor = require('../utils/healthMonitor')
 const { createCallState, bumpGeneration, isCurrentGeneration, endCall } = require('../utils/generationGuard')
-const { decideRollout } = require('../utils/rolloutBucket')
+const { decideRollout, getLegacyObservedBucket } = require('../utils/rolloutBucket')
 const { createTurnMetrics, markOnce, computeDerivedMetrics } = require('../utils/turnMetrics')
 const { createTurnState, markTtsPending, markAudioCommitted, markDone, claimFallback } = require('../utils/turnState')
 const { runChunkedTurn, speakFixedText, createChunkedProducer, adoptChunkedProducer } = require('./chunkedTurn')
@@ -282,6 +282,12 @@ function registerWebSocket(fastify) {
     // (ไม่มี chunked path ให้ guard ในไฟล์นี้เลยตอนนี้) — legacy path ทั้งหมดด้านล่างยังทำงานเหมือนเดิมทุกบรรทัด
     const callState = createCallState()
     let rollout = null // freeze ตอน 'start' event เพราะ callSid อาจยังไม่ resolve ตอน connection เปิด
+    // L2a production exposure gate (design revision 2026-08-20) — freeze ครั้งเดียวพร้อมกับ rollout ข้างบน
+    // ไม่คำนวณใหม่กลางสาย เหมือนกัน — false/null เป็นค่าเริ่มต้นปลอดภัย (CONTROL) ก่อนถึง 'start' event เสมอ
+    let legacyObserved = false
+    let legacyObservedBucket = null
+    let legacyObservedPercentAtStart = null
+    let legacyObservedCampaignMatched = null
 
     console.log(`[WS] Connected callSid=${callSid}`)
 
@@ -631,7 +637,19 @@ function registerWebSocket(fastify) {
         // Freeze ครั้งเดียวต่อสาย ไม่คำนวณใหม่ทุกเทิร์น — อ่าน % ปัจจุบันจาก memory cache (rolloutConfig.js)
         // แค่ตอนนี้จุดเดียว ไม่อ่านซ้ำอีกเลยตลอดสาย แม้ % ใน Sheets จะเปลี่ยนกลางสายก็ไม่กระทบสายที่ freeze ไปแล้ว
         rollout = decideRollout(callSid, rolloutConfig.getCurrentRolloutPercent())
-        console.log(`[Rollout] callSid=${callSid} bucket=${rollout.bucket} percent=${rollout.percentAtStart} chunked=${rollout.useChunkedStreaming}`)
+
+        // L2a — atomic snapshot เดียว {percent, campaignId} จาก refresh รอบเดียวกันเสมอ (ห้ามอ่าน getter แยก 2
+        // ตัว) แล้ว freeze ทั้ง percent/campaign/bucket จาก snapshot นี้พร้อมกันตอนนี้จุดเดียว ไม่คำนวณใหม่กลางสาย
+        // เหมือน rollout ข้างบน — chunked=true ต้องได้ legacyObserved=false เสมอไม่ว่า observed config จะเป็นอะไร
+        // (fresh legacy call site เดียวเท่านั้นที่ L2a แตะ — chunked path ไม่ผ่านจุดนี้เลยอยู่แล้ว)
+        // "ไม่มี campaign_id" ต้องไม่แปลว่า "ทุก campaign" — campaignId ต้อง match ตรงตัวเท่านั้น (null ไม่ match อะไรทั้งนั้น)
+        const observedConfig = rolloutConfig.getCurrentLegacyObservedConfig()
+        legacyObservedBucket = getLegacyObservedBucket(callSid)
+        legacyObservedCampaignMatched = observedConfig.campaignId != null && session.campaign?.id === observedConfig.campaignId
+        legacyObservedPercentAtStart = observedConfig.percent
+        legacyObserved = !rollout.useChunkedStreaming && legacyObservedCampaignMatched && legacyObservedBucket < observedConfig.percent
+
+        console.log(`[Rollout] callSid=${callSid} bucket=${rollout.bucket} percent=${rollout.percentAtStart} chunked=${rollout.useChunkedStreaming} legacyObserved=${legacyObserved} legacyObservedBucket=${legacyObservedBucket} legacyObservedPercent=${observedConfig.percent} campaignMatched=${legacyObservedCampaignMatched}`)
 
         // L1a: ต้องคำนวณหลัง rollout freeze แล้วเท่านั้น (ดูหมายเหตุที่ค่าคงที่ด้านบนไฟล์)
         const interimFinalizeMs = rollout.useChunkedStreaming ? STT_INTERIM_FINALIZE_MS_CHUNKED : 900
@@ -673,6 +691,10 @@ function registerWebSocket(fastify) {
             path: rollout?.useChunkedStreaming ? 'chunked' : 'legacy',
             rolloutBucket: rollout?.bucket ?? null,
             rolloutPercent: rollout?.percentAtStart ?? null,
+            legacyObserved,
+            legacyObservedBucket,
+            legacyObservedPercentAtStart,
+            legacyObservedCampaignMatched,
           })
           markOnce(turnMetrics, 't1')
 
@@ -1025,32 +1047,51 @@ function registerWebSocket(fastify) {
                 reason: 'LEGACY_CLAUDE_TIMEOUT',
                 run: async (childSignal) => {
                   let text = ''
-                  // L2a — swap เฉพาะจุดนี้จุดเดียว (fresh legacy call) เป็น askClaudeObservedFullResponse() แทน
-                  // askClaudeStream() เดิม — prewarm (:389) และ runLegacyFallback (:205) ยังเรียก askClaudeStream()
-                  // เหมือนเดิมทุกประการ ไม่ถูกกระทบเลย onLegacyClaudeMilestone เขียนเข้า turnMetrics ทันทีที่แต่ละ
-                  // milestone มาถึงจริง (ไม่รอ callback เดียวตอนจบ) กัน turn ที่ abort/timeout/error กลางทางเสีย data
-                  const onLegacyClaudeMilestone = (key, value) => {
-                    const fieldMap = {
-                      requestAt: 'legacyClaudeRequestAt',
-                      firstDeltaAt: 'legacyClaudeFirstDeltaAt',
-                      firstSafeAt: 'legacyClaudeFirstSafeAt',
-                      fullAt: 'legacyClaudeFullAt',
+                  // L2a exposure gate (design revision 2026-08-20) — เฉพาะสายที่ legacyObserved=true เท่านั้นที่
+                  // สลับไปใช้ askClaudeObservedFullResponse() ([.stream()) — สายอื่นทั้งหมด (CONTROL) ยังเรียก
+                  // askClaudeStream() ([.create()]) เดิมเป๊ะ ไม่มี milestone ใดๆ ถูกเขียนเข้า turnMetrics เลย ทำให้
+                  // legacyClaude* fields ทั้งหมดคง null ตามที่ CONTROL ควรเป็น — นี่คือ "เบรก" ที่กัน a982fdf
+                  // ไม่ให้เปลี่ยน transport ของ fresh legacy call ทุกสายทันทีที่ push แม้ rollout_percent=0 ก็ตาม
+                  // prewarm (:389) และ runLegacyFallback (:205) ยังเรียก askClaudeStream() เหมือนเดิมทุกประการ
+                  // ไม่ถูกกระทบเลย ไม่ว่า legacyObserved จะเป็นอะไร (นอกขอบเขตของ gate นี้ทั้งคู่)
+                  if (legacyObserved) {
+                    const onLegacyClaudeMilestone = (key, value) => {
+                      const fieldMap = {
+                        requestAt: 'legacyClaudeRequestAt',
+                        firstDeltaAt: 'legacyClaudeFirstDeltaAt',
+                        firstSafeAt: 'legacyClaudeFirstSafeAt',
+                        fullAt: 'legacyClaudeFullAt',
+                      }
+                      const field = fieldMap[key]
+                      if (field && turnMetrics[field] == null) turnMetrics[field] = value
                     }
-                    const field = fieldMap[key]
-                    if (field && turnMetrics[field] == null) turnMetrics[field] = value
+                    try {
+                      for await (const chunk of askClaudeObservedFullResponse(currentSession, childSignal, onLegacyClaudeMilestone)) {
+                        if (childSignal.aborted) break
+                        text += (text ? ' ' : '') + chunk
+                      }
+                    } catch (err) {
+                      // normalize barge-in/watchdog-driven cancellation: ถ้า childSignal ถูก abort ไปแล้ว ให้ resolve
+                      // แบบ graceful แทนที่จะ throw ต่อ — ไม่งั้น runAttemptWithWatchdog จะจัดเป็น outcome:'error' แทน
+                      // 'aborted' (เพราะ helper คืน 'aborted' เฉพาะตอน run() resolve หลัง child ถูก abort เท่านั้น)
+                      // ทำให้ barge-in ถูกเข้าใจผิดเป็น Claude error แล้วพูด recovery phrase ทับเสียงลูกค้าที่กำลังพูดแทรกอยู่
+                      if (childSignal.aborted) return text
+                      throw err // error จริงที่ไม่เกี่ยวกับ abort ต้อง propagate ต่อให้ outcome:'error' เหมือนเดิม
+                    }
+                    return text
                   }
+
+                  // CONTROL — โค้ดเดิมเป๊ะก่อน commit a982fdf (รวม try/catch normalization เดียวกัน — askClaudeStream()
+                  // ก็ signal-aware ผ่าน client.messages.create({...}, {signal}) เหมือนกัน อาจ throw AbortError ได้
+                  // ไม่ต่างจาก .stream() จึงต้อง normalize เหมือนกันทุกประการ ไม่ใช่แค่ bare loop)
                   try {
-                    for await (const chunk of askClaudeObservedFullResponse(currentSession, childSignal, onLegacyClaudeMilestone)) {
+                    for await (const chunk of askClaudeStream(currentSession, false, childSignal)) {
                       if (childSignal.aborted) break
                       text += (text ? ' ' : '') + chunk
                     }
                   } catch (err) {
-                    // normalize barge-in/watchdog-driven cancellation: ถ้า childSignal ถูก abort ไปแล้ว ให้ resolve
-                    // แบบ graceful แทนที่จะ throw ต่อ — ไม่งั้น runAttemptWithWatchdog จะจัดเป็น outcome:'error' แทน
-                    // 'aborted' (เพราะ helper คืน 'aborted' เฉพาะตอน run() resolve หลัง child ถูก abort เท่านั้น)
-                    // ทำให้ barge-in ถูกเข้าใจผิดเป็น Claude error แล้วพูด recovery phrase ทับเสียงลูกค้าที่กำลังพูดแทรกอยู่
                     if (childSignal.aborted) return text
-                    throw err // error จริงที่ไม่เกี่ยวกับ abort ต้อง propagate ต่อให้ outcome:'error' เหมือนเดิม
+                    throw err
                   }
                   return text
                 },
@@ -1059,30 +1100,33 @@ function registerWebSocket(fastify) {
               let shouldSpeakRecovery = false
 
               // L2a — legacyClaudeOutcome แยกจาก legacyClaudeFirstSafeAt=null โดยตั้งใจ (ดู comment ที่ turnMetrics.js)
+              // เขียนเฉพาะตอน legacyObserved=true เท่านั้น — CONTROL ต้องคง legacyClaudeOutcome=null (เหมือนทุก
+              // legacyClaude* field อื่น) ไม่ใช่แค่ timestamp fields เท่านั้นที่ต้อง null การแยกสาขา
+              // aiText/shouldSpeakRecovery/console log ทั้งหมดยังทำงานเหมือนกันทุกประการไม่ว่า CONTROL หรือ OBSERVED
               if (freshAttempt.outcome === 'success' && freshAttempt.result?.trim()) {
                 aiText = freshAttempt.result
-                turnMetrics.legacyClaudeOutcome = 'COMPLETED'
+                if (legacyObserved) turnMetrics.legacyClaudeOutcome = 'COMPLETED'
               } else if (freshAttempt.outcome === 'success') {
                 // askClaudeStream() yield ข้อความก็ต่อเมื่อยาวอย่างน้อย 3 ตัวอักษรเท่านั้น (ดูตัวมันเอง) — เรียก
                 // Claude สำเร็จแต่ไม่มีอะไรให้พูดออกไปเลยก็ยังถือว่า "ไม่ได้คำตอบที่ใช้ได้" เหมือน timeout/error ทุก
                 // ประการ ต้องพูด recovery phrase เช่นกัน ไม่งั้นลูกค้าจะเจอความเงียบทั้งที่ API เรียกสำเร็จ
                 console.error('[AI/TTS error] Claude ตอบสำเร็จแต่ไม่มีข้อความให้พูดเลย (empty/blank result), speaking recovery phrase')
                 shouldSpeakRecovery = true
-                turnMetrics.legacyClaudeOutcome = 'EMPTY'
+                if (legacyObserved) turnMetrics.legacyClaudeOutcome = 'EMPTY'
               } else if (freshAttempt.outcome === 'aborted') {
                 // barge-in — ไม่พูด recovery phrase, ไม่ commit อะไร, ปล่อยไหลลง shared tail ตามปกติ (เหมือน
                 // prewarm's aborted branch ด้านบน) เพื่อให้ pendingTranscript (ถ้ามี) ถูก drain ต่อได้
                 console.log('[AI] Fresh Claude call aborted by barge-in — no recovery phrase, turn ends with no audio')
-                turnMetrics.legacyClaudeOutcome = 'ABORTED'
+                if (legacyObserved) turnMetrics.legacyClaudeOutcome = 'ABORTED'
               } else if (freshAttempt.outcome === 'timeout') {
                 console.error(`[Watchdog] LEGACY_CLAUDE_TIMEOUT — Claude ไม่ตอบภายใน ${LEGACY_FRESH_CLAUDE_TIMEOUT_MS}ms, speaking recovery phrase`)
                 shouldSpeakRecovery = true
-                turnMetrics.legacyClaudeOutcome = 'TIMEOUT'
+                if (legacyObserved) turnMetrics.legacyClaudeOutcome = 'TIMEOUT'
               } else {
                 console.error('[AI/TTS error]', freshAttempt.error.message)
                 healthMonitor.reportError('ai_tts', freshAttempt.error.message)
                 shouldSpeakRecovery = true
-                turnMetrics.legacyClaudeOutcome = 'ERROR'
+                if (legacyObserved) turnMetrics.legacyClaudeOutcome = 'ERROR'
               }
 
               // timeout/error จริง/success-แต่ข้อความว่างเปล่า — ทั้งสามแบบพูด recovery phrase เดียวกัน (จากมุม

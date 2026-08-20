@@ -28,6 +28,9 @@ function ensureStubbed() {
     claudeObservedImpl: null,
     ttsImpl: async function* () { yield Buffer.from('audio') }, // synthesizeSpeechStream(text, voiceId, signal)
     rolloutPercent: 0,
+    // L2a production exposure gate — default fail-closed {percent:0, campaignId:null} เหมือน production cold
+    // start เป๊ะ (ดู rolloutConfig.js cachedObservedConfig) เทสที่ต้องการ observed=true ต้อง set ค่าทั้งคู่เอง
+    legacyObservedConfig: { percent: 0, campaignId: null },
     lastSttCallbacks: null, // { onTranscript, onInterim } — set สดทุกครั้งที่มี connection ใหม่เปิด sttStream
   }
 
@@ -84,6 +87,7 @@ function ensureStubbed() {
         start: () => {},
         stop: () => {},
         getCurrentRolloutPercent: () => state.rolloutPercent,
+        getCurrentLegacyObservedConfig: () => state.legacyObservedConfig,
       }),
     },
   }

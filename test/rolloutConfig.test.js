@@ -1,6 +1,6 @@
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
-const { createRolloutConfig, parseRolloutPercent } = require('../src/utils/rolloutConfig')
+const { createRolloutConfig, parseRolloutPercent, classifyLegacyObservedConfig } = require('../src/utils/rolloutConfig')
 
 function delay(ms) { return new Promise(resolve => setTimeout(resolve, ms)) }
 
@@ -296,4 +296,171 @@ test('logging: config ผิดรูปแบบ (ซ้ำ key) → log ด้
     assert.equal(rc.getCurrentRolloutPercent(), 0, 'ไม่เคย fetch สำเร็จเลยตั้งแต่ต้น (cold start) → ยังเป็น 0 ตามปกติ ไม่ใช่ 5 หรือ 50')
     rc.stop()
   } finally { restore() }
+})
+
+// ---------------------------------------------------------------------------
+// L2a production exposure gate — classifyLegacyObservedConfig() (design revision 2026-08-20)
+// fail-CLOSED เสมอ (คนละ policy จาก rollout_percent's LKG) + "ไม่มี campaign_id" ต้องไม่แปลว่า "ทุก campaign"
+// ---------------------------------------------------------------------------
+
+test('classifyLegacyObservedConfig: percent=0 คู่กับ campaignId ถูกต้อง → ผ่านตรงๆ (percent=0 ไม่ต้องมี campaign คู่)', () => {
+  assert.deepEqual(
+    classifyLegacyObservedConfig([{ key: 'legacy_observed_percent', value: '0' }]),
+    { percent: 0, campaignId: null }
+  )
+})
+
+test('classifyLegacyObservedConfig: percent>0 + campaignId ถูกต้องครบคู่ → ใช้ค่านั้นจริง', () => {
+  assert.deepEqual(
+    classifyLegacyObservedConfig([
+      { key: 'legacy_observed_percent', value: '100' },
+      { key: 'legacy_observed_campaign_id', value: 'CAMPAIGN_TEST' },
+    ]),
+    { percent: 100, campaignId: 'CAMPAIGN_TEST' }
+  )
+})
+
+test('classifyLegacyObservedConfig: percent>0 แต่ไม่มีแถว campaign_id เลย → fail-closed {0, null} (ไม่ใช่ "ทุก campaign")', () => {
+  assert.deepEqual(
+    classifyLegacyObservedConfig([{ key: 'legacy_observed_percent', value: '100' }]),
+    { percent: 0, campaignId: null }
+  )
+})
+
+test('classifyLegacyObservedConfig: percent>0 + campaign_id เป็นค่าว่างเปล่า → fail-closed {0, null}', () => {
+  assert.deepEqual(
+    classifyLegacyObservedConfig([
+      { key: 'legacy_observed_percent', value: '50' },
+      { key: 'legacy_observed_campaign_id', value: '   ' },
+    ]),
+    { percent: 0, campaignId: null }
+  )
+})
+
+test('classifyLegacyObservedConfig: percent>0 + campaign_id ซ้ำกันมากกว่า 1 แถว → fail-closed {0, null}', () => {
+  assert.deepEqual(
+    classifyLegacyObservedConfig([
+      { key: 'legacy_observed_percent', value: '50' },
+      { key: 'legacy_observed_campaign_id', value: 'A' },
+      { key: 'legacy_observed_campaign_id', value: 'B' },
+    ]),
+    { percent: 0, campaignId: null }
+  )
+})
+
+test('classifyLegacyObservedConfig: percent_percent format ผิด (นอกช่วง/ไม่ใช่ integer) → percent เป็น 0 (fail-closed default)', () => {
+  assert.deepEqual(classifyLegacyObservedConfig([{ key: 'legacy_observed_percent', value: '101' }]), { percent: 0, campaignId: null })
+  assert.deepEqual(classifyLegacyObservedConfig([{ key: 'legacy_observed_percent', value: '-1' }]), { percent: 0, campaignId: null })
+  assert.deepEqual(classifyLegacyObservedConfig([{ key: 'legacy_observed_percent', value: 'abc' }]), { percent: 0, campaignId: null })
+})
+
+test('classifyLegacyObservedConfig: legacy_observed_percent ซ้ำกันมากกว่า 1 แถว → percent เป็น 0 (fail-closed default)', () => {
+  assert.deepEqual(
+    classifyLegacyObservedConfig([
+      { key: 'legacy_observed_percent', value: '10' },
+      { key: 'legacy_observed_percent', value: '90' },
+    ]),
+    { percent: 0, campaignId: null }
+  )
+})
+
+test('classifyLegacyObservedConfig: ไม่มีแถวใดๆ เลย (Sheets ยังไม่เคยเพิ่ม key พวกนี้) → {0, null} ปลอดภัยตั้งแต่วันแรก (backward-compat)', () => {
+  assert.deepEqual(classifyLegacyObservedConfig([]), { percent: 0, campaignId: null })
+  assert.deepEqual(classifyLegacyObservedConfig([{ key: 'rollout_percent', value: '20' }]), { percent: 0, campaignId: null })
+})
+
+// ---------------------------------------------------------------------------
+// L2a — createRolloutConfig().getCurrentLegacyObservedConfig(): atomic snapshot + fail-closed ผ่าน background refresh
+// ---------------------------------------------------------------------------
+
+test('L2a: cold start → getCurrentLegacyObservedConfig() คืน {0, null} เสมอ (fail-closed, ไม่ใช่ LKG)', () => {
+  const rc = createRolloutConfig({ getRows: async () => [{ key: 'legacy_observed_percent', value: '100' }, { key: 'legacy_observed_campaign_id', value: 'X' }] })
+  assert.deepEqual(rc.getCurrentLegacyObservedConfig(), { percent: 0, campaignId: null })
+})
+
+test('L2a: refresh สำเร็จ + campaign ถูกต้องครบ → snapshot สะท้อนค่าจริง', async () => {
+  const rc = createRolloutConfig({
+    getRows: async () => [{ key: 'legacy_observed_percent', value: '100' }, { key: 'legacy_observed_campaign_id', value: 'CAMPAIGN_TEST' }],
+    refreshIntervalMs: 10000,
+  })
+  rc.start()
+  await delay(20)
+  assert.deepEqual(rc.getCurrentLegacyObservedConfig(), { percent: 100, campaignId: 'CAMPAIGN_TEST' })
+  rc.stop()
+})
+
+test('L2a: fetch throw error → fail-closed {0, null} ทันที (คนละ policy จาก rollout_percent ที่ preserve LKG)', async () => {
+  let shouldFail = false
+  const rc = createRolloutConfig({
+    getRows: async () => {
+      if (shouldFail) throw new Error('Sheets down')
+      return [{ key: 'legacy_observed_percent', value: '100' }, { key: 'legacy_observed_campaign_id', value: 'X' }]
+    },
+    refreshIntervalMs: 50,
+  })
+  rc.start()
+  await delay(20)
+  assert.deepEqual(rc.getCurrentLegacyObservedConfig(), { percent: 100, campaignId: 'X' }) // fetch แรกสำเร็จ
+  shouldFail = true
+  await delay(100)
+  assert.deepEqual(rc.getCurrentLegacyObservedConfig(), { percent: 0, campaignId: null }, 'ต่างจาก rollout_percent — ต้อง fail-closed ทันที ไม่ preserve ค่าเดิม')
+  rc.stop()
+})
+
+test('L2a: rollout_percent ยัง LKG ปกติ ในขณะที่ legacy_observed_percent fail-closed พร้อมกันจาก fetch เดียวกัน (สอง policy ทำงานคู่ขนานถูกต้อง)', async () => {
+  let shouldFail = false
+  const rc = createRolloutConfig({
+    getRows: async () => {
+      if (shouldFail) throw new Error('Sheets down')
+      return [
+        { key: 'rollout_percent', value: '20' },
+        { key: 'legacy_observed_percent', value: '100' },
+        { key: 'legacy_observed_campaign_id', value: 'X' },
+      ]
+    },
+    refreshIntervalMs: 50,
+  })
+  rc.start()
+  await delay(20)
+  assert.equal(rc.getCurrentRolloutPercent(), 20)
+  assert.deepEqual(rc.getCurrentLegacyObservedConfig(), { percent: 100, campaignId: 'X' })
+  shouldFail = true
+  await delay(100)
+  assert.equal(rc.getCurrentRolloutPercent(), 20, 'rollout_percent ต้องคง LKG เดิม แม้ fetch พังจากรอบเดียวกันที่ทำให้ observed config fail-closed')
+  assert.deepEqual(rc.getCurrentLegacyObservedConfig(), { percent: 0, campaignId: null }, 'legacy_observed_percent ต้อง fail-closed ทันที')
+  rc.stop()
+})
+
+test('L2a: กลับมาใส่ campaign_id หลัง fail-closed → snapshot ฟื้นกลับมาใช้ค่าจริงได้ตามปกติ (ไม่ค้าง 0 ถาวร)', async () => {
+  let campaignRow = null
+  const rc = createRolloutConfig({
+    getRows: async () => {
+      const rows = [{ key: 'legacy_observed_percent', value: '100' }]
+      if (campaignRow) rows.push({ key: 'legacy_observed_campaign_id', value: campaignRow })
+      return rows
+    },
+    refreshIntervalMs: 50,
+  })
+  rc.start()
+  await delay(20)
+  assert.deepEqual(rc.getCurrentLegacyObservedConfig(), { percent: 0, campaignId: null }, 'ยังไม่มี campaign_id → fail-closed')
+  campaignRow = 'CAMPAIGN_TEST'
+  await delay(100)
+  assert.deepEqual(rc.getCurrentLegacyObservedConfig(), { percent: 100, campaignId: 'CAMPAIGN_TEST' }, 'ใส่ campaign_id ถูกต้องแล้ว → กลับมาใช้ค่าจริงได้')
+  rc.stop()
+})
+
+test('L2a: kill switch — legacy_observed_percent กลับเป็น 0 → snapshot ถัดไปเป็น {0, null} ภายในรอบ refresh เดียว', async () => {
+  let percent = '100'
+  const rc = createRolloutConfig({
+    getRows: async () => [{ key: 'legacy_observed_percent', value: percent }, { key: 'legacy_observed_campaign_id', value: 'X' }],
+    refreshIntervalMs: 50,
+  })
+  rc.start()
+  await delay(20)
+  assert.deepEqual(rc.getCurrentLegacyObservedConfig(), { percent: 100, campaignId: 'X' })
+  percent = '0'
+  await delay(100)
+  assert.deepEqual(rc.getCurrentLegacyObservedConfig(), { percent: 0, campaignId: null }, 'percent=0 ต้องล้าง campaignId กลับเป็น null ด้วย (atomic snapshot สอดคล้องกันเสมอ)')
+  rc.stop()
 })

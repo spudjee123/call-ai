@@ -1,6 +1,6 @@
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
-const { getRolloutBucket, decideRollout } = require('../src/utils/rolloutBucket')
+const { getRolloutBucket, decideRollout, getLegacyObservedBucket } = require('../src/utils/rolloutBucket')
 
 test('same callSid → bucket เดิมเสมอ ไม่ว่าจะเรียกกี่ครั้ง', () => {
   const a = getRolloutBucket('CA1234567890')
@@ -60,4 +60,43 @@ test('sticky: เปลี่ยน rolloutPercent กลางสาย ต้�
   // สายใหม่ที่เริ่มหลังจากนี้ค่อยใช้ 100% ตามที่ควรจะเป็น
   const newCallState = { rollout: decideRollout('CA-new-call', newPercentFromConfig) }
   assert.equal(newCallState.rollout.useChunkedStreaming, true, 'สายใหม่ต้องเห็นค่า % ล่าสุด')
+})
+
+// L2a production exposure gate — getLegacyObservedBucket() ต้อง deterministic/0-99 เหมือน getRolloutBucket() เดิม
+// แต่เป็นคนละ hash namespace (design revision 2026-08-20, correction: ห้ามใช้ bucket เดียวกับ rollout_percent)
+test('L2a: getLegacyObservedBucket deterministic — callSid เดิมได้ bucket เดิมเสมอ', () => {
+  const a = getLegacyObservedBucket('CA1234567890')
+  const b = getLegacyObservedBucket('CA1234567890')
+  assert.equal(a, b)
+})
+
+test('L2a: getLegacyObservedBucket อยู่ในช่วง 0-99 เสมอ', () => {
+  for (let i = 0; i < 200; i++) {
+    const bucket = getLegacyObservedBucket('CA' + i)
+    assert.ok(bucket >= 0 && bucket <= 99, `bucket ${bucket} ต้องอยู่ในช่วง 0-99`)
+  }
+})
+
+test('L2a: fixed known fixtures — hash namespace "legacy-observed:" ให้ค่าคงที่ตามที่คำนวณไว้ล่วงหน้า', () => {
+  assert.equal(getLegacyObservedBucket('CA1234567890'), 5)
+  assert.equal(getLegacyObservedBucket('CA160'), 38)
+  assert.equal(getLegacyObservedBucket('CA22'), 1)
+})
+
+test('L2a: getRolloutBucket() เดิม (chunked rollout) ต้องไม่ถูกกระทบ — fixture เดิมจาก boundary test ยังได้ค่าเดิมเป๊ะ', () => {
+  assert.equal(getRolloutBucket('CA160'), 4)
+  assert.equal(getRolloutBucket('CA22'), 5)
+})
+
+test('L2a: independent namespace — getRolloutBucket และ getLegacyObservedBucket ของ callSid เดียวกันไม่ผูก threshold เดียวกัน (อาจชนกันโดยบังเอิญได้ ไม่ใช่บั๊ก ห้าม assert ว่าต้องต่างกันเสมอ)', () => {
+  // ยืนยันด้วยตัวอย่างจริงหลาย callSid ว่าค่าทั้งสองขยับเป็นอิสระต่อกัน (ไม่ได้ผูก formula เดียวกันแค่เติม prefix
+  // แล้วได้ผลเหมือนเดิม) — ไม่ assert notEqual เพราะ %100 ชนกันได้เป็นปกติทางสถิติ
+  const samples = ['CA1', 'CA2', 'CA3', 'CA1234567890', 'CA160', 'CA22']
+  const rolloutBuckets = samples.map(getRolloutBucket)
+  const observedBuckets = samples.map(getLegacyObservedBucket)
+  assert.deepEqual(rolloutBuckets, [8, 60, 16, 53, 4, 5])
+  assert.deepEqual(observedBuckets, [14, 68, 84, 5, 38, 1])
+  // ทั้งสองชุดต้องไม่ใช่ mapping เดียวกันทุกตัว (ถ้า namespace ไม่ได้ผูกจริงจะเห็น pattern ซ้ำ) — ตัวอย่างนี้ต่างกันหมด
+  const identicalCount = rolloutBuckets.filter((v, i) => v === observedBuckets[i]).length
+  assert.ok(identicalCount < samples.length, 'ไม่ควรเห็น bucket ชนกันทุกตัวอย่าง (แปลว่า hash ไม่ independent จริง)')
 })

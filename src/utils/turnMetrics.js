@@ -4,13 +4,20 @@
 // ห้ามฝืน markOnce ให้ครบทุกตัวเพื่อความสวยงาม เพราะจะปลอมความหมาย metric ให้ดูเหมือน streaming ทั้งที่ไม่ใช่
 const { performance } = require('perf_hooks')
 
-function createTurnMetrics({ callSid, generationId, path, rolloutBucket, rolloutPercent }) {
+function createTurnMetrics({ callSid, generationId, path, rolloutBucket, rolloutPercent, legacyObserved = null, legacyObservedBucket = null, legacyObservedPercentAtStart = null, legacyObservedCampaignMatched = null }) {
   return {
     callSid,
     generationId,
     path,
     rolloutBucket,
     rolloutPercent,
+    // L2a production exposure gate (design revision 2026-08-20) — frozen ครั้งเดียวตอน WS 'start' เหมือน
+    // rollout/rolloutBucket ข้างบน เขียนลง [Metrics] ทุก turn เสมอ (ไม่ใช่แค่ [Rollout] แยกบรรทัด) เพื่อให้ join
+    // กลุ่ม CONTROL/OBSERVED กับตัวเลข legacyClaude* ด้านล่างได้จาก log บรรทัดเดียว ไม่ต้อง join ข้าม log ด้วย callSid
+    legacyObserved,
+    legacyObservedBucket,
+    legacyObservedPercentAtStart,
+    legacyObservedCampaignMatched,
     startedAt: new Date().toISOString(), // สำหรับ correlate กับ log บรรทัดอื่น — ไม่ใช้คำนวณ latency (wall clock กระโดดได้)
     t1: null, // STT final
     t2: null, // Claude request sent (หรือเริ่มรอ prewarm ที่ในไฟลท์อยู่แล้ว)
