@@ -400,4 +400,267 @@ async function* askClaudeObservedFullResponse(session, signal = null, onMileston
   if (trimmed.length >= 3) yield trimmed
 }
 
-module.exports = { askClaude, askClaudeStream, askClaudeStreamChunked, askClaudeObservedFullResponse, summarizeCall }
+// ==========================================================================
+// askClaudeConditionalStream — L2b PROTOTYPE (design revision 2026-08-21, NOT wired into any live call
+// path — local prototype only, no rollout, no commit/push/deploy per gate instructions)
+// ==========================================================================
+// Design per L2a Expanded Measurement (24 production fresh-observed turns, CONDITIONAL L2b decision):
+//   first-safe boundary found → wait CONDITIONAL_GRACE_MS (150ms)
+//     Claude finishes within grace → SINGLE_SHOT: yield the canonical text once (measured: SHORT responses
+//       get ~0 benefit from chunking, so they stay on a single TTS request — no seam, no continuity risk)
+//     Claude still generating past grace → CHUNKED: yield the held first-safe chunk immediately, then
+//       continue yielding each subsequent safe chunk as speechChunker finds it (same boundary/numeric-
+//       protection logic chunkedTurn.js already uses in production for the L1b chunked-rollout path)
+//   On an exact tie (stream-completion and the grace timer scheduled for the identical target time) this
+//   implementation resolves to CHUNKED, empirically — verified by a repeated-run test in
+//   claudeConditional.test.js that asserts the SAME outcome across multiple iterations, never a coin flip,
+//   never a double-yield. (An earlier draft of this comment guessed stream-completion would win via
+//   Promise.race's array-order tie-break among already-settled promises — that guess was wrong; measuring
+//   it directly showed the grace timer's callback actually fires first under Node's mock-timer scheduling
+//   here. What the design review round actually required was determinism, not a specific winner, so this
+//   comment now states the measured behavior instead of an unverified mechanism.)
+//
+// Why this can't reuse askClaudeStreamChunked()/createChunkedProducer() directly (design review finding):
+// askClaudeStreamChunked() uses a DIFFERENT system prompt (buildSystemPromptToolBased) and a DIFFERENT
+// end_call mechanism (Anthropic tool_use) than legacy's buildSystemPrompt/[END_CALL] text marker — routing
+// through it would silently change what Claude generates, not just how it's transported, confounding the
+// L2a comparison entirely. This function clones askClaudeStream()'s exact prompt/config (same as
+// askClaudeObservedFullResponse() does) and only adds incremental boundary detection + conditional timing.
+//
+// END_CALL contract (locked design review round 2, 2026-08-21) — three separate channels, none derived
+// from the others:
+//   Speech (yielded chunks, both modes) — NEVER contains "[END_CALL]" or a partial fragment of it. Bracket-
+//     safety: boundary search never looks past the first unmatched '[' in the buffer (safeView()/
+//     tryFindBoundary() below), so no chunk yielded before stream-end can ever contain '['. The final
+//     post-stream chunk (either mode) also has the marker stripped before yielding.
+//   Canonical history (`finalText` milestone) — built ONLY from `rawText`, the raw per-delta accumulator
+//     that chunk boundaries never touch, with the marker stripped. A future caller must NOT reconstruct
+//     this by concatenating yielded speech chunks — CHUNKED mode's chunks are stripped independently per
+//     chunk, so concatenation is not guaranteed byte-for-byte equal to `finalText` and must never be
+//     treated as if it were.
+//   Control (`endCallRequested` milestone, boolean) — `rawText.includes('[END_CALL]')`. A future
+//     audioStream.js integration must use this, not `fullText.includes('[END_CALL]')` on reconstructed
+//     text, then run through the exact same premature-end-call guard policy that already exists.
+// This deliberately replaces askClaudeStream()'s older "yield raw text incl. marker, caller strips it"
+// convention — this function's speech output is unconditionally marker-free in both modes, uniformly.
+//
+// TTS continuity note (design review, not this prototype's concern): CHUNKED-mode chunks are synthesized
+// as independent ElevenLabs requests with no previous_text threading, same as the current L1b chunked path
+// (ENABLE_PREVIOUS_TEXT_CONTINUITY is hardcoded false in chunkedTurn.js after a production 400 incident) —
+// L2b prototype inherits that same known prosody-seam risk, does not attempt to fix or worsen it.
+const CONDITIONAL_GRACE_MS = 150
+
+async function* askClaudeConditionalStream(session, signal = null, onMilestone = null) {
+  const { name, campaign, messages } = session
+  const systemPrompt = buildSystemPrompt(campaign.script || campaign.system_prompt, name)
+  const history = messages.slice(-MAX_HISTORY)
+
+  if (!history.length) { yield 'สวัสดีค่ะ'; return }
+
+  const cachedMsgs = history.map((m, i) =>
+    i === history.length - 1
+      ? { role: m.role, content: [{ type: 'text', text: m.content, cache_control: { type: 'ephemeral' } }] }
+      : m
+  )
+
+  const requestAt = performance.now()
+  onMilestone?.('requestAt', requestAt)
+
+  const stream = client.messages.stream({
+    model: 'claude-sonnet-4-6',
+    max_tokens: 200,
+    thinking: { type: 'disabled' },
+    output_config: { effort: 'low' },
+    system: [
+      { type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } }
+    ],
+    messages: cachedMsgs,
+  }, { signal })
+
+  // Internal producer/consumer split mirrors chunkedTurn.js's createChunkedProducer shape (queue +
+  // waiter-resolve) — unavoidable because a plain generator can only yield from its own body, never from
+  // a detached setTimeout callback, so the grace-vs-stream-completion race has to live in a separate
+  // driver that pushes decided items into a queue this generator's body drains.
+  const items = []
+  let waiter = null
+  function push(item) { items.push(item); if (waiter) { const w = waiter; waiter = null; w() } }
+  function waitForItem() {
+    if (items.length > 0) return Promise.resolve()
+    return new Promise(resolve => { waiter = resolve })
+  }
+
+  let rawText = ''
+  let firstDeltaAt = null
+  let firstSafeAt = null
+  let mode = null // null (deciding) | 'SINGLE_SHOT' | 'CHUNKED'
+
+  const driver = (async () => {
+    let buffer = ''
+    let segmentStartMs = null
+    let numericProtectionTimer = null
+    let graceTimer = null
+    let pendingFirstChunk = null
+
+    function clearNumericProtectionTimer() { if (numericProtectionTimer) { clearTimeout(numericProtectionTimer); numericProtectionTimer = null } }
+    function clearGraceTimer() { if (graceTimer) { clearTimeout(graceTimer); graceTimer = null } }
+
+    // never search past the first unmatched '[' — see [END_CALL] bracket-safety note above
+    function safeView() {
+      const idx = buffer.indexOf('[')
+      return idx === -1 ? buffer : buffer.slice(0, idx)
+    }
+    function tryFindBoundary(elapsedMs) {
+      const view = safeView()
+      const result = findChunkBoundary(view, elapsedMs)
+      if (!result) return null
+      return { chunk: result.chunk, remainder: result.remainder + buffer.slice(view.length) }
+    }
+    function numericProtectionRemainingMs(elapsedMs) {
+      return getNumericProtectionRemainingMs(safeView(), elapsedMs)
+    }
+
+    // phase 2 (mode === 'CHUNKED'): drain every safe chunk as found, same continuous-flush shape as
+    // chunkedTurn.js's drainReadyChunks() — arms its own wall-clock numeric-protection timer so a
+    // protected buffer still resolves even if Claude goes quiet before HARD_MAX_MS
+    function drainChunked() {
+      clearNumericProtectionTimer()
+      while (true) {
+        const elapsedMs = performance.now() - segmentStartMs
+        const result = tryFindBoundary(elapsedMs)
+        if (result) {
+          push({ type: 'chunk', text: result.chunk })
+          buffer = result.remainder
+          segmentStartMs = performance.now()
+          continue
+        }
+        const remainingMs = numericProtectionRemainingMs(elapsedMs)
+        if (remainingMs != null) {
+          numericProtectionTimer = setTimeout(() => {
+            numericProtectionTimer = null
+            if (signal?.aborted) return
+            drainChunked()
+          }, remainingMs)
+        }
+        return
+      }
+    }
+
+    function armGrace() {
+      return new Promise(resolve => {
+        graceTimer = setTimeout(() => resolve('GRACE'), CONDITIONAL_GRACE_MS)
+      })
+    }
+
+    // exactly-once guarantee: waitForItem() on the consumer side only ever resolves via push() — every
+    // driver exit path (abort mid-stream, normal completion, error) MUST push something or the consumer
+    // hangs forever awaiting a promise nothing will ever resolve. Caught this before running any test by
+    // re-reading the abort-return paths below: a bare `return` after `if (signal?.aborted)` does exactly
+    // that. sendDone() makes the "always push before returning" invariant impossible to accidentally skip.
+    let doneSent = false
+    function sendDone() { if (!doneSent) { doneSent = true; push({ type: 'done' }) } }
+
+    const iterator = stream[Symbol.asyncIterator]()
+    let pendingNext = iterator.next()
+    let gracePromise = null
+
+    try {
+      while (true) {
+        const racers = [pendingNext.then(r => ({ kind: 'stream', r }))]
+        if (gracePromise) racers.push(gracePromise.then(() => ({ kind: 'grace' })))
+        const winner = await Promise.race(racers)
+
+        if (signal?.aborted) { sendDone(); return }
+
+        if (winner.kind === 'grace') {
+          gracePromise = null
+          clearGraceTimer()
+          mode = 'CHUNKED'
+          onMilestone?.('mode', mode)
+          push({ type: 'chunk', text: pendingFirstChunk })
+          segmentStartMs = performance.now() // buffer already holds the remainder from the boundary find below
+          drainChunked() // in case more deltas already queued up behind the boundary before grace fired
+          continue
+        }
+
+        const { value: event, done } = winner.r
+        if (done) break
+        pendingNext = iterator.next()
+
+        if (signal?.aborted) { sendDone(); return }
+        if (event.type !== 'content_block_delta' || event.delta?.type !== 'text_delta') continue
+
+        if (firstDeltaAt === null) { firstDeltaAt = performance.now(); onMilestone?.('firstDeltaAt', firstDeltaAt) }
+        rawText += event.delta.text
+
+        const wasEmpty = buffer.length === 0
+        buffer += event.delta.text
+        if (wasEmpty) segmentStartMs = performance.now()
+
+        if (mode === 'CHUNKED') {
+          drainChunked()
+        } else if (mode === null) {
+          const elapsedMs = performance.now() - segmentStartMs
+          const result = tryFindBoundary(elapsedMs)
+          if (result && firstSafeAt === null) {
+            firstSafeAt = performance.now()
+            onMilestone?.('firstSafeAt', firstSafeAt)
+            pendingFirstChunk = result.chunk
+            buffer = result.remainder
+            gracePromise = armGrace()
+          }
+          // no boundary yet (or already found — waiting on grace): keep accumulating, nothing to flush
+        }
+      }
+
+      clearNumericProtectionTimer()
+      clearGraceTimer()
+      if (signal?.aborted) { sendDone(); return }
+
+      const fullAt = performance.now()
+      onMilestone?.('fullAt', fullAt)
+
+      // END_CALL contract (locked design review 2026-08-21) — [END_CALL] never appears in ANY yielded
+      // speech chunk in either mode (unlike askClaudeStream()'s raw-yield-let-caller-strip convention;
+      // this function replaces that quirk with a clean, uniform contract since a future caller must not
+      // depend on `text.includes('[END_CALL]')` for this path at all). Canonical history text and the
+      // end-call control signal are exposed as two SEPARATE milestones, both built directly from rawText
+      // — the pure delta accumulator, untouched by chunk boundaries — never reconstructed by concatenating
+      // yielded speech chunks (CHUNKED mode's chunks have already been marker-stripped independently per
+      // chunk, so concatenating them is not guaranteed to equal the canonical text byte-for-byte, and must
+      // never be relied on as if it were).
+      const finalText = rawText.replace(/\[END_CALL\]/g, '').trim()
+      const endCallRequested = rawText.includes('[END_CALL]')
+      onMilestone?.('finalText', finalText)
+      onMilestone?.('endCallRequested', endCallRequested)
+
+      if (mode === 'CHUNKED') {
+        const lastSpeechChunk = buffer.replace(/\[END_CALL\]/g, '').trim()
+        if (lastSpeechChunk) push({ type: 'chunk', text: lastSpeechChunk })
+      } else {
+        mode = 'SINGLE_SHOT'
+        onMilestone?.('mode', mode)
+        if (finalText.length >= 3) push({ type: 'chunk', text: finalText })
+      }
+      sendDone()
+    } catch (err) {
+      clearNumericProtectionTimer()
+      clearGraceTimer()
+      if (!signal?.aborted) push({ type: 'error', err })
+      else sendDone() // abort surfaced as a rejected iterator.next() instead of a clean stream end — still must not hang the consumer
+    }
+  })()
+
+  try {
+    while (true) {
+      await waitForItem()
+      const item = items.shift() // guaranteed non-empty here — sendDone() ensures every driver exit path pushes exactly one final item
+      if (item.type === 'chunk') yield item.text
+      else if (item.type === 'done') break
+      else if (item.type === 'error') throw item.err
+    }
+  } finally {
+    await driver.catch(() => {}) // let the driver settle (clears its own timers in its own try/catch/finally) before returning control
+  }
+}
+
+module.exports = { askClaude, askClaudeStream, askClaudeStreamChunked, askClaudeObservedFullResponse, askClaudeConditionalStream, summarizeCall }
