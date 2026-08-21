@@ -1,10 +1,10 @@
 const callSessions = require('../utils/callSessions')
 const { transcribeStream } = require('../services/googleSTT')
-const { askClaude, askClaudeStream, askClaudeObservedFullResponse } = require('../services/claude')
+const { askClaude, askClaudeStream, askClaudeObservedFullResponse, askClaudeConditionalStream } = require('../services/claude')
 const { synthesizeSpeechStream } = require('../services/tts')
 const healthMonitor = require('../utils/healthMonitor')
 const { createCallState, bumpGeneration, isCurrentGeneration, endCall } = require('../utils/generationGuard')
-const { decideRollout, getLegacyObservedBucket } = require('../utils/rolloutBucket')
+const { decideRollout, getLegacyObservedBucket, getLegacyEarlyTtsBucket } = require('../utils/rolloutBucket')
 const { createTurnMetrics, markOnce, computeDerivedMetrics } = require('../utils/turnMetrics')
 const { createTurnState, markTtsPending, markAudioCommitted, markDone, claimFallback } = require('../utils/turnState')
 const { runChunkedTurn, speakFixedText, createChunkedProducer, adoptChunkedProducer } = require('./chunkedTurn')
@@ -288,6 +288,12 @@ function registerWebSocket(fastify) {
     let legacyObservedBucket = null
     let legacyObservedPercentAtStart = null
     let legacyObservedCampaignMatched = null
+    // L2b production exposure gate (design revision 2026-08-21) — freeze ครั้งเดียวพร้อมกับ rollout/legacyObserved
+    // ข้างบน same หลักการเป๊ะ ห้ามคำนวณใหม่กลางสาย — false/null ปลอดภัยเสมอก่อนถึง 'start' event
+    let legacyEarlyTts = false
+    let legacyEarlyTtsBucket = null
+    let legacyEarlyTtsPercentAtStart = null
+    let legacyEarlyTtsCampaignMatched = null
 
     console.log(`[WS] Connected callSid=${callSid}`)
 
@@ -649,7 +655,19 @@ function registerWebSocket(fastify) {
         legacyObservedPercentAtStart = observedConfig.percent
         legacyObserved = !rollout.useChunkedStreaming && legacyObservedCampaignMatched && legacyObservedBucket < observedConfig.percent
 
-        console.log(`[Rollout] callSid=${callSid} bucket=${rollout.bucket} percent=${rollout.percentAtStart} chunked=${rollout.useChunkedStreaming} legacyObserved=${legacyObserved} legacyObservedBucket=${legacyObservedBucket} legacyObservedPercent=${observedConfig.percent} campaignMatched=${legacyObservedCampaignMatched}`)
+        // L2b (design revision 2026-08-21) — safety precedence CONFIRMED (review round 3): chunked ก่อน แล้ว
+        // legacyObserved ก่อน แล้วค่อยถึง legacyEarlyTts เป็นลำดับสุดท้าย — เขียนเป็น chain ตรงๆ ในสูตรเดียว ไม่ใช่
+        // if/else แยกหลายที่ กัน future edit พลาดลำดับ ทั้งสาม flag mutual exclusive กันโดยสมบูรณ์เสมอ:
+        //   chunked=true            → legacyObserved=false, legacyEarlyTts=false
+        //   chunked=false, observed=true  → legacyEarlyTts=false
+        //   chunked=false, observed=false, campaign match + bucket ผ่าน → legacyEarlyTts=true
+        const earlyTtsConfig = rolloutConfig.getCurrentLegacyEarlyTtsConfig()
+        legacyEarlyTtsBucket = getLegacyEarlyTtsBucket(callSid)
+        legacyEarlyTtsCampaignMatched = earlyTtsConfig.campaignId != null && session.campaign?.id === earlyTtsConfig.campaignId
+        legacyEarlyTtsPercentAtStart = earlyTtsConfig.percent
+        legacyEarlyTts = !rollout.useChunkedStreaming && !legacyObserved && legacyEarlyTtsCampaignMatched && legacyEarlyTtsBucket < earlyTtsConfig.percent
+
+        console.log(`[Rollout] callSid=${callSid} bucket=${rollout.bucket} percent=${rollout.percentAtStart} chunked=${rollout.useChunkedStreaming} legacyObserved=${legacyObserved} legacyObservedBucket=${legacyObservedBucket} legacyObservedPercent=${observedConfig.percent} campaignMatched=${legacyObservedCampaignMatched} legacyEarlyTts=${legacyEarlyTts} legacyEarlyTtsBucket=${legacyEarlyTtsBucket} legacyEarlyTtsPercent=${earlyTtsConfig.percent} earlyTtsCampaignMatched=${legacyEarlyTtsCampaignMatched}`)
 
         // L1a: ต้องคำนวณหลัง rollout freeze แล้วเท่านั้น (ดูหมายเหตุที่ค่าคงที่ด้านบนไฟล์)
         const interimFinalizeMs = rollout.useChunkedStreaming ? STT_INTERIM_FINALIZE_MS_CHUNKED : 900
@@ -695,6 +713,10 @@ function registerWebSocket(fastify) {
             legacyObservedBucket,
             legacyObservedPercentAtStart,
             legacyObservedCampaignMatched,
+            legacyEarlyTts,
+            legacyEarlyTtsBucket,
+            legacyEarlyTtsPercentAtStart,
+            legacyEarlyTtsCampaignMatched,
           })
           markOnce(turnMetrics, 't1')
 
@@ -1041,6 +1063,185 @@ function registerWebSocket(fastify) {
             if (prewarmPromise === myPrewarm) clearPrewarm()
 
             if (!aiText && !signal.aborted && callActive && isSpeaking) {
+              if (legacyEarlyTts) {
+                // L2b exposure gate (design revision 2026-08-21, review round 3) — TTS happens INSIDE run()
+                // itself, interleaved with Claude streaming, unlike CONTROL/OBSERVED below where aiText is
+                // set first and the shared TTS block (:1177) speaks it afterward. legacyEarlyTts deliberately
+                // never sets aiText, so that shared block naturally no-ops here — audio for this turn is
+                // already fully sent by the time this branch resolves.
+                //
+                // Signal separation (MANDATORY refinement 1) — the single most important invariant of this
+                // branch: TTS is bound to the OUTER `signal` (generation/barge-in signal), never to
+                // `childSignal` (the Claude-watchdog's own child). A 6000ms Claude-side timeout must only be
+                // able to stop MORE Claude generation — it has NO right to abort audio already being sent or
+                // already committed for an earlier chunk. Barge-in (outer `signal` aborting) still stops
+                // everything, because childSignal is bridged from signal by attachChildAbort() inside
+                // runAttemptWithWatchdog() itself (barge-in → signal aborts → child aborts too → Claude AND
+                // in-flight speakFixedText() calls both stop, since speakFixedText's own isCurrentGeneration
+                // guard also fires independently of which signal it was passed).
+                // BLOCKER D fix (design review round 4) — runAttemptWithWatchdog() races [attemptPromise,
+                // watchdogPromise] and returns the INSTANT the watchdog wins; it never waits for the loser
+                // (attemptPromise) to actually settle, only attaches a late-rejection log handler to it. Since
+                // speakFixedText() below is deliberately bound to the OUTER `signal` (not `childSignal`, per
+                // the signal-separation invariant above), a watchdog fire does NOT stop an in-flight
+                // speakFixedText() call — it keeps running in the background while runAttemptWithWatchdog
+                // already returned control here. Without tracking it explicitly, the outcome-branching code
+                // right below could read turnState.audioCommitted BEFORE the loser's TTS call has actually
+                // committed audio, misclassify as precommit, speak a recovery phrase, and race an unrelated
+                // audio stream still being sent from the loser — confirmed against real code, not assumed.
+                let inFlightTtsPromise = null
+
+                const freshAttempt = await runAttemptWithWatchdog({
+                  signal,
+                  timeoutMs: LEGACY_FRESH_CLAUDE_TIMEOUT_MS,
+                  reason: 'LEGACY_CLAUDE_TIMEOUT',
+                  run: async (childSignal, arm) => {
+                    let canonicalFinalText = null
+                    let endCallRequestedResult = false
+                    const onEarlyTtsMilestone = (key, value) => {
+                      const fieldMap = {
+                        requestAt: 'legacyEarlyTtsRequestAt',
+                        firstDeltaAt: 'legacyEarlyTtsFirstDeltaAt',
+                        firstSafeAt: 'legacyEarlyTtsFirstSafeAt',
+                        fullAt: 'legacyEarlyTtsFullAt',
+                      }
+                      const field = fieldMap[key]
+                      if (field && turnMetrics[field] == null) turnMetrics[field] = value
+                      else if (key === 'mode' && turnMetrics.legacyEarlyTtsMode == null) turnMetrics.legacyEarlyTtsMode = value
+                      // MANDATORY refinement 2 — capture only, do NOT push session.messages here. Claude may
+                      // complete (fullAt/finalText milestone) while an earlier chunk is still being spoken;
+                      // pushing immediately risks a barge-in mid-tail seeing a fabricated complete history
+                      // entry for audio the customer never actually heard in full. History is written once,
+                      // at the shared tail (:1223-ish), from whatever this run() call returns — same timing
+                      // as legacy's existing fullText push, not earlier.
+                      else if (key === 'finalText') canonicalFinalText = value
+                      else if (key === 'endCallRequested') endCallRequestedResult = value
+                      // Design review round 4 — Claude finishing (fullAt) must disarm the 6000ms watchdog.
+                      // Without this, the SAME window also covers however long the tail TTS chunk(s) take
+                      // after Claude is already fully done, so a slow-but-healthy ElevenLabs response could
+                      // fire "LEGACY_CLAUDE_TIMEOUT" for a turn where Claude itself answered in 2s — a
+                      // misleading reason and outcome for what is actually just TTS latency, matching what
+                      // the existing chunked/adoptChunkedProducer path already accepts as its own risk (no
+                      // dedicated per-chunk TTS watchdog there either — not a new gap introduced here).
+                      //
+                      // MUST be a separate unconditional check, not another `else if` in the chain above —
+                      // 'fullAt' already matches fieldMap (first branch sets turnMetrics.legacyEarlyTtsFullAt),
+                      // so as an else-if this line was dead code and the watchdog was never actually being
+                      // disarmed (self-caught via the round-4 fullAt-disarm test failing against real code,
+                      // not assumed from reading the diff).
+                      if (key === 'fullAt') arm()
+                    }
+                    // canonical t3/t4 — unlike L2a (always null for legacy), L2b genuinely streams/speaks
+                    // early, so these are meaningful the same way chunked path's t3/t4 already are.
+                    let t3Marked = false, t4Marked = false
+                    const wrappedMilestone = (key, value) => {
+                      onEarlyTtsMilestone(key, value)
+                      if (key === 'firstDeltaAt' && !t3Marked) { markOnce(turnMetrics, 't3'); t3Marked = true }
+                      if (key === 'firstSafeAt' && !t4Marked) { markOnce(turnMetrics, 't4'); t4Marked = true }
+                    }
+                    for await (const chunk of askClaudeConditionalStream(currentSession, childSignal, wrappedMilestone)) {
+                      const ttsPromise = speakFixedText({
+                        text: chunk, signal, socket, streamSid,
+                        voiceId: currentSession.campaign.voice_id,
+                        turnMetrics, turnState, callState, generationId,
+                        startingSentCount: totalSent,
+                      })
+                      inFlightTtsPromise = ttsPromise
+                      const result = await ttsPromise
+                      inFlightTtsPromise = null
+                      totalSent += result.sentCount
+                    }
+                    return { canonicalFinalText, endCallRequestedResult }
+                  },
+                })
+
+                // BLOCKER D fix, continued — if the watchdog won while a speakFixedText() call was still
+                // outstanding (the loser scenario documented above), wait for it to actually settle before
+                // touching turnState.audioCommitted or anything shared-tail-adjacent. The loser is bound to
+                // the OUTER `signal`, so it either already committed audio or is about to — this must be known
+                // before deciding precommit-vs-postcommit, not raced. Swallow the loser's own rejection here —
+                // freshAttempt's outcome was already decided by runAttemptWithWatchdog and stands regardless.
+                if (inFlightTtsPromise) {
+                  try { await inFlightTtsPromise } catch { /* loser's own error is irrelevant to freshAttempt's outcome */ }
+                }
+
+                let shouldSpeakRecoveryEarlyTts = false
+                if (freshAttempt.outcome === 'success' && freshAttempt.result?.canonicalFinalText?.trim()) {
+                  fullText = freshAttempt.result.canonicalFinalText
+                  endCallRequested = freshAttempt.result.endCallRequestedResult || endCallRequested
+                  turnMetrics.legacyEarlyTtsOutcome = 'COMPLETED'
+                } else if (freshAttempt.outcome === 'success') {
+                  turnMetrics.legacyEarlyTtsOutcome = 'EMPTY'
+                  if (!turnState.audioCommitted) shouldSpeakRecoveryEarlyTts = true
+                } else if (freshAttempt.outcome === 'aborted') {
+                  turnMetrics.legacyEarlyTtsOutcome = 'ABORTED'
+                  // barge-in — เหมือน CONTROL/OBSERVED's aborted branch เป๊ะ ไม่พูด recovery ไม่ commit fullText
+                } else if (freshAttempt.outcome === 'timeout') {
+                  // MANDATORY refinement 1 — postcommit ต้องไม่พูด recovery/fabricate ทับเสียงที่ commit ไปแล้ว
+                  if (turnState.audioCommitted) {
+                    turnMetrics.legacyEarlyTtsOutcome = 'TIMEOUT_POSTCOMMIT'
+                    console.log('[L2b] Claude tail timed out after audio already committed — no recovery phrase, no replay')
+                  } else {
+                    turnMetrics.legacyEarlyTtsOutcome = 'TIMEOUT_PRECOMMIT'
+                    console.error(`[Watchdog] LEGACY_CLAUDE_TIMEOUT (L2b precommit) — Claude ไม่ตอบภายใน ${LEGACY_FRESH_CLAUDE_TIMEOUT_MS}ms, speaking recovery phrase`)
+                    shouldSpeakRecoveryEarlyTts = true
+                  }
+                } else {
+                  if (turnState.audioCommitted) {
+                    turnMetrics.legacyEarlyTtsOutcome = 'ERROR_POSTCOMMIT'
+                    console.error('[L2b] Tail error after audio already committed — not fabricating recovery/history:', freshAttempt.error.message)
+                  } else {
+                    turnMetrics.legacyEarlyTtsOutcome = 'ERROR'
+                    console.error('[AI/TTS error] (L2b precommit)', freshAttempt.error.message)
+                    healthMonitor.reportError('ai_tts', freshAttempt.error.message)
+                    shouldSpeakRecoveryEarlyTts = true
+                  }
+                }
+
+                if (shouldSpeakRecoveryEarlyTts) {
+                  console.log('[Recovery] Speaking canned recovery phrase (L2b precommit)')
+                  const recoveryResult = await speakFixedText({
+                    text: LEGACY_RECOVERY_PHRASE, signal, socket, streamSid,
+                    voiceId: currentSession.campaign.voice_id, turnMetrics, turnState, callState, generationId,
+                    startingSentCount: totalSent,
+                  })
+                  totalSent += recoveryResult.sentCount
+                  if (recoveryResult.sentCount > 0) {
+                    const deliveredFully = !signal.aborted && isCurrentGeneration(callState, generationId) && callActive && socket.readyState === socket.OPEN
+                    fullText = deliveredFully
+                      ? LEGACY_RECOVERY_PHRASE
+                      : '[ระบบ: คำตอบก่อนหน้าถูกขัดจังหวะหลังเริ่มส่งเสียง ลูกค้าอาจได้ยินเพียงบางส่วน]'
+                  }
+                }
+
+                // MANDATORY refinement 3 — premature END_CALL guard, L2b-local equivalent of the legacy-only
+                // guard further below (that one only ever sees fullText.includes('[END_CALL]'), which is
+                // always false for L2b by design — L2b's own signal is the endCallRequested boolean instead).
+                if (endCallRequested && shouldBlockEndCall(currentSession, fullText)) {
+                  console.log('[Guard] Premature END_CALL blocked — injecting follow-up question (L2b)')
+                  const followUp = 'มีอะไรสอบถามเพิ่มเติมไหมคะ'
+                  endCallRequested = false // MUST reset — shared tail (:1247-ish) checks this boolean directly
+                  fullText = `${fullText} ${followUp}`.trim()
+                  try {
+                    markOnce(turnMetrics, 't5')
+                    markTtsPending(turnState)
+                    for await (const followUpChunk of synthesizeSpeechStream(followUp, currentSession.campaign.voice_id, signal)) {
+                      if (socket.readyState !== socket.OPEN || signal.aborted) break
+                      markOnce(turnMetrics, 't6')
+                      if (totalSent === 0) console.log('[TTS] First audio chunk sent')
+                      socket.send(JSON.stringify({ event: 'media', streamSid, media: { payload: followUpChunk.toString('base64') } }))
+                      markOnce(turnMetrics, 't7')
+                      markAudioCommitted(turnState)
+                      totalSent++
+                    }
+                  } catch (err) {
+                    if (err.code !== 'ERR_CANCELED' && err.name !== 'CanceledError') {
+                      console.error('[Guard TTS error] (L2b)', err.message)
+                      healthMonitor.reportError('tts', err.message)
+                    }
+                  }
+                }
+              } else {
               const freshAttempt = await runAttemptWithWatchdog({
                 signal,
                 timeoutMs: LEGACY_FRESH_CLAUDE_TIMEOUT_MS,
@@ -1150,6 +1351,7 @@ function registerWebSocket(fastify) {
                 }
                 // sentCount === 0 → ไม่ commit อะไรเข้า history เลย (fullText คงเป็น '' เหมือนเดิม)
               }
+              } // end else (CONTROL/legacyObserved — L2b takes the `if (legacyEarlyTts)` branch above instead)
             }
 
             if (aiText && !signal.aborted && callActive && isSpeaking) {

@@ -79,6 +79,40 @@ function classifyLegacyObservedConfig(rows) {
   return { percent, campaignId }
 }
 
+// L2b production exposure gate (design revision 2026-08-21) — same fail-closed policy and atomic-snapshot
+// shape as classifyLegacyObservedConfig() above, own key names, own cache/log-signature state entirely
+// (see createRolloutConfig() below) — completely independent kill switch from legacy_observed_*, since L2b
+// changes actual TTS start timing (a stronger production risk than L2a's pure instrumentation) and must be
+// disable-able without touching L2a's exposure at all. Same "percent>0 requires a valid campaignId" rule.
+function classifyLegacyEarlyTtsConfig(rows) {
+  const percentRows = rows.filter(r => r.key === 'legacy_early_tts_percent')
+  const campaignRows = rows.filter(r => r.key === 'legacy_early_tts_campaign_id')
+
+  let percent = 0
+  if (percentRows.length === 1) {
+    const raw = String(percentRows[0].value ?? '').trim()
+    if (/^\d+$/.test(raw)) {
+      const n = Number(raw)
+      if (n >= 0 && n <= 100) percent = n
+    }
+  }
+
+  let campaignId = null
+  let campaignIdValid = true
+  if (campaignRows.length === 1) {
+    const raw = String(campaignRows[0].value ?? '').trim()
+    campaignId = raw || null
+  } else if (campaignRows.length > 1) {
+    campaignIdValid = false
+  }
+
+  if (percent > 0 && (campaignId == null || !campaignIdValid)) {
+    return { percent: 0, campaignId: null }
+  }
+  if (percent === 0) return { percent: 0, campaignId: null }
+  return { percent, campaignId }
+}
+
 function createRolloutConfig({ getRows = () => sheetsService.getStreamingConfig(), refreshIntervalMs = DEFAULT_REFRESH_INTERVAL_MS } = {}) {
   let cachedPercent = null // null = cold start, ยังไม่เคย fetch สำเร็จเลย
   let lastAttemptAt = null
@@ -88,6 +122,8 @@ function createRolloutConfig({ getRows = () => sheetsService.getStreamingConfig(
   // L2a — fail-closed เสมอ (ไม่มี "cold start ยังไม่รู้ค่า" แบบ cachedPercent) เริ่มต้นที่ {0, null} ตรงๆ ตั้งแต่
   // ก่อน fetch ครั้งแรกเลย — ถ้า Sheets ยังไม่เคยเพิ่มแถว legacy_observed_percent เลย นี่คือค่าที่ปลอดภัยอยู่แล้ว
   let cachedObservedConfig = { percent: 0, campaignId: null }
+  // L2b — cache/policy แยกจาก L2a โดยสิ้นเชิง (ดู comment ที่ classifyLegacyEarlyTtsConfig ด้านบน)
+  let cachedEarlyTtsConfig = { percent: 0, campaignId: null }
 
   // C6b — log แบบ state-change เท่านั้น ไม่ log ทุกรอบ poll (30s) เพราะจะ spam production logs โดยไม่มีประโยชน์
   // log signature เปลี่ยนเมื่อไหร่ก็ต่อเมื่อผลลัพธ์เปลี่ยนจริง (success→success ค่าเดิม ไม่ log ซ้ำ, error เดิมซ้ำๆ
@@ -106,6 +142,14 @@ function createRolloutConfig({ getRows = () => sheetsService.getStreamingConfig(
   function logOnChangeObserved(signature, logFn) {
     if (signature === lastObservedLogSignature) return
     lastObservedLogSignature = signature
+    logFn()
+  }
+
+  // L2b — signature ของตัวเองอีกชุด แยกจากทั้ง rollout_percent และ legacy_observed_* (เหตุผลเดียวกัน)
+  let lastEarlyTtsLogSignature = null
+  function logOnChangeEarlyTts(signature, logFn) {
+    if (signature === lastEarlyTtsLogSignature) return
+    lastEarlyTtsLogSignature = signature
     logFn()
   }
 
@@ -133,12 +177,22 @@ function createRolloutConfig({ getRows = () => sheetsService.getStreamingConfig(
           `observed:${observedResult.percent}:${observedResult.campaignId}`,
           () => console.log(`[RolloutConfig] observed config percent=${observedResult.percent} campaignId=${observedResult.campaignId ?? 'null'}`)
         )
+
+        // L2b — เขียนทับ cachedEarlyTtsConfig ทุกรอบเช่นกัน (fail-closed ไม่ใช่ LKG) rows ชุดเดียวกัน ไม่ fetch ซ้ำ
+        const earlyTtsResult = classifyLegacyEarlyTtsConfig(rows)
+        cachedEarlyTtsConfig = earlyTtsResult
+        logOnChangeEarlyTts(
+          `earlyTts:${earlyTtsResult.percent}:${earlyTtsResult.campaignId}`,
+          () => console.log(`[RolloutConfig] early-tts config percent=${earlyTtsResult.percent} campaignId=${earlyTtsResult.campaignId ?? 'null'}`)
+        )
       } catch (err) {
         // ใช้ last-known-good ต่อไปเฉพาะ rollout_percent ไม่ throw ให้กระทบ caller (ทั้ง background poll และ manual call)
         logOnChange(`failure:${err.message}`, () => console.error(`[RolloutConfig] refresh failed error=${JSON.stringify(err.message)} using_lkg=${cachedPercent ?? 0}`))
-        // L2a — fetch ล้มเหลวเอง (ไม่ใช่แค่ parse ล้มเหลว) ก็ fail-closed เหมือนกัน ไม่ preserve ค่าเดิม
+        // L2a/L2b — fetch ล้มเหลวเอง (ไม่ใช่แค่ parse ล้มเหลว) ก็ fail-closed เหมือนกันทั้งคู่ ไม่ preserve ค่าเดิม
         cachedObservedConfig = { percent: 0, campaignId: null }
         logOnChangeObserved('observed:fetch_failed', () => console.warn('[RolloutConfig] observed config fetch failed — fail-closed percent=0'))
+        cachedEarlyTtsConfig = { percent: 0, campaignId: null }
+        logOnChangeEarlyTts('earlyTts:fetch_failed', () => console.warn('[RolloutConfig] early-tts config fetch failed — fail-closed percent=0'))
       } finally {
         refreshInFlight = null
       }
@@ -176,7 +230,13 @@ function createRolloutConfig({ getRows = () => sheetsService.getStreamingConfig(
     return cachedObservedConfig
   }
 
-  return { getCurrentRolloutPercent, getCurrentLegacyObservedConfig, start, stop, refresh }
+  // L2b — atomic snapshot เดียวกัน pattern เป๊ะ แยก state จาก L2a โดยสิ้นเชิง
+  function getCurrentLegacyEarlyTtsConfig() {
+    refreshIfStale()
+    return cachedEarlyTtsConfig
+  }
+
+  return { getCurrentRolloutPercent, getCurrentLegacyObservedConfig, getCurrentLegacyEarlyTtsConfig, start, stop, refresh }
 }
 
-module.exports = { createRolloutConfig, parseRolloutPercent, classifyLegacyObservedConfig }
+module.exports = { createRolloutConfig, parseRolloutPercent, classifyLegacyObservedConfig, classifyLegacyEarlyTtsConfig }

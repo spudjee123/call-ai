@@ -26,11 +26,18 @@ function ensureStubbed() {
     // เทสเดิมไม่สนใจ field พวกนี้จึงไม่กระทบ) — เทสที่ต้องการคุม milestone/behavior ของ L2a โดยเฉพาะค่อย set
     // claudeObservedImpl ตรงๆ แทน
     claudeObservedImpl: null,
+    // L2b — askClaudeConditionalStream(session, signal, onMilestone) ค่า default เป็น null: stub ด้านล่าง
+    // delegate ไปที่ claudeStreamImpl เหมือนกัน ยิง milestone ครบชุด (รวม finalText/endCallRequested/mode) ตาม
+    // contract จริง แต่เป็น SINGLE_SHOT เสมอ (chunk เดียว) — เทสที่ต้องการคุม CHUNKED mode/milestone ละเอียดค่อย
+    // set claudeConditionalImpl ตรงๆ แทน
+    claudeConditionalImpl: null,
     ttsImpl: async function* () { yield Buffer.from('audio') }, // synthesizeSpeechStream(text, voiceId, signal)
     rolloutPercent: 0,
     // L2a production exposure gate — default fail-closed {percent:0, campaignId:null} เหมือน production cold
     // start เป๊ะ (ดู rolloutConfig.js cachedObservedConfig) เทสที่ต้องการ observed=true ต้อง set ค่าทั้งคู่เอง
     legacyObservedConfig: { percent: 0, campaignId: null },
+    // L2b production exposure gate — default fail-closed เหมือนกันเป๊ะ
+    legacyEarlyTtsConfig: { percent: 0, campaignId: null },
     lastSttCallbacks: null, // { onTranscript, onInterim } — set สดทุกครั้งที่มี connection ใหม่เปิด sttStream
   }
 
@@ -56,6 +63,29 @@ function ensureStubbed() {
           // ก่อน record fullAt เสมอ) ต้อง mirror ให้ตรงเพื่อให้เทสที่ผ่าน stub นี้สะท้อนพฤติกรรมจริงได้ถูกต้อง
           if (signal?.aborted) return
           onMilestone?.('fullAt', Date.now())
+        })()
+      },
+      // L2b — default stub เป็น SINGLE_SHOT เสมอ (chunk เดียว, delegate ไป claudeStreamImpl เหมือน L2a's stub)
+      // ยิง milestone ครบตาม contract จริงของ askClaudeConditionalStream() (requestAt/firstDeltaAt/fullAt/mode/
+      // finalText/endCallRequested) — เทสที่ต้องการ CHUNKED mode หรือคุม milestone ละเอียดกว่านี้ค่อย set
+      // claudeConditionalImpl ตรงๆ แทน
+      askClaudeConditionalStream: (session, signal, onMilestone) => {
+        if (state.claudeConditionalImpl) return state.claudeConditionalImpl(session, signal, onMilestone)
+        return (async function* () {
+          onMilestone?.('requestAt', Date.now())
+          let text = ''
+          let first = true
+          for await (const chunk of state.claudeStreamImpl(session, false, signal)) {
+            if (first) { onMilestone?.('firstDeltaAt', Date.now()); first = false }
+            text += (text ? ' ' : '') + chunk
+          }
+          if (signal?.aborted) return
+          onMilestone?.('fullAt', Date.now())
+          onMilestone?.('mode', 'SINGLE_SHOT')
+          const finalText = text.replace(/\[END_CALL\]/g, '').trim()
+          onMilestone?.('finalText', finalText)
+          onMilestone?.('endCallRequested', text.includes('[END_CALL]'))
+          if (finalText.length >= 3) yield finalText
         })()
       },
     },
@@ -88,6 +118,7 @@ function ensureStubbed() {
         stop: () => {},
         getCurrentRolloutPercent: () => state.rolloutPercent,
         getCurrentLegacyObservedConfig: () => state.legacyObservedConfig,
+        getCurrentLegacyEarlyTtsConfig: () => state.legacyEarlyTtsConfig,
       }),
     },
   }

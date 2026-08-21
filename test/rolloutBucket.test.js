@@ -1,6 +1,6 @@
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
-const { getRolloutBucket, decideRollout, getLegacyObservedBucket } = require('../src/utils/rolloutBucket')
+const { getRolloutBucket, decideRollout, getLegacyObservedBucket, getLegacyEarlyTtsBucket } = require('../src/utils/rolloutBucket')
 
 test('same callSid → bucket เดิมเสมอ ไม่ว่าจะเรียกกี่ครั้ง', () => {
   const a = getRolloutBucket('CA1234567890')
@@ -99,4 +99,37 @@ test('L2a: independent namespace — getRolloutBucket และ getLegacyObserve
   // ทั้งสองชุดต้องไม่ใช่ mapping เดียวกันทุกตัว (ถ้า namespace ไม่ได้ผูกจริงจะเห็น pattern ซ้ำ) — ตัวอย่างนี้ต่างกันหมด
   const identicalCount = rolloutBuckets.filter((v, i) => v === observedBuckets[i]).length
   assert.ok(identicalCount < samples.length, 'ไม่ควรเห็น bucket ชนกันทุกตัวอย่าง (แปลว่า hash ไม่ independent จริง)')
+})
+
+// ---------------------------------------------------------------------------
+// L2b production exposure gate — getLegacyEarlyTtsBucket() (design revision 2026-08-21)
+// ---------------------------------------------------------------------------
+
+test('L2b: getLegacyEarlyTtsBucket deterministic + อยู่ในช่วง 0-99', () => {
+  assert.equal(getLegacyEarlyTtsBucket('CA1'), getLegacyEarlyTtsBucket('CA1'))
+  for (let i = 0; i < 100; i++) {
+    const b = getLegacyEarlyTtsBucket('CA' + i)
+    assert.ok(b >= 0 && b <= 99)
+  }
+})
+
+test('L2b: fixed known fixtures — hash namespace "legacy-early-tts:" ให้ค่าคงที่ตามที่คำนวณไว้ล่วงหน้า', () => {
+  assert.equal(getLegacyEarlyTtsBucket('CA1'), 90)
+  assert.equal(getLegacyEarlyTtsBucket('CA2'), 77)
+  assert.equal(getLegacyEarlyTtsBucket('CA3'), 37)
+})
+
+test('L2b: getRolloutBucket()/getLegacyObservedBucket() เดิมต้องไม่ถูกกระทบเลย — fixture เดิมยังได้ค่าเดิมเป๊ะ', () => {
+  assert.equal(getRolloutBucket('CA1'), 8)
+  assert.equal(getLegacyObservedBucket('CA1'), 14)
+})
+
+test('L2b: independent namespace จากทั้ง rollout และ legacy-observed — สาม bucket ของ callSid เดียวกันไม่ผูกกัน (ชนกันได้บังเอิญ ไม่ใช่บั๊ก)', () => {
+  const samples = ['CA1', 'CA2', 'CA3', 'CA1234567890']
+  const rolloutBuckets = samples.map(getRolloutBucket)
+  const observedBuckets = samples.map(getLegacyObservedBucket)
+  const earlyTtsBuckets = samples.map(getLegacyEarlyTtsBucket)
+  assert.deepEqual(earlyTtsBuckets, [90, 77, 37, 22])
+  const allThreeIdentical = samples.filter((_, i) => rolloutBuckets[i] === observedBuckets[i] && observedBuckets[i] === earlyTtsBuckets[i]).length
+  assert.ok(allThreeIdentical < samples.length, 'ไม่ควรเห็นสาม bucket ชนกันทุกตัวอย่าง')
 })

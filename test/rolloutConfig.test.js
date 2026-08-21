@@ -1,6 +1,6 @@
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
-const { createRolloutConfig, parseRolloutPercent, classifyLegacyObservedConfig } = require('../src/utils/rolloutConfig')
+const { createRolloutConfig, parseRolloutPercent, classifyLegacyObservedConfig, classifyLegacyEarlyTtsConfig } = require('../src/utils/rolloutConfig')
 
 function delay(ms) { return new Promise(resolve => setTimeout(resolve, ms)) }
 
@@ -462,5 +462,70 @@ test('L2a: kill switch — legacy_observed_percent กลับเป็น 0 �
   percent = '0'
   await delay(100)
   assert.deepEqual(rc.getCurrentLegacyObservedConfig(), { percent: 0, campaignId: null }, 'percent=0 ต้องล้าง campaignId กลับเป็น null ด้วย (atomic snapshot สอดคล้องกันเสมอ)')
+  rc.stop()
+})
+
+// ---------------------------------------------------------------------------
+// L2b production exposure gate — classifyLegacyEarlyTtsConfig() (design revision 2026-08-21)
+// same fail-closed shape as L2a's classifyLegacyObservedConfig(), own keys/state entirely independent
+// ---------------------------------------------------------------------------
+
+test('classifyLegacyEarlyTtsConfig: percent>0 + campaignId ถูกต้องครบคู่ → ใช้ค่านั้นจริง', () => {
+  assert.deepEqual(
+    classifyLegacyEarlyTtsConfig([
+      { key: 'legacy_early_tts_percent', value: '100' },
+      { key: 'legacy_early_tts_campaign_id', value: 'CAMPAIGN_L2B_TEST' },
+    ]),
+    { percent: 100, campaignId: 'CAMPAIGN_L2B_TEST' }
+  )
+})
+
+test('classifyLegacyEarlyTtsConfig: percent>0 แต่ไม่มีแถว campaign_id เลย → fail-closed {0, null}', () => {
+  assert.deepEqual(
+    classifyLegacyEarlyTtsConfig([{ key: 'legacy_early_tts_percent', value: '100' }]),
+    { percent: 0, campaignId: null }
+  )
+})
+
+test('classifyLegacyEarlyTtsConfig: ไม่มีแถวใดๆ เลย (Sheets ยังไม่เคยเพิ่ม key พวกนี้) → {0, null} ปลอดภัยตั้งแต่วันแรก', () => {
+  assert.deepEqual(classifyLegacyEarlyTtsConfig([]), { percent: 0, campaignId: null })
+})
+
+test('classifyLegacyEarlyTtsConfig: independent จาก legacy_observed_* โดยสิ้นเชิง — มีทั้งคู่ในแถวเดียวกันไม่ปนกัน', () => {
+  const rows = [
+    { key: 'legacy_observed_percent', value: '100' },
+    { key: 'legacy_observed_campaign_id', value: 'CAMPAIGN_L2A' },
+    { key: 'legacy_early_tts_percent', value: '50' },
+    { key: 'legacy_early_tts_campaign_id', value: 'CAMPAIGN_L2B' },
+  ]
+  assert.deepEqual(classifyLegacyObservedConfig(rows), { percent: 100, campaignId: 'CAMPAIGN_L2A' })
+  assert.deepEqual(classifyLegacyEarlyTtsConfig(rows), { percent: 50, campaignId: 'CAMPAIGN_L2B' })
+})
+
+test('L2b: createRolloutConfig().getCurrentLegacyEarlyTtsConfig() — fail-closed ทันทีตอน fetch ล้มเหลว ในขณะที่ rollout_percent ยัง LKG และ legacy_observed_* ก็ fail-closed คู่ขนานกัน (สาม policy ทำงานถูกต้องพร้อมกันจาก fetch เดียว)', async () => {
+  let shouldFail = false
+  const rc = createRolloutConfig({
+    getRows: async () => {
+      if (shouldFail) throw new Error('Sheets down')
+      return [
+        { key: 'rollout_percent', value: '20' },
+        { key: 'legacy_observed_percent', value: '100' },
+        { key: 'legacy_observed_campaign_id', value: 'A' },
+        { key: 'legacy_early_tts_percent', value: '100' },
+        { key: 'legacy_early_tts_campaign_id', value: 'B' },
+      ]
+    },
+    refreshIntervalMs: 50,
+  })
+  rc.start()
+  await delay(20)
+  assert.equal(rc.getCurrentRolloutPercent(), 20)
+  assert.deepEqual(rc.getCurrentLegacyObservedConfig(), { percent: 100, campaignId: 'A' })
+  assert.deepEqual(rc.getCurrentLegacyEarlyTtsConfig(), { percent: 100, campaignId: 'B' })
+  shouldFail = true
+  await delay(100)
+  assert.equal(rc.getCurrentRolloutPercent(), 20, 'rollout_percent ต้องคง LKG')
+  assert.deepEqual(rc.getCurrentLegacyObservedConfig(), { percent: 0, campaignId: null }, 'L2a ต้อง fail-closed')
+  assert.deepEqual(rc.getCurrentLegacyEarlyTtsConfig(), { percent: 0, campaignId: null }, 'L2b ต้อง fail-closed เช่นกัน')
   rc.stop()
 })

@@ -80,12 +80,21 @@ beforeEach(() => {
   // L2a production exposure gate (design revision 2026-08-20) — reset ทุกเทสเหมือน rolloutPercent ข้างบน กัน
   // ค่าที่เทสก่อนหน้าตั้งไว้หลุดข้ามมาปนเทสถัดไปโดยไม่ตั้งใจ default fail-closed เหมือน production cold start
   state.legacyObservedConfig = { percent: 0, campaignId: null }
+  // L2b — reset เช่นกัน + คืน claudeConditionalImpl เป็น default (delegate ไป claudeStreamImpl)
+  state.legacyEarlyTtsConfig = { percent: 0, campaignId: null }
+  state.claudeConditionalImpl = null
 })
 
 // L2a exposure gate tests — campaign id คงที่ใช้ร่วมกันเพื่อจำลอง "dedicated test campaign" ตามแผน production จริง
 const L2A_CAMPAIGN_ID = 'CAMPAIGN_L2A_TEST'
 function l2aCampaign(overrides = {}) {
   return { voice_id: 'voice1', script: 'ระบบทดสอบ', id: L2A_CAMPAIGN_ID, ...overrides }
+}
+
+// L2b exposure gate tests — คนละ campaign id จาก L2A ตั้งใจ (พิสูจน์ independence)
+const L2B_CAMPAIGN_ID = 'CAMPAIGN_L2B_TEST'
+function l2bCampaign(overrides = {}) {
+  return { voice_id: 'voice1', script: 'ระบบทดสอบ', id: L2B_CAMPAIGN_ID, ...overrides }
 }
 
 test('smoke: connect + start + final transcript ที่ rollout 0% → ได้ media event ส่งออกจริงจาก legacy path', async () => {
@@ -2438,5 +2447,367 @@ test('L2a exposure (required test 30): runLegacyFallback (chunked path fallback-
   const mediaEvents = socket.sent.filter(e => e.event === 'media')
   assert.ok(mediaEvents.length > 0, 'fallback ต้องพูดออกมาได้จริง')
 
+  harness.disconnect(socket)
+})
+
+// ===== L2b — conditional legacy early TTS wiring (design locked 2026-08-21, review round 3) =====
+// พิสูจน์ 4 gate criteria ที่ผู้ใช้ระบุไว้เป็นพิเศษ: (1) Claude timeout หลัง audio commit ต้องไม่ kill/replay,
+// (2) tail TTS fail หลัง commit ต้องไม่ restart, (3) history เขียน finalText ครั้งเดียวจาก milestone ไม่ใช่จาก
+// การต่อ chunk, (4) chunked/legacyObserved/legacyEarlyTts ต้องไม่มีทาง active พร้อมกัน — รวมถึง END_CALL
+// guard-and-reset (mandatory refinement 3) และ signal separation (mandatory refinement 1)
+
+test('L2b precedence (required criterion 4): chunked=true → legacyEarlyTts=false เสมอ ไม่ว่า earlyTts config จะ match แค่ไหน', async () => {
+  const callSid = 'CA_L2B_PRECEDENCE_1'
+  harness.getState().legacyEarlyTtsConfig = { percent: 100, campaignId: L2B_CAMPAIGN_ID }
+  const { socket, state } = await connectPastGreeting(callSid, { rolloutPercent: 100, sessionOverrides: { campaign: l2bCampaign() } })
+  state.claudeStreamChunkedImpl = async function* () { yield 'ตอบจาก chunked' }
+
+  const metrics = await captureMetrics(() => harness.sendFinalTranscript('ทดสอบ'))
+
+  assert.equal(metrics.path, 'chunked')
+  assert.equal(metrics.legacyEarlyTts, false)
+  assert.equal(metrics.legacyEarlyTtsOutcome, null)
+  harness.disconnect(socket)
+})
+
+test('L2b precedence (required criterion 4): legacyObserved=true → legacyEarlyTts=false เสมอ แม้ earlyTts campaign+bucket จะผ่านเกณฑ์ของตัวเองก็ตาม', async () => {
+  const callSid = 'CA_L2B_PRECEDENCE_2'
+  harness.getState().legacyObservedConfig = { percent: 100, campaignId: L2A_CAMPAIGN_ID }
+  harness.getState().legacyEarlyTtsConfig = { percent: 100, campaignId: L2A_CAMPAIGN_ID } // campaign เดียวกับ observed ตั้งใจ — ให้ earlyTts เอง "ผ่านเกณฑ์" ถ้าดูตัวมันเองเฉยๆ
+  const { socket, state } = await connectPastGreeting(callSid, { rolloutPercent: 0, sessionOverrides: { campaign: l2aCampaign() } })
+
+  const metrics = await captureMetrics(() => harness.sendFinalTranscript('ทดสอบ'))
+
+  assert.equal(metrics.legacyObserved, true)
+  assert.equal(metrics.legacyEarlyTtsCampaignMatched, true, 'earlyTts campaign match เองต้องผ่าน (พิสูจน์ว่า precedence เป็นตัวบังคับจริง ไม่ใช่แค่บังเอิญ campaign ไม่ตรง)')
+  assert.equal(metrics.legacyEarlyTts, false, 'legacyObserved ต้อง win แม้ legacyEarlyTts เองจะ qualify')
+  assert.equal(metrics.legacyEarlyTtsOutcome, null)
+  harness.disconnect(socket)
+})
+
+test('L2b precedence (required criterion 4): chunked=false, legacyObserved=false, campaign match + bucket ผ่านเกณฑ์ → legacyEarlyTts=true', async () => {
+  const callSid = 'CA_L2B_PRECEDENCE_3' // bucket=43
+  harness.getState().legacyEarlyTtsConfig = { percent: 50, campaignId: L2B_CAMPAIGN_ID } // 43<50 qualifies
+  const { socket, state } = await connectPastGreeting(callSid, { rolloutPercent: 0, sessionOverrides: { campaign: l2bCampaign() } })
+
+  const metrics = await captureMetrics(() => harness.sendFinalTranscript('ทดสอบ'))
+
+  assert.equal(metrics.legacyObserved, false)
+  assert.equal(metrics.legacyEarlyTts, true)
+  assert.equal(metrics.legacyEarlyTtsOutcome, 'COMPLETED')
+  harness.disconnect(socket)
+})
+
+test('L2b (required, mandatory refinement 1 — signal separation): Claude tail timeout หลัง audio commit แล้ว → ไม่พูด recovery ทับ ไม่ fabricate history ไม่มี media event เพิ่มหลัง commit', { timeout: 15000 }, async () => {
+  const callSid = 'CA_L2B_TIMEOUT_POSTCOMMIT'
+  harness.getState().legacyEarlyTtsConfig = { percent: 100, campaignId: L2B_CAMPAIGN_ID }
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0, sessionOverrides: { campaign: l2bCampaign() } })
+  state.claudeConditionalImpl = (sess, signal, onMilestone) => (async function* () {
+    onMilestone?.('requestAt', Date.now())
+    onMilestone?.('firstDeltaAt', Date.now())
+    onMilestone?.('firstSafeAt', Date.now())
+    onMilestone?.('mode', 'CHUNKED')
+    yield 'เริ่มพูดไปแล้วค่ะ' // chunk แรก — ต้องถูกพูด/commit จริง
+    await new Promise(() => {}) // ค้างตลอดไป — จำลอง Claude tail ไม่ตอบต่อ ให้ watchdog (80ms override) timeout จริง
+  })()
+
+  const metrics = await captureMetrics(() => harness.sendFinalTranscript('ทดสอบ'))
+
+  assert.equal(metrics.legacyEarlyTtsOutcome, 'TIMEOUT_POSTCOMMIT')
+  const mediaEvents = socket.sent.filter(e => e.event === 'media')
+  assert.equal(mediaEvents.length, 1, 'ต้องมีแค่ chunk แรกที่ commit ไปแล้ว ห้ามมี recovery phrase มาต่อท้าย')
+  const lastAssistant = session.messages.filter(m => m.role === 'assistant').at(-1)
+  assert.notEqual(lastAssistant?.content, LEGACY_RECOVERY_PHRASE, 'ห้ามพูด recovery phrase ทับเสียงที่ commit ไปแล้ว')
+  harness.disconnect(socket)
+})
+
+// BLOCKER D (design review round 4) — runAttemptWithWatchdog() ไม่รอ attemptPromise (loser) settle ก่อน return
+// เมื่อ watchdog ชนะ race — speakFixedText() ผูกกับ outer signal (ตั้งใจ, ไม่ผูก childSignal) จึงยังทำงานต่อได้
+// เบื้องหลังหลัง runAttemptWithWatchdog คืนค่าไปแล้ว สองเทสนี้เจาะเคสที่ watchdog fire ขณะ speakFixedText() ยัง
+// in-flight อยู่จริง (ttsImpl หน่วง 300ms > watchdog override 80ms) พิสูจน์ว่า outcome-branching รอ loser จริงก่อน
+// ตัดสินใจ ไม่ race กับ turnState.audioCommitted
+
+test('L2b (BLOCKER D fix, race case 1): watchdog fires ขณะ speakFixedText() ยัง in-flight (loser) แล้ว loser สำเร็จ commit จริง → ต้องรอ loser ก่อน แล้วได้ TIMEOUT_POSTCOMMIT ไม่ race เป็น PRECOMMIT ผิดๆ', { timeout: 15000 }, async () => {
+  const callSid = 'CA_L2B_RACE_INFLIGHT_SUCCESS'
+  harness.getState().legacyEarlyTtsConfig = { percent: 100, campaignId: L2B_CAMPAIGN_ID }
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0, sessionOverrides: { campaign: l2bCampaign() } })
+
+  state.ttsImpl = async function* () {
+    await delay(300) // ช้ากว่า watchdog override (80ms) มาก — speakFixedText() ยังรอ ElevenLabs อยู่ตอน watchdog fire แน่นอน
+    yield Buffer.from('audio-chunk')
+  }
+  state.claudeConditionalImpl = (sess, signal, onMilestone) => (async function* () {
+    onMilestone?.('requestAt', Date.now())
+    onMilestone?.('mode', 'CHUNKED')
+    yield 'เริ่มพูดช้าๆ'
+    await new Promise(() => {}) // ไม่เคย fullAt/delta ต่อ — Claude ยังไม่จบ ระหว่างที่ speakFixedText กำลังรอ TTS ของ chunk แรกอยู่
+  })()
+
+  const metrics = await captureMetrics(() => harness.sendFinalTranscript('ทดสอบ'))
+
+  assert.equal(metrics.legacyEarlyTtsOutcome, 'TIMEOUT_POSTCOMMIT',
+    'ต้องรอ loser (speakFixedText ที่กำลัง commit อยู่) จบก่อนตัดสิน ไม่อ่าน audioCommitted=false ก่อนเวลาแล้ว classify PRECOMMIT ผิด')
+  const mediaEvents = socket.sent.filter(e => e.event === 'media')
+  assert.equal(mediaEvents.length, 1, 'ต้องมีแค่ chunk เดียวจาก loser ที่ commit สำเร็จ ไม่มี recovery phrase มาแทรกซ้อน/ซ้ำ')
+  const lastAssistant = session.messages.filter(m => m.role === 'assistant').at(-1)
+  assert.notEqual(lastAssistant?.content, LEGACY_RECOVERY_PHRASE, 'ต้องไม่พูด recovery ทับเสียงที่ loser กำลังจะ commit')
+  harness.disconnect(socket)
+})
+
+test('L2b (BLOCKER D fix, race case 2): watchdog fires ขณะ speakFixedText() ยัง in-flight (loser) แล้ว loser พังจริง (ไม่เคย commit) → ยัง TIMEOUT_PRECOMMIT ถูกต้อง พูด recovery ได้ครั้งเดียว ไม่ race/ซ้ำ', { timeout: 15000 }, async () => {
+  const callSid = 'CA_L2B_RACE_INFLIGHT_FAIL'
+  harness.getState().legacyEarlyTtsConfig = { percent: 100, campaignId: L2B_CAMPAIGN_ID }
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0, sessionOverrides: { campaign: l2bCampaign() } })
+
+  let ttsCallCount = 0
+  state.ttsImpl = async function* () {
+    ttsCallCount++
+    if (ttsCallCount === 1) {
+      await delay(300) // ช้ากว่า watchdog override (80ms) — ยังไม่ทันจบตอน watchdog fire — เฉพาะ loser (chunk แรก) เท่านั้นที่พัง
+      throw new Error('ElevenLabs ล้มขณะ loser ยังรอ')
+    }
+    yield Buffer.from('recovery-audio') // recovery phrase (เรียกทีหลัง คนละ speakFixedText call) ต้องสำเร็จปกติ
+  }
+  state.claudeConditionalImpl = (sess, signal, onMilestone) => (async function* () {
+    onMilestone?.('requestAt', Date.now())
+    onMilestone?.('mode', 'CHUNKED')
+    yield 'พยายามพูดแต่จะพัง'
+    await new Promise(() => {})
+  })()
+
+  const metrics = await captureMetrics(() => harness.sendFinalTranscript('ทดสอบ'))
+
+  assert.equal(metrics.legacyEarlyTtsOutcome, 'TIMEOUT_PRECOMMIT', 'loser TTS พังโดยไม่เคย commit จริง (audioCommitted ยัง false) ต้องยัง PRECOMMIT ถูกต้อง')
+  const lastAssistant = session.messages.filter(m => m.role === 'assistant').at(-1)
+  assert.equal(lastAssistant?.content, LEGACY_RECOVERY_PHRASE, 'precommit ต้องพูด recovery ได้ตามปกติ')
+  const mediaEvents = socket.sent.filter(e => e.event === 'media')
+  assert.equal(mediaEvents.length, 1, 'ต้องมีแค่ recovery phrase เดียว ไม่ race/ซ้อนกับความพยายามเดิมที่พังไปแล้ว')
+  harness.disconnect(socket)
+})
+
+test('L2b (required criterion 1): Claude timeout ก่อน commit เสียงเลย (precommit) → ยังพูด recovery phrase ได้ตามปกติ (เหมือน legacy เดิม)', { timeout: 15000 }, async () => {
+  const callSid = 'CA_L2B_TIMEOUT_PRECOMMIT'
+  harness.getState().legacyEarlyTtsConfig = { percent: 100, campaignId: L2B_CAMPAIGN_ID }
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0, sessionOverrides: { campaign: l2bCampaign() } })
+  state.claudeConditionalImpl = () => (async function* () { await new Promise(() => {}) })() // ไม่เคย yield อะไรเลย ไม่มี delta ใดๆ มาถึง
+
+  const metrics = await captureMetrics(() => harness.sendFinalTranscript('ทดสอบ'))
+
+  assert.equal(metrics.legacyEarlyTtsOutcome, 'TIMEOUT_PRECOMMIT')
+  const lastAssistant = session.messages.filter(m => m.role === 'assistant').at(-1)
+  assert.equal(lastAssistant?.content, LEGACY_RECOVERY_PHRASE, 'precommit timeout ต้องพูด recovery phrase ปกติ (ไม่มีอะไรให้ preserve)')
+  harness.disconnect(socket)
+})
+
+test('L2b (required criterion 2, mandatory refinement 1): tail TTS error หลัง commit แล้ว → ไม่ restart จากต้น ไม่ resend chunk แรกซ้ำ ไม่ fabricate history', async () => {
+  const callSid = 'CA_L2B_TAIL_TTS_FAIL'
+  harness.getState().legacyEarlyTtsConfig = { percent: 100, campaignId: L2B_CAMPAIGN_ID }
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0, sessionOverrides: { campaign: l2bCampaign() } })
+  let ttsCallCount = 0
+  state.ttsImpl = async function* () {
+    ttsCallCount++
+    if (ttsCallCount === 1) { yield Buffer.from('audio-chunk-1'); return }
+    throw new Error('ElevenLabs tail boom')
+  }
+  state.claudeConditionalImpl = (sess, signal, onMilestone) => (async function* () {
+    onMilestone?.('requestAt', Date.now())
+    onMilestone?.('mode', 'CHUNKED')
+    yield 'ก้อนแรกพูดสำเร็จ'
+    yield 'ก้อนสองจะพัง'
+  })()
+
+  const metrics = await captureMetrics(() => harness.sendFinalTranscript('ทดสอบ'))
+
+  assert.equal(metrics.legacyEarlyTtsOutcome, 'ERROR_POSTCOMMIT')
+  assert.equal(ttsCallCount, 2, 'ต้องพยายามพูด chunk สองจริง ไม่ retry/restart จาก chunk แรกใหม่')
+  const mediaEvents = socket.sent.filter(e => e.event === 'media')
+  assert.equal(mediaEvents.length, 1, 'ต้องมีแค่ chunk แรกที่ส่งสำเร็จ ไม่มีการ resend/restart')
+  const lastAssistant = session.messages.filter(m => m.role === 'assistant').at(-1)
+  assert.notEqual(lastAssistant?.content, LEGACY_RECOVERY_PHRASE)
+  harness.disconnect(socket)
+})
+
+test('L2b (required criterion 3, mandatory refinement 2): history เขียนจาก finalText milestone เท่านั้น ไม่ใช่การต่อ chunk ที่พูดไป', async () => {
+  const callSid = 'CA_L2B_HISTORY'
+  harness.getState().legacyEarlyTtsConfig = { percent: 100, campaignId: L2B_CAMPAIGN_ID }
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0, sessionOverrides: { campaign: l2bCampaign() } })
+  state.claudeConditionalImpl = (sess, signal, onMilestone) => (async function* () {
+    onMilestone?.('requestAt', Date.now())
+    onMilestone?.('mode', 'CHUNKED')
+    yield 'พูดไปก้อนหนึ่ง' // สิ่งที่ลูกค้าได้ยินจริง
+    onMilestone?.('fullAt', Date.now())
+    onMilestone?.('finalText', 'ข้อความ canonical จริงที่ไม่ตรงกับ chunk ที่พูดไปเป๊ะ') // ตั้งใจให้ต่างกัน พิสูจน์ source
+    onMilestone?.('endCallRequested', false)
+  })()
+
+  await harness.sendFinalTranscript('ทดสอบ')
+
+  const lastAssistant = session.messages.filter(m => m.role === 'assistant').at(-1)
+  assert.equal(lastAssistant?.content, 'ข้อความ canonical จริงที่ไม่ตรงกับ chunk ที่พูดไปเป๊ะ',
+    'history ต้องมาจาก finalText milestone ตรงๆ ไม่ใช่จาก chunk ที่ยิง TTS ออกไป')
+  harness.disconnect(socket)
+})
+
+// BLOCKER F (design review round 4) — representative [Metrics] examples: CHUNKED success ที่มี >=2 speech
+// segment จริง (เทสอื่นๆ ก่อนหน้ามีแค่ SINGLE_SHOT success หรือ CHUNKED ที่ commit แค่ 1 chunk ก่อนพัง/timeout)
+test('L2b telemetry (BLOCKER F): CHUNKED success ที่มี 2 segment จริง → t5/t6/t7 first-only ตลอดทั้งเทิร์น, segment count ถูกต้อง, legacyEarlyTts* ครบ', async () => {
+  const callSid = 'CA_L2B_CHUNKED_MULTI_SEGMENT'
+  harness.getState().legacyEarlyTtsConfig = { percent: 100, campaignId: L2B_CAMPAIGN_ID }
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0, sessionOverrides: { campaign: l2bCampaign() } })
+  state.claudeConditionalImpl = (sess, signal, onMilestone) => (async function* () {
+    onMilestone?.('requestAt', Date.now())
+    onMilestone?.('firstDeltaAt', Date.now())
+    onMilestone?.('firstSafeAt', Date.now())
+    onMilestone?.('mode', 'CHUNKED')
+    yield 'ประโยคแรกที่พูดก่อน.'
+    yield 'ประโยคที่สองที่พูดต่อ.'
+    onMilestone?.('fullAt', Date.now())
+    onMilestone?.('finalText', 'ประโยคแรกที่พูดก่อน. ประโยคที่สองที่พูดต่อ.')
+    onMilestone?.('endCallRequested', false)
+  })()
+
+  const metrics = await captureMetrics(() => harness.sendFinalTranscript('ทดสอบ'))
+
+  assert.equal(metrics.legacyEarlyTtsMode, 'CHUNKED')
+  assert.equal(metrics.legacyEarlyTtsOutcome, 'COMPLETED')
+  const mediaEvents = socket.sent.filter(e => e.event === 'media')
+  assert.equal(mediaEvents.length, 2, 'ต้องมี 2 segment จริง (2 chunk = 2 synthesizeSpeechStream request แยกกัน ผ่าน stub ที่ yield 1 audio chunk ต่อ 1 เรียก)')
+  // t5/t6/t7 (canonical) ต้อง first-only ตลอดทั้งเทิร์น — markOnce() เดิมของ synthesizeAndSend รับประกันสิ่งนี้อยู่
+  // แล้วโดยไม่ต้องเขียนโค้ดเพิ่มฝั่ง L2b เลย (ใช้ speakFixedText/synthesizeAndSend ตัวเดียวกับ chunked path)
+  assert.ok(metrics.t5 != null && metrics.t6 != null && metrics.t7 != null)
+  console.log('[BLOCKER F example] CHUNKED success (2 segments):', JSON.stringify(metrics))
+  harness.disconnect(socket)
+})
+
+test('L2b (required, mandatory refinement 3): endCallRequested + shouldBlockEndCall=true → follow-up ถูกพูด, endCallRequested reset เป็น false, ไม่ hangup', async () => {
+  const callSid = 'CA_L2B_ENDCALL_BLOCK'
+  harness.getState().legacyEarlyTtsConfig = { percent: 100, campaignId: L2B_CAMPAIGN_ID }
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0, sessionOverrides: { campaign: l2bCampaign() } })
+  state.claudeConditionalImpl = (sess, signal, onMilestone) => (async function* () {
+    onMilestone?.('requestAt', Date.now())
+    onMilestone?.('mode', 'SINGLE_SHOT')
+    yield 'ขอบคุณค่ะ'
+    onMilestone?.('fullAt', Date.now())
+    onMilestone?.('finalText', 'ขอบคุณค่ะ') // ไม่มีคำว่า "เพิ่มเติม" — shouldBlockEndCall ต้อง block
+    onMilestone?.('endCallRequested', true)
+  })()
+
+  await harness.sendFinalTranscript('สนใจครับ') // มี "สนใจ" ไม่มี negation → hasInterest=true, hasNegation=false
+
+  assert.equal(session.hangupReason, undefined, 'ต้องไม่ hangup เพราะ guard block ไปแล้ว (endCallRequested ต้องถูก reset)')
+  const lastAssistant = session.messages.filter(m => m.role === 'assistant').at(-1)
+  // BLOCKER E (design review round 4) — exact match ไม่ใช่แค่ .includes(): history ต้องสะท้อน "Claude finalText +
+  // follow-up" เป๊ะๆ เหมือนที่ลูกค้าได้ยินจริง (canonicalFinalText='ขอบคุณค่ะ' + ' ' + followUp) เพื่อให้เทิร์นถัดไปที่
+  // Claude เห็น history นี้ รู้ว่า AI เพิ่งถามคำถามเพิ่มเติมไปแล้วจริง ไม่ใช่แค่ "มี follow-up คำบางคำปนอยู่ที่ไหนก็ได้"
+  assert.equal(lastAssistant?.content, 'ขอบคุณค่ะ มีอะไรสอบถามเพิ่มเติมไหมคะ',
+    'history ต้องเป็น canonicalFinalText + follow-up เป๊ะ ไม่ใช่แค่มีคำว่า follow-up ปนอยู่')
+  assert.ok(!lastAssistant?.content.includes('END_CALL'), 'marker ต้องไม่หลุดเข้า history เด็ดขาด')
+  const mediaEvents = socket.sent.filter(e => e.event === 'media')
+  assert.ok(mediaEvents.length >= 2, 'ต้องพูดทั้งคำตอบเดิม + follow-up (คนละ TTS request กัน)')
+  harness.disconnect(socket)
+})
+
+test('L2b: endCallRequested + shouldBlockEndCall=false → hangup เกิดจริง (ไม่ถูก block)', async () => {
+  const callSid = 'CA_L2B_ENDCALL_ALLOW'
+  harness.getState().legacyEarlyTtsConfig = { percent: 100, campaignId: L2B_CAMPAIGN_ID }
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0, sessionOverrides: { campaign: l2bCampaign() } })
+  state.claudeConditionalImpl = (sess, signal, onMilestone) => (async function* () {
+    onMilestone?.('requestAt', Date.now())
+    onMilestone?.('mode', 'SINGLE_SHOT')
+    yield 'ขอบคุณที่สนใจนะคะ'
+    onMilestone?.('fullAt', Date.now())
+    onMilestone?.('finalText', 'ขอบคุณที่สนใจนะคะ')
+    onMilestone?.('endCallRequested', true)
+  })()
+
+  await harness.sendFinalTranscript('ไม่สนใจค่ะ') // negation → hasNegation=true → shouldBlockEndCall=false
+
+  assert.equal(session.hangupReason, 'ai_ended')
+  harness.disconnect(socket)
+})
+
+test('L2b (required): prewarm HIT → บายพาส askClaudeConditionalStream ทั้งหมด ไม่มี legacyEarlyTts telemetry ใดๆ ถูก fabricate', async () => {
+  const callSid = 'CA_L2B_PREWARM_HIT'
+  harness.getState().legacyEarlyTtsConfig = { percent: 100, campaignId: L2B_CAMPAIGN_ID }
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0, sessionOverrides: { campaign: l2bCampaign() } })
+  let conditionalCalls = 0
+  state.claudeConditionalImpl = () => { conditionalCalls++; return (async function* () { yield 'ไม่ควรถูกเรียก' })() }
+  state.claudeStreamImpl = async function* () { yield 'คำตอบจาก prewarm' }
+
+  harness.sendInterim('อยากทราบโปรโมชั่นสมาชิกใหม่')
+  await delay(30)
+  const metrics = await captureMetrics(() => harness.sendFinalTranscript('อยากทราบโปรโมชั่นสมาชิกใหม่ครับ'))
+
+  assert.equal(conditionalCalls, 0, 'prewarm HIT ต้องบายพาส L2b ทั้งหมด ไม่เรียก askClaudeConditionalStream เลย')
+  assert.equal(metrics.legacyEarlyTtsOutcome, null)
+  assert.equal(metrics.legacyEarlyTtsRequestAt, null)
+  harness.disconnect(socket)
+})
+
+test('L2b (design review round 4): fullAt disarms watchdog — TTS หลัง Claude จบแล้วช้ากว่า watchdog window รวม ต้องไม่ถูกนับเป็น Claude timeout', { timeout: 15000 }, async () => {
+  const callSid = 'CA_L2B_FULLAT_DISARM'
+  harness.getState().legacyEarlyTtsConfig = { percent: 100, campaignId: L2B_CAMPAIGN_ID }
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0, sessionOverrides: { campaign: l2bCampaign() } })
+
+  // Claude "จบ" (fullAt) ทันทีตั้งแต่ก่อน TTS เริ่มด้วยซ้ำ แต่ TTS ของ chunk เดียวใช้เวลานานกว่า watchdog override
+  // (80ms) มาก — ถ้า fullAt ไม่ disarm watchdog จริง จะ fire ผิดๆ กลายเป็น timeout ทั้งที่ Claude ตอบสำเร็จไปแล้ว
+  state.ttsImpl = async function* () {
+    await delay(200)
+    yield Buffer.from('audio-chunk')
+  }
+  state.claudeConditionalImpl = (sess, signal, onMilestone) => (async function* () {
+    onMilestone?.('requestAt', Date.now())
+    onMilestone?.('mode', 'SINGLE_SHOT')
+    onMilestone?.('fullAt', Date.now()) // Claude จบก่อน TTS จะเริ่มด้วยซ้ำ — ต้อง disarm watchdog ตรงนี้
+    onMilestone?.('finalText', 'คำตอบสำเร็จเร็วมาก')
+    onMilestone?.('endCallRequested', false)
+    yield 'คำตอบสำเร็จเร็วมาก'
+  })()
+
+  const metrics = await captureMetrics(() => harness.sendFinalTranscript('ทดสอบ'))
+
+  assert.equal(metrics.legacyEarlyTtsOutcome, 'COMPLETED',
+    'Claude จบไปแล้วจริงตั้งแต่ก่อน TTS เริ่ม แม้ TTS จะช้ากว่า watchdog window ก็ไม่ควรถูกนับเป็น Claude timeout')
+  assert.ok(metrics.legacyEarlyTtsFullAt != null)
+  const lastAssistant = session.messages.filter(m => m.role === 'assistant').at(-1)
+  assert.equal(lastAssistant?.content, 'คำตอบสำเร็จเร็วมาก')
+  harness.disconnect(socket)
+})
+
+test('L2b: barge-in ก่อน Claude commit เสียงใดๆ เลย → outcome=ABORTED ไม่พูด recovery ไม่ fabricate history', async () => {
+  const callSid = 'CA_L2B_ABORTED'
+  harness.getState().legacyEarlyTtsConfig = { percent: 100, campaignId: L2B_CAMPAIGN_ID }
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0, sessionOverrides: { campaign: l2bCampaign() } })
+
+  let resumeOldTurn
+  const oldTurnGate = new Promise(resolve => { resumeOldTurn = resolve })
+  state.claudeConditionalImpl = (sess, signal, onMilestone) => (async function* () {
+    onMilestone?.('requestAt', Date.now())
+    await oldTurnGate
+    yield 'ไม่ควรมาถึง'
+  })()
+
+  const originalLog = console.log
+  const logs = []
+  console.log = (...args) => { logs.push(args.join(' ')); originalLog(...args) }
+
+  const oldTurnPromise = harness.sendFinalTranscript('คำถามแรกครับ')
+  await delay(30) // ให้เทิร์นแรกเข้าสู่ fresh-call (L2b) แล้วจริง
+
+  state.claudeStreamImpl = async function* () { yield 'ตอบเรื่องใหม่' } // เทิร์นใหม่หลัง barge-in ไม่ผ่าน L2b (legacyEarlyTtsConfig ยังเปิดอยู่ แต่ config เดิม frozen ต่อสายแล้ว ไม่กระทบ — ยังเป็น legacyEarlyTts เดิม แต่ใช้ default claudeConditionalImpl)
+  state.claudeConditionalImpl = null
+  await harness.sendFinalTranscript('เดี๋ยวก่อนครับ ขอถามเรื่องอื่นก่อน') // ยาวพอ trigger bargeIn จริง
+
+  resumeOldTurn()
+  await oldTurnPromise
+  await delay(20)
+  console.log = originalLog
+
+  const oldMetricsLine = logs.find(l => l.includes('[Metrics]') && l.includes('"generationId":1,'))
+  assert.ok(oldMetricsLine, 'ต้องเจอ [Metrics] log ของเทิร์นแรก (generationId=1)')
+  const oldMetrics = JSON.parse(oldMetricsLine.slice(oldMetricsLine.indexOf('{')))
+  assert.equal(oldMetrics.legacyEarlyTtsOutcome, 'ABORTED')
+  const lastAssistant = session.messages.filter(m => m.role === 'assistant').at(-1)
+  assert.notEqual(lastAssistant?.content, LEGACY_RECOVERY_PHRASE)
   harness.disconnect(socket)
 })

@@ -30,4 +30,13 @@ function getLegacyObservedBucket(callSid) {
   return parseInt(hex, 16) % 100
 }
 
-module.exports = { getRolloutBucket, decideRollout, getLegacyObservedBucket }
+// L2b exposure gate — dedicated helper, same reasoning as getLegacyObservedBucket() above: own namespace
+// prefix so legacy_early_tts assignment is independent of both getRolloutBucket() (chunked) and
+// getLegacyObservedBucket() (L2a) even for the same callSid. A collision between any two of the three is
+// statistically normal (%100 buckets), not a sign that independence is broken — never assert they differ.
+function getLegacyEarlyTtsBucket(callSid) {
+  const hex = crypto.createHash('sha256').update(`legacy-early-tts:${String(callSid)}`).digest('hex').slice(0, 8)
+  return parseInt(hex, 16) % 100
+}
+
+module.exports = { getRolloutBucket, decideRollout, getLegacyObservedBucket, getLegacyEarlyTtsBucket }

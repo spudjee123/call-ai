@@ -4,7 +4,11 @@
 // ห้ามฝืน markOnce ให้ครบทุกตัวเพื่อความสวยงาม เพราะจะปลอมความหมาย metric ให้ดูเหมือน streaming ทั้งที่ไม่ใช่
 const { performance } = require('perf_hooks')
 
-function createTurnMetrics({ callSid, generationId, path, rolloutBucket, rolloutPercent, legacyObserved = null, legacyObservedBucket = null, legacyObservedPercentAtStart = null, legacyObservedCampaignMatched = null }) {
+function createTurnMetrics({
+  callSid, generationId, path, rolloutBucket, rolloutPercent,
+  legacyObserved = null, legacyObservedBucket = null, legacyObservedPercentAtStart = null, legacyObservedCampaignMatched = null,
+  legacyEarlyTts = null, legacyEarlyTtsBucket = null, legacyEarlyTtsPercentAtStart = null, legacyEarlyTtsCampaignMatched = null,
+}) {
   return {
     callSid,
     generationId,
@@ -18,6 +22,13 @@ function createTurnMetrics({ callSid, generationId, path, rolloutBucket, rollout
     legacyObservedBucket,
     legacyObservedPercentAtStart,
     legacyObservedCampaignMatched,
+    // L2b production exposure gate (design revision 2026-08-21) — frozen ครั้งเดียวตอน WS 'start' เหมือนกัน
+    // safety precedence: chunked=true → legacyObserved=false ก่อน → legacyEarlyTts=false เสมอ (ดู audioStream.js
+    // freeze block) สาม flag นี้ mutual exclusive กันโดยสมบูรณ์ ไม่มีทาง active พร้อมกันสองตัว
+    legacyEarlyTts,
+    legacyEarlyTtsBucket,
+    legacyEarlyTtsPercentAtStart,
+    legacyEarlyTtsCampaignMatched,
     startedAt: new Date().toISOString(), // สำหรับ correlate กับ log บรรทัดอื่น — ไม่ใช้คำนวณ latency (wall clock กระโดดได้)
     t1: null, // STT final
     t2: null, // Claude request sent (หรือเริ่มรอ prewarm ที่ในไฟลท์อยู่แล้ว)
@@ -53,6 +64,20 @@ function createTurnMetrics({ callSid, generationId, path, rolloutBucket, rollout
     // boundary เลย" (Claude ตอบสั้นจนจบก่อนเจอ boundary) กับ "transport ล้มเหลวก่อนตอบ" เป็นคนละคำถามกัน — ไม่งั้น
     // วิเคราะห์ทีหลังจะแยกไม่ออกว่า null เพราะอะไร
     legacyClaudeOutcome: null,
+    // L2b (conditional legacy early TTS, design locked 2026-08-21) — telemetry namespace ของตัวเอง แยกจาก
+    // legacyClaude* (L2a, ไม่เคยเริ่มพูดเร็วขึ้นเลย) เพราะ L2b ตัวนี้ "ทำจริง" (เริ่ม TTS ก่อน full completion
+    // ถ้า mode=CHUNKED) — canonical t3/t4 ก็ยัง markOnce ตามปกติสำหรับ L2b โดยเจตนา (ต่างจาก L2a ที่ปล่อย null
+    // เสมอ) เพราะ L2b คือ streaming จริงเหมือน chunked path ไม่ใช่แค่วัดเฉยๆ
+    legacyEarlyTtsRequestAt: null,
+    legacyEarlyTtsFirstDeltaAt: null,
+    legacyEarlyTtsFirstSafeAt: null,
+    legacyEarlyTtsFullAt: null,
+    legacyEarlyTtsMode: null, // 'SINGLE_SHOT' | 'CHUNKED'
+    // COMPLETED/EMPTY/ABORTED/ERROR/TIMEOUT_PRECOMMIT/TIMEOUT_POSTCOMMIT/ERROR_POSTCOMMIT — POSTCOMMIT variants
+    // แยกจาก precommit โดยตั้งใจ (design review round 3, mandatory refinement 1): ถ้า audio ถูก commit ไปแล้ว
+    // (turnState.audioCommitted) ก่อนที่ Claude tail จะ timeout/error ห้าม fabricate recovery/replay ทับเสียงที่
+    // พูดไปแล้ว — ต้องแยกให้วิเคราะห์ทีหลังรู้ว่า "ไม่มีคำตอบเลย" กับ "มีคำตอบบางส่วนแล้วท้ายพัง" เป็นคนละเคสกัน
+    legacyEarlyTtsOutcome: null,
   }
 }
 
@@ -79,6 +104,11 @@ function computeDerivedMetrics(metrics) {
     legacyFirstSafeMs: duration(metrics.legacyClaudeRequestAt, metrics.legacyClaudeFirstSafeAt),
     legacyFullCompletionMs: duration(metrics.legacyClaudeRequestAt, metrics.legacyClaudeFullAt),
     legacyEarlyOpportunityMs: duration(metrics.legacyClaudeFirstSafeAt, metrics.legacyClaudeFullAt),
+    // L2b — คนละ namespace จาก legacyClaude* (L2a) โดยตั้งใจเหมือนกัน
+    legacyEarlyTtsTTFTMs: duration(metrics.legacyEarlyTtsRequestAt, metrics.legacyEarlyTtsFirstDeltaAt),
+    legacyEarlyTtsFirstSafeMs: duration(metrics.legacyEarlyTtsRequestAt, metrics.legacyEarlyTtsFirstSafeAt),
+    legacyEarlyTtsFullCompletionMs: duration(metrics.legacyEarlyTtsRequestAt, metrics.legacyEarlyTtsFullAt),
+    legacyEarlyTtsEarlyOpportunityMs: duration(metrics.legacyEarlyTtsFirstSafeAt, metrics.legacyEarlyTtsFullAt),
   }
 }
 
