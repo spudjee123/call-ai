@@ -1470,8 +1470,48 @@ function registerWebSocket(fastify) {
         }
         processTranscriptDispatch = processTranscript // Design B: ref สำหรับ mark handler/no-audio sites ที่อยู่นอก scope นี้ (mark handler เป็น sibling if-block, ไม่ hoist ฟังก์ชันใหญ่ทั้งก้อน)
 
+        // STT-A1 (observability only, 2026-08-21): "dumb" emitter — ประกอบ [STT_DIAG] JSON + log เท่านั้น ไม่อ่าน
+        // isSpeaking/bargeInCooldown/bargeInPendingFinal หรือ derive คำตัดสินใจใดๆ เอง — disposition/reason ต้องถูก
+        // ตัดสินที่ branch เดิมเป๊ะแล้วส่งเข้ามาเป็นค่าสำเร็จรูปเท่านั้น กัน diagnostic drift จาก filter logic จริง
+        // "diagnostic failure must never affect call flow" — ห่อ try/catch ทั้งก้อน ไม่มีทางโยน error ออกไปกระทบสายจริง
+        //
+        // Enum: disposition = DELIVERED | DROPPED | DEFERRED, reason = null | BARGE_IN_COOLDOWN | POST_MARK_ECHO |
+        // SHORT_FRAGMENT_ECHO | TIER2_ACK | PENDING_TRANSCRIPT | BUSY
+        //
+        // Review Gate round 2 amendment — DEFERRED/PENDING_TRANSCRIPT คือ disposition ณ ขณะที่ callback exit
+        // เท่านั้น ไม่ใช่ final lifecycle outcome ของ transcript นั้น: ถ้า pendingTranscript ถูก latest-wins
+        // แทนที่ด้วยตัวใหม่ทีหลัง (ดู 3 จุดที่ set pendingTranscript ด้านล่าง) หรือถูก bargeIn() ล้างทิ้ง ไม่มี
+        // event ย้อนกลับมาบอกว่า item เดิมกลายเป็นอะไรต่อ — known limitation เดียวกับที่ยอมรับไว้แล้วสำหรับ
+        // TIER2_ACK (pendingShortAck ก็มีชะตากรรมแบบเดียวกันทุกประการ)
+        const emitSttDiag = (sttMeta, disposition, reason, text) => {
+          if (!sttMeta) return
+          try {
+            console.log(`[STT_DIAG] ${JSON.stringify({
+              callSid,
+              streamId: sttMeta.streamId,
+              utteranceId: sttMeta.utteranceId,
+              source: sttMeta.source,
+              disposition,
+              reason,
+              interimCount: sttMeta.interimCount,
+              regressionCount: sttMeta.regressionCount,
+              firstInterimAt: sttMeta.firstInterimAt,
+              lastInterimAt: sttMeta.lastInterimAt,
+              finalAt: sttMeta.finalAt,
+              firstInterimToFinalMs: sttMeta.firstInterimToFinalMs,
+              lastStability: sttMeta.lastStability,
+              maxStability: sttMeta.maxStability,
+              finalConfidence: sttMeta.finalConfidence,
+              coldMutePackets: sttMeta.coldMutePackets,
+              text,
+            })}`)
+          } catch (e) {
+            console.error('[STT_DIAG] emit failed (non-fatal, ignored):', e.message)
+          }
+        }
+
         // เริ่ม STT stream
-        sttStream = transcribeStream(async (transcript) => {
+        sttStream = transcribeStream(async (transcript, sttMeta) => {
           if (!transcript || !callActive) return
           if (pendingEndCall) return
           if (socket.readyState !== socket.OPEN) return
@@ -1481,6 +1521,7 @@ function registerWebSocket(fastify) {
           // ช่วงสั้นๆ 400ms) กลืนมันไปด้วย ประโยคที่ลูกค้าเพิ่งพูดแทรกจะหายไปทั้งที่ bargeIn() ทำงานถูกต้องแล้ว
           if (bargeInCooldown && !bargeInPendingFinal) {
             console.log(`[STT] Transcript dropped (barge-in cooldown): "${transcript.substring(0, 40)}"`)
+            emitSttDiag(sttMeta, 'DROPPED', 'BARGE_IN_COOLDOWN', transcript)
             return
           }
           // Post-mark echo filter: short fragment ภายใน 500ms ของ mark = delayed PSTN echo
@@ -1491,6 +1532,7 @@ function registerWebSocket(fastify) {
             const wc = transcript.trim().split(/\s+/).length
             if (wc < 3 && transcript.length < 10) {
               console.log(`[STT] Echo suppressed (${msSinceMark}ms after mark): "${transcript}"`)
+              emitSttDiag(sttMeta, 'DROPPED', 'POST_MARK_ECHO', transcript)
               return
             }
           }
@@ -1512,12 +1554,14 @@ function registerWebSocket(fastify) {
             if (ackTier === 'TIER2') {
               pendingShortAck = { text: transcript, pipelineId: activePipelineId, capturedAt: Date.now() }
               console.log(`[STT] Tier2 ack deferred during AI speech: "${transcript}"`)
+              emitSttDiag(sttMeta, 'DEFERRED', 'TIER2_ACK', transcript)
               return
             }
             const wordCount = transcript.trim().split(/\s+/).length
             if (ackTier !== 'TIER1' && wordCount < 2 && transcript.length < 8) {
               // Fragment สั้น = echo หรือ noise → ไม่ barge-in
               console.log(`[STT] Short fragment during AI speech — ignoring echo: "${transcript}"`)
+              emitSttDiag(sttMeta, 'DROPPED', 'SHORT_FRAGMENT_ECHO', transcript)
               return
             }
             bargeIn()
@@ -1529,10 +1573,15 @@ function registerWebSocket(fastify) {
               // เก็บ transcript นี้ไว้ก่อน แล้วให้เทิร์นเดิมเป็นคนสั่ง process ต่อเอง (ดู processTranscript() ด้านบน)
               pendingTranscript = { session: currentSession, text: transcript }
               console.log('[Barge-in] Old turn still processing — transcript queued (latest-wins)')
+              emitSttDiag(sttMeta, 'DEFERRED', 'PENDING_TRANSCRIPT', transcript)
               return
             }
             await new Promise(r => setTimeout(r, 200))
-            if (sttProcessing) return // เผื่อมี turn อื่นแทรกเข้ามาระหว่าง 200ms นี้
+            // Review Gate round 3 (accepted as-is): defensive telemetry ภายใต้ invariant ปัจจุบัน — bargeIn() ตั้ง
+            // bargeInCooldown 400ms (นานกว่า 200ms นี้) และ transcript อื่นทุกตัวที่มาระหว่างนี้โดน cooldown ก่อนจะมี
+            // โอกาสตั้ง sttProcessing=true ทัน จึง reachability ยัง unproven จาก code review + probe เชิงประจักษ์
+            // (ดูรายงานรอบ review) — ห้ามเพิ่ม test-only hook หรือแก้ state machine เพื่อบังคับ coverage ให้ branch นี้
+            if (sttProcessing) { emitSttDiag(sttMeta, 'DROPPED', 'BUSY', transcript); return } // เผื่อมี turn อื่นแทรกเข้ามาระหว่าง 200ms นี้
           } else if (bargeInPendingFinal) {
             // C6c follow-up (STT listening): interim ระหว่าง isSpeaking=true เพิ่ง trigger bargeIn() ไปแล้ว (ดู
             // onInterim ด้านล่าง) — isSpeaking ถูก bargeIn() ตั้งเป็น false ไปแล้วตั้งแต่ตอนนั้น final ตัวนี้จึงไม่
@@ -1542,6 +1591,7 @@ function registerWebSocket(fastify) {
             if (sttProcessing) {
               pendingTranscript = { session: currentSession, text: transcript }
               console.log('[Barge-in] Final transcript after interim-triggered barge-in — queued (latest-wins)')
+              emitSttDiag(sttMeta, 'DEFERRED', 'PENDING_TRANSCRIPT', transcript)
               return
             }
             // sttProcessing ว่างแล้ว (เทิร์นเดิมจบไปแล้วจริงตั้งแต่ก่อน final นี้มาถึง) — ไปต่อด้านล่างได้เลยตามปกติ
@@ -1555,15 +1605,26 @@ function registerWebSocket(fastify) {
               // (latest-wins ช่องเดียว ไม่ FIFO — กัน AI ตอบหลาย turn จากการพูดแทรกครั้งเดียว)
               pendingTranscript = { session: currentSession, text: transcript }
               console.log('[Barge-in] Additional transcript while still queued — replacing with latest')
+              emitSttDiag(sttMeta, 'DEFERRED', 'PENDING_TRANSCRIPT', transcript)
               return
             }
             // non-barge-in overlap (isSpeaking=false แต่ sttProcessing=true) — กันเหมือนเดิมทุกประการ
+            //
+            // Review Gate round 3 (accepted as-is): เช่นเดียวกับ BUSY อีกจุดด้านบน — defensive telemetry ภายใต้
+            // invariant ปัจจุบัน ปกติ isSpeaking=false ระหว่าง sttProcessing=true ยังคง true จะเจอ pendingTranscript
+            // ตั้งไว้แล้วเข้า branch latest-wins ด้านบนก่อนถึงตรงนี้เสมอ (bargeIn() คือจุดเดียวที่ตั้ง isSpeaking=false
+            // ระหว่างที่ sttProcessing ยัง true และมันตั้ง pendingTranscript ไปพร้อมกันเสมอ) reachability ของ branch
+            // นี้เองยัง unproven เช่นกัน — ห้ามเพิ่ม test-only hook หรือแก้ state machine เพื่อบังคับ coverage
             const trimmed = transcript.trim()
             const wc = trimmed ? trimmed.split(/\s+/).length : 0
             console.log(`[STT] Transcript dropped (busy, ${wc} words): "${transcript}"`)
+            emitSttDiag(sttMeta, 'DROPPED', 'BUSY', transcript)
             return
           }
 
+          // DELIVERED = ผ่านทุก filter แล้วถูกส่งเข้า processTranscript() จริง — ไม่ได้ยืนยันว่า Claude API ได้รับ
+          // คำขอแล้ว (นั่นคือ generation/network layer คนละชั้น ไม่ใช่สิ่งที่ STT-A1 วัด)
+          emitSttDiag(sttMeta, 'DELIVERED', null, transcript)
           await processTranscript(currentSession, transcript)
         }, (interimText) => {
           if (!callActive || bargeInCooldown) return

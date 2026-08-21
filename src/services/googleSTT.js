@@ -61,6 +61,20 @@ function transcribeStream(onTranscript, onInterim, { interimFinalizeMs = 900 } =
   let interimText = ''
   let interimTimer = null
   let utteranceClosed = false  // true after timer delivers transcript — blocks trailing interims and isFinal duplicate
+
+  // STT-A1 (observability only, 2026-08-21): telemetry-only state — ไม่มีค่าใดในบล็อกนี้ถูกใช้ตัดสิน recognition
+  // behavior/filter ใดๆ เลย มีไว้แค่ประกอบ metadata ส่งออกไปให้ audioStream.js log เท่านั้น
+  let streamIdCounter = 0
+  let utteranceIdCounter = 0
+  let utteranceIdAssigned = false   // reset คู่กับ utteranceClosed ใน resetUtteranceState() เสมอ — กัน utteranceId ถูกใช้ซ้ำข้าม utterance
+  let currentUtteranceId = null
+  let interimCount = 0
+  let regressionCount = 0
+  let firstInterimAt = null
+  let lastInterimAt = null
+  let lastStability = null   // null = "ไม่มีค่าจริง" (0 กับ missing แยกไม่ออกใน proto3 float — ไม่ fabricate 0)
+  let maxStability = null
+  let coldMutePackets = 0
   // เดิม 1500ms — วัดจาก log จริงพบว่า Google isFinal แทบไม่เคยมาทัน ต้องพึ่ง timer นี้ตัดสินใจแทบทุกครั้ง
   // ทำให้ลูกค้าต้องรอเงียบเต็ม 1.5 วิทุกรอบก่อน AI จะเริ่มคิดคำตอบด้วยซ้ำ ลดลงมาก่อนเป็นค่าที่ยังกันลูกค้าหยุดคิดกลางประโยคได้
   const INTERIM_FINALIZE_MS = interimFinalizeMs
@@ -76,6 +90,16 @@ function transcribeStream(onTranscript, onInterim, { interimFinalizeMs = 900 } =
     interimTimer = null
     interimText = ''
     utteranceClosed = false
+    // STT-A1: utterance-scoped diagnostic counters — reset พร้อมกับ utterance state จริงเสมอ
+    utteranceIdAssigned = false
+    currentUtteranceId = null
+    interimCount = 0
+    regressionCount = 0
+    firstInterimAt = null
+    lastInterimAt = null
+    lastStability = null
+    maxStability = null
+    coldMutePackets = 0
   }
 
   function activatePrewarm() {
@@ -118,6 +142,8 @@ function transcribeStream(onTranscript, onInterim, { interimFinalizeMs = 900 } =
     if (!isPrewarm && currentStream) return
 
     console.log(isPrewarm ? '[STT] Pre-warming next stream' : '[STT] Creating new stream')
+
+    const thisStreamId = ++streamIdCounter // STT-A1: monotonic per-call, ครอบคลุมทั้ง prewarm และ non-prewarm
 
     const stream = client.streamingRecognize({
       config: STT_CONFIG,
@@ -168,11 +194,32 @@ function transcribeStream(onTranscript, onInterim, { interimFinalizeMs = 900 } =
       if (!result.isFinal) {
         if (!text || utteranceClosed) return
 
+        // STT-A1: diagnostic snapshot — ต้องจับ nowTs และ update ก่อนเรียก onInterim?.() เสมอ (Review Gate round 4
+        // fix) เพราะ onInterim ใน audioStream.js ไม่ใช่ noop จริง (ทำ barge-in detection/prewarm trigger แบบ
+        // synchronous) ถ้าจับเวลาหลัง callback firstInterimAt/lastInterimAt จะเลื่อนช้าไปเท่ากับเวลาที่ callback ใช้
+        // ไม่ใช่เวลาที่ Google interim มาถึงจริง — บล็อกนี้ไม่มีผลต่อ interimText/regression/filter behavior ใดๆ เลย
+        if (!utteranceIdAssigned) { currentUtteranceId = ++utteranceIdCounter; utteranceIdAssigned = true }
+        interimCount++
+        const nowTs = Date.now()
+        if (firstInterimAt === null) firstInterimAt = nowTs
+        lastInterimAt = nowTs
+        // Review Gate round 1 fix: เดิม lastStability เก็บเฉพาะตอน >0 เท่านั้น ทำให้ถ้า interim ล่าสุดมี
+        // stability=0/missing แต่ interim ก่อนหน้ามีค่าจริง ค่าที่ log จะเป็น "ค่าที่ไม่ใช่ศูนย์ล่าสุด" ไม่ใช่
+        // "ค่าของ interim ล่าสุดจริง" ตามชื่อ field — ต้อง set ทุกครั้งให้ตรงกับ interim ปัจจุบันเป๊ะ (null ถ้าใช้ไม่ได้)
+        // ส่วน maxStabilityยังอัปเดตเฉพาะค่าที่ >0 เท่านั้นเหมือนเดิม (ไม่มีเหตุผลให้ null ไปลด max ที่เคยเจอ)
+        const normalizedStability = (typeof result.stability === 'number' && result.stability > 0) ? result.stability : null
+        lastStability = normalizedStability
+        if (normalizedStability !== null) {
+          maxStability = maxStability === null ? normalizedStability : Math.max(maxStability, normalizedStability)
+        }
+
         console.log(`[STT interim] "${text}"`)
         onInterim?.(text)
 
-        if (isInterimRegression(interimText, text)) {
+        const isRegression = isInterimRegression(interimText, text)
+        if (isRegression) {
           console.log(`[STT] Interim regression ignored: "${interimText}" <- "${text}"`)
+          regressionCount++
         } else {
           interimText = text
         }
@@ -186,7 +233,22 @@ function transcribeStream(onTranscript, onInterim, { interimFinalizeMs = 900 } =
             const deliveredText = interimText
             interimText = ''
             utteranceClosed = true
-            onTranscript(deliveredText)
+            const finalAt = Date.now()
+            onTranscript(deliveredText, {
+              streamId: thisStreamId,
+              utteranceId: currentUtteranceId,
+              source: 'TIMER_FINAL',
+              interimCount,
+              regressionCount,
+              firstInterimAt,
+              lastInterimAt,
+              finalAt,
+              firstInterimToFinalMs: firstInterimAt !== null ? finalAt - firstInterimAt : null,
+              lastStability,
+              maxStability,
+              finalConfidence: null, // TIMER_FINAL คือการตัดสินใจของเราเอง ไม่ใช่ final ที่ Google ส่ง confidence มาด้วย
+              coldMutePackets,
+            })
             rotateForNextUtterance() // ต้องอยู่ท้ายสุดเสมอ (ดูหมายเหตุที่ rotateForNextUtterance ด้านบน)
           }
         }, INTERIM_FINALIZE_MS)
@@ -202,7 +264,25 @@ function transcribeStream(onTranscript, onInterim, { interimFinalizeMs = 900 } =
       utteranceClosed = false
       if (shouldDeliver) {
         if (finalText) {
-          onTranscript(finalText)
+          // STT-A1: GOOGLE_FINAL อาจมาโดยไม่มี interim นำมาก่อนเลย — ถ้ายังไม่เคย assign utteranceId ให้ assign ตอนนี้
+          if (!utteranceIdAssigned) { currentUtteranceId = ++utteranceIdCounter; utteranceIdAssigned = true }
+          const finalAt = Date.now()
+          const rawConfidence = result.alternatives?.[0]?.confidence
+          onTranscript(finalText, {
+            streamId: thisStreamId,
+            utteranceId: currentUtteranceId,
+            source: 'GOOGLE_FINAL',
+            interimCount,
+            regressionCount,
+            firstInterimAt,
+            lastInterimAt,
+            finalAt,
+            firstInterimToFinalMs: firstInterimAt !== null ? finalAt - firstInterimAt : null,
+            lastStability,
+            maxStability,
+            finalConfidence: (typeof rawConfidence === 'number' && rawConfidence > 0) ? rawConfidence : null,
+            coldMutePackets,
+          })
         } else {
           console.log('[STT] Final result but empty transcript')
         }
@@ -247,7 +327,7 @@ function transcribeStream(onTranscript, onInterim, { interimFinalizeMs = 900 } =
         if (!destroyed) console.log('[STT] write skipped — no stream')
         return
       }
-      if (Date.now() < coldStreamMuteUntil) return // ทิ้งเสียงช่วงรอยต่อสั้นๆ กันคำหลอนจากสัญญาณตกค้าง
+      if (Date.now() < coldStreamMuteUntil) { coldMutePackets++; return } // ทิ้งเสียงช่วงรอยต่อสั้นๆ กันคำหลอนจากสัญญาณตกค้าง — STT-A1: นับไว้เฉยๆ เพื่อ diagnostic
       try {
         const pcm = mulawBufferToPcm16(mulawBuffer)
         currentStream.write(pcm)

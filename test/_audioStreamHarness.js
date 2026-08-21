@@ -166,8 +166,8 @@ function disconnect(socket) {
 
 // จำลอง final transcript หนึ่งเทิร์น — คืน Promise ที่ resolve เมื่อ turn processing ทั้งหมดจบ (รวม fallback/guard
 // ถ้ามี) เพราะ transcribeStream ของจริงไม่ await callback นี้เลย แต่ในเทสเราต้อง await เพื่อ assert ผลลัพธ์ได้
-async function sendFinalTranscript(text) {
-  await state.lastSttCallbacks.onTranscript(text)
+async function sendFinalTranscript(text, sttMeta) {
+  await state.lastSttCallbacks.onTranscript(text, sttMeta)
 }
 
 function sendInterim(text) {

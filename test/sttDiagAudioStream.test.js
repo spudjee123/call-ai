@@ -1,0 +1,355 @@
+// STT-A1 (observability only) — ยืนยัน disposition/reason mapping ที่ audioStream.js emit [STT_DIAG] จริง ตรงกับ
+// filter/branch เดิมเป๊ะ (ไม่ derive เอง), และ "diagnostic failure ต้องไม่กระทบ call flow" ตามที่ล็อกไว้
+const { test, beforeEach } = require('node:test')
+const assert = require('node:assert/strict')
+const callSessions = require('../src/utils/callSessions')
+const harness = require('./_audioStreamHarness')
+
+process.env.NODE_ENV = 'test'
+
+function delay(ms) { return new Promise(resolve => setTimeout(resolve, ms)) }
+
+function makeSession(overrides = {}) {
+  return {
+    name: 'ทดสอบ',
+    campaign: { voice_id: 'voice1', script: 'ระบบทดสอบ' },
+    messages: [],
+    ...overrides,
+  }
+}
+
+let callSidCounter = 0
+function nextCallSid() { callSidCounter++; return `CA_STTDIAG_${callSidCounter}` }
+
+async function connectPastGreeting(callSid, { sessionOverrides = {} } = {}) {
+  const state = harness.getState()
+  state.rolloutPercent = 0
+  const session = makeSession({ greetingChunks: [Buffer.from('pregenerated-greeting')], ...sessionOverrides })
+  callSessions.set(callSid, session)
+  const socket = harness.connect({ callSid })
+  harness.sendStart(socket)
+  await delay(2000) // 300ms (greeting timer) + 1520ms (unlock ของ greeting เอง) + margin
+  socket.sent.length = 0
+  return { socket, session, state }
+}
+
+// จับ [STT_DIAG] JSON line จากช่วงที่ fn() รัน
+async function captureSttDiag(fn) {
+  const originalLog = console.log
+  const originalError = console.error
+  const logs = []
+  const errors = []
+  console.log = (...args) => { logs.push(args.join(' ')); originalLog(...args) }
+  console.error = (...args) => { errors.push(args.join(' ')); originalError(...args) }
+  try {
+    await fn()
+  } finally {
+    console.log = originalLog
+    console.error = originalError
+  }
+  const diagLines = logs.filter(l => l.includes('[STT_DIAG]')).map(l => JSON.parse(l.slice(l.indexOf('{'))))
+  return { diagLines, logs, errors }
+}
+
+harness.ensureStubbed()
+
+beforeEach(() => {
+  const state = harness.getState()
+  state.claudeStreamImpl = async function* () { yield 'default response.' }
+  state.claudeStreamChunkedImpl = async function* () {}
+  state.ttsImpl = async function* () { yield Buffer.from('audio') }
+  state.rolloutPercent = 0
+  state.legacyObservedConfig = { percent: 0, campaignId: null }
+  state.legacyEarlyTtsConfig = { percent: 0, campaignId: null }
+  state.claudeConditionalImpl = null
+})
+
+const FAKE_META = {
+  streamId: 3, utteranceId: 7, source: 'TIMER_FINAL',
+  interimCount: 5, regressionCount: 1,
+  firstInterimAt: 100, lastInterimAt: 400, finalAt: 900, firstInterimToFinalMs: 800,
+  lastStability: null, maxStability: null, finalConfidence: null, coldMutePackets: 0,
+}
+
+test('DELIVERED: transcript ที่ผ่านทุก filter ต้อง emit [STT_DIAG] disposition=DELIVERED reason=null พร้อม metadata ที่ส่งเข้ามาครบ', async () => {
+  const callSid = nextCallSid()
+  const { socket } = await connectPastGreeting(callSid)
+  try {
+    const { diagLines } = await captureSttDiag(async () => {
+      await harness.sendFinalTranscript('สวัสดีค่ะ สนใจโปรโมชั่น', FAKE_META)
+    })
+
+    assert.equal(diagLines.length, 1)
+    const d = diagLines[0]
+    assert.equal(d.callSid, callSid)
+    assert.equal(d.disposition, 'DELIVERED')
+    assert.equal(d.reason, null)
+    assert.equal(d.text, 'สวัสดีค่ะ สนใจโปรโมชั่น')
+    assert.equal(d.streamId, 3)
+    assert.equal(d.utteranceId, 7)
+    assert.equal(d.source, 'TIMER_FINAL')
+    assert.equal(d.interimCount, 5)
+    assert.equal(d.regressionCount, 1)
+    assert.equal(d.firstInterimToFinalMs, 800)
+  } finally {
+    harness.disconnect(socket)
+  }
+})
+
+test('sttMeta ไม่ถูกส่งมา (undefined) → ไม่ emit [STT_DIAG] เลย แต่ conversation ยังทำงานปกติ (backward-compatible)', async () => {
+  const callSid = nextCallSid()
+  const { socket } = await connectPastGreeting(callSid)
+  try {
+    const { diagLines } = await captureSttDiag(async () => {
+      await harness.sendFinalTranscript('สวัสดีค่ะ') // ไม่ส่ง sttMeta เลย เหมือน caller เก่า
+    })
+
+    assert.equal(diagLines.length, 0)
+    assert.ok(socket.sent.some(e => e.event === 'media'), 'turn ต้อง process ต่อปกติแม้ไม่มี sttMeta')
+  } finally {
+    harness.disconnect(socket)
+  }
+})
+
+test('DROPPED/BARGE_IN_COOLDOWN: transcript ที่มาระหว่าง cooldown 400ms หลัง bargeIn() (final-triggered, ไม่ใช่ interim-triggered) ต้อง emit DROPPED', async () => {
+  const callSid = nextCallSid()
+  const { socket, state } = await connectPastGreeting(callSid)
+  try {
+    let resumeOldTurn
+    const gate = new Promise(resolve => { resumeOldTurn = resolve })
+    state.claudeStreamImpl = async function* () { yield 'คำตอบหลักที่กำลังตอบอยู่'; await gate }
+    const oldTurnPromise = harness.sendFinalTranscript('ขอสอบถามโปรโมชั่นหน่อยค่ะ')
+    await delay(30) // isSpeaking=true
+
+    // ตัวนี้ trigger bargeIn() ผ่าน final-transcript path (ไม่ใช่ interim) → bargeInCooldown=true, bargeInPendingFinal ยังเป็น false
+    await harness.sendFinalTranscript('เดี๋ยวก่อนครับขอถามเรื่องอื่นก่อน')
+
+    const { diagLines } = await captureSttDiag(async () => {
+      // ตัวนี้มาระหว่าง cooldown (400ms) และ bargeInPendingFinal=false → ต้องโดน DROPPED/BARGE_IN_COOLDOWN
+      await harness.sendFinalTranscript('ข้อความที่มาซ้ำระหว่าง cooldown', FAKE_META)
+    })
+
+    assert.equal(diagLines.length, 1)
+    assert.equal(diagLines[0].disposition, 'DROPPED')
+    assert.equal(diagLines[0].reason, 'BARGE_IN_COOLDOWN')
+
+    resumeOldTurn()
+    await oldTurnPromise
+  } finally {
+    harness.disconnect(socket)
+  }
+})
+
+test('DEFERRED/TIER2_ACK: Tier2 ack ("ครับ") ระหว่าง isSpeaking=true ต้อง emit DEFERRED ไม่ใช่ DROPPED', async () => {
+  const callSid = nextCallSid()
+  const { socket, state } = await connectPastGreeting(callSid)
+  try {
+    let resumeOldTurn
+    const gate = new Promise(resolve => { resumeOldTurn = resolve })
+    state.claudeStreamImpl = async function* () { yield 'คำตอบหลักที่กำลังตอบอยู่'; await gate }
+    const oldTurnPromise = harness.sendFinalTranscript('ขอสอบถามโปรโมชั่นหน่อยค่ะ')
+    await delay(30) // isSpeaking=true
+
+    const { diagLines } = await captureSttDiag(async () => {
+      await harness.sendFinalTranscript('ครับ', FAKE_META) // Tier2 ack เดี่ยว
+    })
+
+    assert.equal(diagLines.length, 1)
+    assert.equal(diagLines[0].disposition, 'DEFERRED')
+    assert.equal(diagLines[0].reason, 'TIER2_ACK')
+    assert.equal(diagLines[0].text, 'ครับ')
+
+    resumeOldTurn()
+    await oldTurnPromise
+  } finally {
+    harness.disconnect(socket)
+  }
+})
+
+test('DROPPED/SHORT_FRAGMENT_ECHO: fragment สั้นที่ไม่ใช่ ack ระหว่าง isSpeaking=true ต้อง emit DROPPED', async () => {
+  const callSid = nextCallSid()
+  const { socket, state } = await connectPastGreeting(callSid)
+  try {
+    let resumeOldTurn
+    const gate = new Promise(resolve => { resumeOldTurn = resolve })
+    state.claudeStreamImpl = async function* () { yield 'คำตอบหลักที่กำลังตอบอยู่'; await gate }
+    const oldTurnPromise = harness.sendFinalTranscript('ขอสอบถามโปรโมชั่นหน่อยค่ะ')
+    await delay(30) // isSpeaking=true
+
+    const { diagLines } = await captureSttDiag(async () => {
+      await harness.sendFinalTranscript('เอ่อ', FAKE_META) // 1 คำ, สั้นกว่า 8 ตัวอักษร, ไม่ใช่ ack ที่รู้จัก
+    })
+
+    assert.equal(diagLines.length, 1)
+    assert.equal(diagLines[0].disposition, 'DROPPED')
+    assert.equal(diagLines[0].reason, 'SHORT_FRAGMENT_ECHO')
+
+    resumeOldTurn()
+    await oldTurnPromise
+  } finally {
+    harness.disconnect(socket)
+  }
+})
+
+test('DROPPED/POST_MARK_ECHO: fragment สั้นภายใน 500ms หลัง mark echo กลับมา (ไม่ใช่ ack ที่รู้จัก) ต้อง emit DROPPED', async () => {
+  const callSid = nextCallSid()
+  const { socket } = await connectPastGreeting(callSid)
+  try {
+    await harness.sendFinalTranscript('ขอสอบถามโปรโมชั่นหน่อยค่ะ') // เทิร์นปกติจบเร็ว (ttsImpl default ไม่ gate)
+    const markSent = socket.sent.filter(e => e.event === 'mark').at(-1)
+    assert.ok(markSent, 'ต้องมี mark ถูกส่งหลังเทิร์นจบ')
+    socket.emit('message', JSON.stringify({ event: 'mark', mark: markSent.mark })) // จำลอง Twilio echo mark กลับมา (ตั้ง lastMarkTime)
+    await delay(5)
+
+    const { diagLines } = await captureSttDiag(async () => {
+      await harness.sendFinalTranscript('เอ่อ', FAKE_META) // สั้น ไม่ใช่ ack, ภายใน 500ms หลัง mark
+    })
+
+    assert.equal(diagLines.length, 1)
+    assert.equal(diagLines[0].disposition, 'DROPPED')
+    assert.equal(diagLines[0].reason, 'POST_MARK_ECHO')
+  } finally {
+    harness.disconnect(socket)
+  }
+})
+
+test('lifecycle guard (pendingEndCall) ไม่ emit [STT_DIAG] เลย — ตาม scope ที่ล็อกไว้ว่า A1 ไม่ยุ่งกับ call-shutdown semantics', async () => {
+  const callSid = nextCallSid()
+  const { socket, state } = await connectPastGreeting(callSid)
+  try {
+    state.claudeStreamImpl = async function* () { yield 'จบการสนทนานะคะ [END_CALL]' }
+    await harness.sendFinalTranscript('ไม่มีอะไรแล้วค่ะ') // ทำให้ pendingEndCall=true
+
+    const { diagLines } = await captureSttDiag(async () => {
+      await harness.sendFinalTranscript('ข้อความหลัง end call ถูก request แล้ว', FAKE_META)
+    })
+
+    assert.equal(diagLines.length, 0, 'pendingEndCall guard ต้องไม่มี [STT_DIAG] ตามที่ล็อก scope ไว้')
+  } finally {
+    harness.disconnect(socket)
+  }
+})
+
+// Review Gate round 2 amendment (approved): 5 exit points ที่ก่อนหน้านี้ไม่มี [STT_DIAG] เลย — 3 จุดใช้
+// DEFERRED/PENDING_TRANSCRIPT (pendingTranscript queue variants), 2 จุดใช้ DROPPED/BUSY (sttProcessing ยัง true)
+// ทดสอบครบเฉพาะ 3 จุด PENDING_TRANSCRIPT ที่ construct ผ่าน integration harness ได้จริง
+//
+// Review Gate round 3 (accepted, ไม่ต้องไล่ต่อ): อีก 2 จุด DROPPED/BUSY (200ms-grace retry และ non-barge-in
+// overlap) ยืนยันด้วย code review + probe เชิงประจักษ์หลายรอบว่า reachability ยัง unproven ภายใต้ invariant
+// ปัจจุบัน (bargeInCooldown 400ms > 200ms grace window, และ isSpeaking=false ระหว่าง sttProcessing=true ปกติ
+// จะเจอ pendingTranscript ตั้งไว้แล้วเข้า latest-wins branch ก่อนเสมอ) — ตกลงรับเป็น defensive-path telemetry
+// ที่ code-reviewed แต่ไม่มี integration test คลุม โดยเจตนา ไม่สร้าง test-only hook เพื่อบังคับ coverage
+// (ดู comment คู่กันที่ audioStream.js ตรง emitSttDiag(sttMeta, 'DROPPED', 'BUSY', ...) ทั้งสองจุด)
+
+test('DEFERRED/PENDING_TRANSCRIPT (1/3 — old turn still processing): transcript ที่ trigger bargeIn ผ่าน final-path ขณะเทิร์นเดิมยัง sttProcessing=true ต้อง emit DEFERRED และ queue จริงตาม behavior เดิม', async () => {
+  const callSid = nextCallSid()
+  const { socket, state, session } = await connectPastGreeting(callSid)
+  try {
+    let resumeOldTurn
+    const gate = new Promise(resolve => { resumeOldTurn = resolve })
+    state.claudeStreamImpl = async function* () { yield 'คำตอบหลักที่กำลังตอบอยู่'; await gate }
+    const oldTurnPromise = harness.sendFinalTranscript('ขอสอบถามโปรโมชั่นหน่อยค่ะ')
+    await delay(30) // isSpeaking=true, sttProcessing=true (gated)
+
+    const { diagLines } = await captureSttDiag(async () => {
+      await harness.sendFinalTranscript('เดี๋ยวก่อนครับขอถามเรื่องอื่นก่อน', FAKE_META)
+    })
+
+    assert.equal(diagLines.length, 1)
+    assert.equal(diagLines[0].disposition, 'DEFERRED')
+    assert.equal(diagLines[0].reason, 'PENDING_TRANSCRIPT')
+    assert.equal(diagLines[0].text, 'เดี๋ยวก่อนครับขอถามเรื่องอื่นก่อน')
+
+    // behavior เดิมต้องไม่เปลี่ยน: transcript ที่ queue ไว้ต้องถูก drain/process จริงหลัง turn เดิมปล่อย sttProcessing
+    resumeOldTurn()
+    await oldTurnPromise
+    await delay(50)
+    const lastUserMsg = session.messages.filter(m => m.role === 'user').at(-1)
+    assert.equal(lastUserMsg.content, 'เดี๋ยวก่อนครับขอถามเรื่องอื่นก่อน', 'transcript ที่ deferred ไว้ต้องถูก process จริงหลัง drain ไม่ใช่หายไปเฉยๆ')
+  } finally {
+    harness.disconnect(socket)
+  }
+})
+
+test('DEFERRED/PENDING_TRANSCRIPT (2/3 — final หลัง interim-triggered barge-in ขณะยัง busy): ต้อง emit DEFERRED และ queue จริงตาม behavior เดิม', async () => {
+  const callSid = nextCallSid()
+  const { socket, state, session } = await connectPastGreeting(callSid)
+  try {
+    let resumeOldTurn
+    const gate = new Promise(resolve => { resumeOldTurn = resolve })
+    state.claudeStreamImpl = async function* () { yield 'คำตอบหลักที่กำลังตอบอยู่'; await gate }
+    const oldTurnPromise = harness.sendFinalTranscript('ขอสอบถามโปรโมชั่นหน่อยค่ะ')
+    await delay(30) // isSpeaking=true, sttProcessing=true (gated)
+
+    harness.sendInterim('เดี๋ยวก่อนครับขอถามเรื่องอื่นก่อน') // trigger bargeIn ผ่าน onInterim → bargeInPendingFinal=true, isSpeaking=false
+    await delay(5)
+
+    const { diagLines } = await captureSttDiag(async () => {
+      await harness.sendFinalTranscript('เดี๋ยวก่อนครับขอถามเรื่องอื่นก่อน', FAKE_META) // final ตัวจริงของ interim เดียวกัน
+    })
+
+    assert.equal(diagLines.length, 1)
+    assert.equal(diagLines[0].disposition, 'DEFERRED')
+    assert.equal(diagLines[0].reason, 'PENDING_TRANSCRIPT')
+
+    resumeOldTurn()
+    await oldTurnPromise
+    await delay(50)
+    const lastUserMsg = session.messages.filter(m => m.role === 'user').at(-1)
+    assert.equal(lastUserMsg.content, 'เดี๋ยวก่อนครับขอถามเรื่องอื่นก่อน')
+  } finally {
+    harness.disconnect(socket)
+  }
+})
+
+test('DEFERRED/PENDING_TRANSCRIPT (3/3 — additional transcript ระหว่างคิวมีของค้างอยู่): ต้อง emit DEFERRED และ latest-wins replace จริงตาม behavior เดิม (ไม่ใช่ FIFO)', async () => {
+  const callSid = nextCallSid()
+  const { socket, state, session } = await connectPastGreeting(callSid)
+  try {
+    let resumeOldTurn
+    const gate = new Promise(resolve => { resumeOldTurn = resolve })
+    state.claudeStreamImpl = async function* () { yield 'คำตอบหลักที่กำลังตอบอยู่'; await gate }
+    const oldTurnPromise = harness.sendFinalTranscript('ขอสอบถามโปรโมชั่นหน่อยค่ะ')
+    await delay(30) // isSpeaking=true, sttProcessing=true (gated)
+
+    await harness.sendFinalTranscript('เดี๋ยวก่อนครับขอถามเรื่องอื่นก่อน', FAKE_META) // queue #1 (path 1/3)
+    await delay(450) // รอ bargeInCooldown (400ms) หมดก่อน ไม่งั้นตัวถัดไปโดน BARGE_IN_COOLDOWN แทนที่จะถึง branch นี้
+
+    const { diagLines } = await captureSttDiag(async () => {
+      await harness.sendFinalTranscript('ประโยคที่สามที่ควรมาแทนที่คิวเดิม', FAKE_META)
+    })
+
+    assert.equal(diagLines.length, 1)
+    assert.equal(diagLines[0].disposition, 'DEFERRED')
+    assert.equal(diagLines[0].reason, 'PENDING_TRANSCRIPT')
+    assert.equal(diagLines[0].text, 'ประโยคที่สามที่ควรมาแทนที่คิวเดิม')
+
+    resumeOldTurn()
+    await oldTurnPromise
+    await delay(50)
+    const lastUserMsg = session.messages.filter(m => m.role === 'user').at(-1)
+    assert.equal(lastUserMsg.content, 'ประโยคที่สามที่ควรมาแทนที่คิวเดิม', 'latest-wins ต้องยังทำงานเหมือนเดิม — คิวที่สองแทนที่คิวแรกไปแล้ว ไม่ใช่ FIFO')
+  } finally {
+    harness.disconnect(socket)
+  }
+})
+
+test('diagnostic failure ต้องไม่กระทบ call flow: field ที่ JSON.stringify ไม่ได้ (BigInt) → conversation ยังดำเนินต่อปกติ', async () => {
+  const callSid = nextCallSid()
+  const { socket } = await connectPastGreeting(callSid)
+  try {
+    // BigInt ทำให้ JSON.stringify throw แน่นอน — ต่างจาก circular reference ตรงที่ emitSttDiag ประกอบ object
+    // ใหม่จาก field ที่ whitelist ไว้เท่านั้น (ไม่ spread sttMeta ทั้งก้อน) จึงต้องฉีดผ่าน field ที่ถูกอ่านจริง
+    const badMeta = { ...FAKE_META, firstInterimAt: 10n }
+
+    const { diagLines, errors } = await captureSttDiag(async () => {
+      await harness.sendFinalTranscript('สวัสดีค่ะ สนใจโปรโมชั่น', badMeta)
+    })
+
+    assert.equal(diagLines.length, 0, 'ไม่มี [STT_DIAG] line ที่ serialize สำเร็จ')
+    assert.ok(errors.some(e => e.includes('[STT_DIAG] emit failed')), 'ต้อง log error แบบ non-fatal แทนที่จะ throw ออกไป')
+    assert.ok(socket.sent.some(e => e.event === 'media'), 'turn ต้อง process ต่อและส่งเสียงจริงแม้ diagnostic พัง')
+  } finally {
+    harness.disconnect(socket)
+  }
+})
