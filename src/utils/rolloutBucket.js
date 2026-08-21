@@ -47,4 +47,13 @@ function getSttA2Bucket(callSid) {
   return parseInt(hex, 16) % 100
 }
 
-module.exports = { getRolloutBucket, decideRollout, getLegacyObservedBucket, getLegacyEarlyTtsBucket, getSttA2Bucket }
+// A2.1 Shadow Google Final Diagnostics gate — dedicated helper, same reasoning as the others above: own
+// namespace prefix ("stt-a2-shadow:") so shadow assignment is independent of chunked/L2a/L2b/A2 even for
+// the same callSid — deliberately NOT reusing A2's "stt-a2:" prefix (Design Review Blocker 1: this must be
+// its own gate, not a reuse of A2's, so shadow can deploy OFF and be exposed separately from A2 itself).
+function getSttA2ShadowBucket(callSid) {
+  const hex = crypto.createHash('sha256').update(`stt-a2-shadow:${String(callSid)}`).digest('hex').slice(0, 8)
+  return parseInt(hex, 16) % 100
+}
+
+module.exports = { getRolloutBucket, decideRollout, getLegacyObservedBucket, getLegacyEarlyTtsBucket, getSttA2Bucket, getSttA2ShadowBucket }

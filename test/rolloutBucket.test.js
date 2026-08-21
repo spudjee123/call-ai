@@ -1,6 +1,6 @@
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
-const { getRolloutBucket, decideRollout, getLegacyObservedBucket, getLegacyEarlyTtsBucket, getSttA2Bucket } = require('../src/utils/rolloutBucket')
+const { getRolloutBucket, decideRollout, getLegacyObservedBucket, getLegacyEarlyTtsBucket, getSttA2Bucket, getSttA2ShadowBucket } = require('../src/utils/rolloutBucket')
 
 test('same callSid → bucket เดิมเสมอ ไม่ว่าจะเรียกกี่ครั้ง', () => {
   const a = getRolloutBucket('CA1234567890')
@@ -167,4 +167,39 @@ test('STT-A2: independent namespace จากทั้งสามตัวเ�
   const rolloutBuckets = samples.map(getRolloutBucket)
   const allIdenticalToRollout = samples.filter((_, i) => a2Buckets[i] === rolloutBuckets[i]).length
   assert.ok(allIdenticalToRollout < samples.length, 'ไม่ควรเห็น A2 bucket ชนกับ rollout bucket ทุกตัวอย่าง')
+})
+
+// ---------------------------------------------------------------------------
+// A2.1 Shadow Google Final Diagnostics gate — getSttA2ShadowBucket() (design revision 2026-08-21, Design
+// Gate v2 PASS) — deliberately own namespace, NOT a reuse of getSttA2Bucket()'s "stt-a2:" prefix
+// ---------------------------------------------------------------------------
+
+test('A2.1 Shadow: getSttA2ShadowBucket deterministic + อยู่ในช่วง 0-99', () => {
+  assert.equal(getSttA2ShadowBucket('CA1'), getSttA2ShadowBucket('CA1'))
+  for (let i = 0; i < 100; i++) {
+    const b = getSttA2ShadowBucket('CA' + i)
+    assert.ok(b >= 0 && b <= 99)
+  }
+})
+
+test('A2.1 Shadow: fixed known fixtures — hash namespace "stt-a2-shadow:" ให้ค่าคงที่ตามที่คำนวณไว้ล่วงหน้า', () => {
+  assert.equal(getSttA2ShadowBucket('CA1'), 38)
+  assert.equal(getSttA2ShadowBucket('CA2'), 21)
+  assert.equal(getSttA2ShadowBucket('CA3'), 62)
+})
+
+test('A2.1 Shadow: getRolloutBucket()/getLegacyObservedBucket()/getLegacyEarlyTtsBucket()/getSttA2Bucket() เดิมต้องไม่ถูกกระทบเลย — fixture เดิมยังได้ค่าเดิมเป๊ะ', () => {
+  assert.equal(getRolloutBucket('CA1'), 8)
+  assert.equal(getLegacyObservedBucket('CA1'), 14)
+  assert.equal(getLegacyEarlyTtsBucket('CA1'), 90)
+  assert.equal(getSttA2Bucket('CA1'), 93)
+})
+
+test('A2.1 Shadow: independent namespace จากทุกตัวเดิมรวมถึง A2 เอง — bucket ของ callSid เดียวกันไม่ผูกกัน (ห้าม assert ว่าต้องต่างกันเสมอ — ชนกันได้บังเอิญ)', () => {
+  const samples = ['CA1', 'CA2', 'CA3', 'CA1234567890', 'CA160', 'CA22']
+  const shadowBuckets = samples.map(getSttA2ShadowBucket)
+  assert.deepEqual(shadowBuckets, [38, 21, 62, 85, 18, 62])
+  const a2Buckets = samples.map(getSttA2Bucket)
+  const allIdenticalToA2 = samples.filter((_, i) => shadowBuckets[i] === a2Buckets[i]).length
+  assert.ok(allIdenticalToA2 < samples.length, 'ไม่ควรเห็น shadow bucket ชนกับ A2 bucket ทุกตัวอย่าง')
 })

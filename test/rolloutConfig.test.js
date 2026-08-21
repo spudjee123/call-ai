@@ -1,6 +1,6 @@
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
-const { createRolloutConfig, parseRolloutPercent, classifyLegacyObservedConfig, classifyLegacyEarlyTtsConfig, classifySttA2Config } = require('../src/utils/rolloutConfig')
+const { createRolloutConfig, parseRolloutPercent, classifyLegacyObservedConfig, classifyLegacyEarlyTtsConfig, classifySttA2Config, classifySttA2ShadowConfig } = require('../src/utils/rolloutConfig')
 
 function delay(ms) { return new Promise(resolve => setTimeout(resolve, ms)) }
 
@@ -621,5 +621,107 @@ test('STT-A2: createRolloutConfig().getCurrentSttA2Config() — fail-closed ท�
   assert.deepEqual(rc.getCurrentLegacyObservedConfig(), { percent: 0, campaignId: null }, 'L2a ต้อง fail-closed')
   assert.deepEqual(rc.getCurrentLegacyEarlyTtsConfig(), { percent: 0, campaignId: null }, 'L2b ต้อง fail-closed เช่นกัน')
   assert.deepEqual(rc.getCurrentSttA2Config(), { percent: 0, campaignId: null }, 'A2 ต้อง fail-closed เช่นกัน')
+  rc.stop()
+})
+
+// ---------------------------------------------------------------------------
+// A2.1 Shadow Google Final Diagnostics gate — classifySttA2ShadowConfig() (design revision 2026-08-21,
+// Design Gate v2 PASS) — same fail-closed shape as A2/L2a/L2b, own keys/state entirely independent,
+// deliberately NOT a reuse of stt_a2_percent/stt_a2_campaign_id (Design Review Blocker 1)
+// ---------------------------------------------------------------------------
+
+test('classifySttA2ShadowConfig: percent>0 + campaignId ถูกต้องครบคู่ → ใช้ค่านั้นจริง', () => {
+  assert.deepEqual(
+    classifySttA2ShadowConfig([
+      { key: 'stt_a2_shadow_percent', value: '100' },
+      { key: 'stt_a2_shadow_campaign_id', value: 'CAMPAIGN_A2_SHADOW_TEST' },
+    ]),
+    { percent: 100, campaignId: 'CAMPAIGN_A2_SHADOW_TEST' }
+  )
+})
+
+test('classifySttA2ShadowConfig: percent>0 แต่ไม่มีแถว campaign_id เลย → fail-closed {0, null}', () => {
+  assert.deepEqual(
+    classifySttA2ShadowConfig([{ key: 'stt_a2_shadow_percent', value: '100' }]),
+    { percent: 0, campaignId: null }
+  )
+})
+
+test('classifySttA2ShadowConfig: ไม่มีแถวใดๆ เลย (Sheets ยังไม่เคยเพิ่ม key พวกนี้) → {0, null} ปลอดภัยตั้งแต่วันแรก — implementation รอบแรกต้องไม่สร้างแถวนี้เอง', () => {
+  assert.deepEqual(classifySttA2ShadowConfig([]), { percent: 0, campaignId: null })
+})
+
+test('classifySttA2ShadowConfig: duplicate percent row → invalid, fail-closed', () => {
+  assert.deepEqual(
+    classifySttA2ShadowConfig([
+      { key: 'stt_a2_shadow_percent', value: '50' },
+      { key: 'stt_a2_shadow_percent', value: '100' },
+      { key: 'stt_a2_shadow_campaign_id', value: 'X' },
+    ]),
+    { percent: 0, campaignId: null }
+  )
+})
+
+test('classifySttA2ShadowConfig: duplicate campaign_id row → invalid, fail-closed', () => {
+  assert.deepEqual(
+    classifySttA2ShadowConfig([
+      { key: 'stt_a2_shadow_percent', value: '100' },
+      { key: 'stt_a2_shadow_campaign_id', value: 'X' },
+      { key: 'stt_a2_shadow_campaign_id', value: 'Y' },
+    ]),
+    { percent: 0, campaignId: null }
+  )
+})
+
+test('classifySttA2ShadowConfig: independent จาก legacy_observed_*/legacy_early_tts_*/stt_a2_* (A2 เอง) โดยสิ้นเชิง — มีทั้งหมดในแถวเดียวกันไม่ปนกัน', () => {
+  const rows = [
+    { key: 'legacy_observed_percent', value: '100' },
+    { key: 'legacy_observed_campaign_id', value: 'CAMPAIGN_L2A' },
+    { key: 'legacy_early_tts_percent', value: '50' },
+    { key: 'legacy_early_tts_campaign_id', value: 'CAMPAIGN_L2B' },
+    { key: 'stt_a2_percent', value: '100' },
+    { key: 'stt_a2_campaign_id', value: 'CAMPAIGN_A2' },
+    { key: 'stt_a2_shadow_percent', value: '30' },
+    { key: 'stt_a2_shadow_campaign_id', value: 'CAMPAIGN_A2_SHADOW' },
+  ]
+  assert.deepEqual(classifyLegacyObservedConfig(rows), { percent: 100, campaignId: 'CAMPAIGN_L2A' })
+  assert.deepEqual(classifyLegacyEarlyTtsConfig(rows), { percent: 50, campaignId: 'CAMPAIGN_L2B' })
+  assert.deepEqual(classifySttA2Config(rows), { percent: 100, campaignId: 'CAMPAIGN_A2' })
+  assert.deepEqual(classifySttA2ShadowConfig(rows), { percent: 30, campaignId: 'CAMPAIGN_A2_SHADOW' })
+})
+
+test('A2.1 Shadow: createRolloutConfig().getCurrentSttA2ShadowConfig() — fail-closed ทันทีตอน fetch ล้มเหลว ในขณะที่ rollout_percent ยัง LKG และ L2a/L2b/A2 ก็ fail-closed คู่ขนานกัน (ห้า policy ทำงานถูกต้องพร้อมกันจาก fetch เดียว)', async () => {
+  let shouldFail = false
+  const rc = createRolloutConfig({
+    getRows: async () => {
+      if (shouldFail) throw new Error('Sheets down')
+      return [
+        { key: 'rollout_percent', value: '20' },
+        { key: 'legacy_observed_percent', value: '100' },
+        { key: 'legacy_observed_campaign_id', value: 'A' },
+        { key: 'legacy_early_tts_percent', value: '100' },
+        { key: 'legacy_early_tts_campaign_id', value: 'B' },
+        { key: 'stt_a2_percent', value: '100' },
+        { key: 'stt_a2_campaign_id', value: 'C' },
+        { key: 'stt_a2_shadow_percent', value: '100' },
+        { key: 'stt_a2_shadow_campaign_id', value: 'D' },
+      ]
+    },
+    refreshIntervalMs: 50,
+  })
+  rc.start()
+  await delay(20)
+  assert.equal(rc.getCurrentRolloutPercent(), 20)
+  assert.deepEqual(rc.getCurrentLegacyObservedConfig(), { percent: 100, campaignId: 'A' })
+  assert.deepEqual(rc.getCurrentLegacyEarlyTtsConfig(), { percent: 100, campaignId: 'B' })
+  assert.deepEqual(rc.getCurrentSttA2Config(), { percent: 100, campaignId: 'C' })
+  assert.deepEqual(rc.getCurrentSttA2ShadowConfig(), { percent: 100, campaignId: 'D' })
+  shouldFail = true
+  await delay(100)
+  assert.equal(rc.getCurrentRolloutPercent(), 20, 'rollout_percent ต้องคง LKG')
+  assert.deepEqual(rc.getCurrentLegacyObservedConfig(), { percent: 0, campaignId: null }, 'L2a ต้อง fail-closed')
+  assert.deepEqual(rc.getCurrentLegacyEarlyTtsConfig(), { percent: 0, campaignId: null }, 'L2b ต้อง fail-closed เช่นกัน')
+  assert.deepEqual(rc.getCurrentSttA2Config(), { percent: 0, campaignId: null }, 'A2 ต้อง fail-closed เช่นกัน')
+  assert.deepEqual(rc.getCurrentSttA2ShadowConfig(), { percent: 0, campaignId: null }, 'A2.1 Shadow ต้อง fail-closed เช่นกัน — independent จาก A2 เองด้วย')
   rc.stop()
 })

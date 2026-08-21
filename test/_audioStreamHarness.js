@@ -40,6 +40,8 @@ function ensureStubbed() {
     legacyEarlyTtsConfig: { percent: 0, campaignId: null },
     // STT-A2 diagnostic gate — default fail-closed เหมือนกันเป๊ะ
     sttA2Config: { percent: 0, campaignId: null },
+    // A2.1 Shadow gate — default fail-closed เหมือนกันเป๊ะ, independent จาก sttA2Config เอง (คนละ Sheet keys)
+    sttA2ShadowConfig: { percent: 0, campaignId: null },
     lastSttCallbacks: null, // { onTranscript, onInterim } — set สดทุกครั้งที่มี connection ใหม่เปิด sttStream
   }
 
@@ -122,6 +124,7 @@ function ensureStubbed() {
         getCurrentLegacyObservedConfig: () => state.legacyObservedConfig,
         getCurrentLegacyEarlyTtsConfig: () => state.legacyEarlyTtsConfig,
         getCurrentSttA2Config: () => state.sttA2Config,
+        getCurrentSttA2ShadowConfig: () => state.sttA2ShadowConfig,
       }),
     },
   }

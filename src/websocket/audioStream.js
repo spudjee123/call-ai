@@ -4,7 +4,7 @@ const { askClaude, askClaudeStream, askClaudeObservedFullResponse, askClaudeCond
 const { synthesizeSpeechStream } = require('../services/tts')
 const healthMonitor = require('../utils/healthMonitor')
 const { createCallState, bumpGeneration, isCurrentGeneration, endCall } = require('../utils/generationGuard')
-const { decideRollout, getLegacyObservedBucket, getLegacyEarlyTtsBucket, getSttA2Bucket } = require('../utils/rolloutBucket')
+const { decideRollout, getLegacyObservedBucket, getLegacyEarlyTtsBucket, getSttA2Bucket, getSttA2ShadowBucket } = require('../utils/rolloutBucket')
 const { createTurnMetrics, markOnce, computeDerivedMetrics } = require('../utils/turnMetrics')
 const { createTurnState, markTtsPending, markAudioCommitted, markDone, claimFallback } = require('../utils/turnState')
 const { runChunkedTurn, speakFixedText, createChunkedProducer, adoptChunkedProducer } = require('./chunkedTurn')
@@ -301,6 +301,14 @@ function registerWebSocket(fastify) {
     let sttA2Bucket = null
     let sttA2PercentAtStart = null
     let sttA2CampaignMatched = null
+    // A2.1 Shadow Google Final Diagnostics gate (design revision 2026-08-21, Design Gate v2 PASS) — freeze
+    // ครั้งเดียวพร้อมกับตัวอื่นข้างบน same หลักการเป๊ะ — false/null ปลอดภัยเสมอก่อนถึง 'start' event — independent
+    // gate จาก A2 เอง (คนละ Sheet keys/bucket namespace) แต่ activation ยัง require sttA2===true เพิ่มด้วย (ดู
+    // 'start' handler ด้านล่าง) — ไม่ reuse stt_a2_percent/stt_a2_campaign_id เด็ดขาด (Design Review Blocker 1)
+    let sttA2Shadow = false
+    let sttA2ShadowBucket = null
+    let sttA2ShadowPercentAtStart = null
+    let sttA2ShadowCampaignMatched = null
 
     console.log(`[WS] Connected callSid=${callSid}`)
 
@@ -684,7 +692,20 @@ function registerWebSocket(fastify) {
         sttA2PercentAtStart = sttA2Config.percent
         sttA2 = sttA2CampaignMatched && sttA2Bucket < sttA2Config.percent
 
-        console.log(`[Rollout] callSid=${callSid} bucket=${rollout.bucket} percent=${rollout.percentAtStart} chunked=${rollout.useChunkedStreaming} legacyObserved=${legacyObserved} legacyObservedBucket=${legacyObservedBucket} legacyObservedPercent=${observedConfig.percent} campaignMatched=${legacyObservedCampaignMatched} legacyEarlyTts=${legacyEarlyTts} legacyEarlyTtsBucket=${legacyEarlyTtsBucket} legacyEarlyTtsPercent=${earlyTtsConfig.percent} earlyTtsCampaignMatched=${legacyEarlyTtsCampaignMatched} sttA2=${sttA2} sttA2Bucket=${sttA2Bucket} sttA2Percent=${sttA2Config.percent} sttA2CampaignMatched=${sttA2CampaignMatched}`)
+        // A2.1 Shadow (design revision 2026-08-21, Design Gate v2 PASS) — independent fail-closed gate, own
+        // Sheet keys (stt_a2_shadow_percent/stt_a2_shadow_campaign_id), own bucket namespace
+        // ("stt-a2-shadow:") — deliberately NOT a reuse of A2's gate (Design Review Blocker 1): A2 is already
+        // live at 100%/camp10 in production, so reusing its gate would put this shadow-observation code live
+        // the instant it deploys, with no deploy→OFF→verify→exposure window. Activation additionally requires
+        // sttA2===true (observing alt1/alt2 candidates via a shadow is meaningless without A2 itself asking
+        // Google for maxAlternatives>1 in the first place).
+        const sttA2ShadowConfig = rolloutConfig.getCurrentSttA2ShadowConfig()
+        sttA2ShadowBucket = getSttA2ShadowBucket(callSid)
+        sttA2ShadowCampaignMatched = sttA2ShadowConfig.campaignId != null && session.campaign?.id === sttA2ShadowConfig.campaignId
+        sttA2ShadowPercentAtStart = sttA2ShadowConfig.percent
+        sttA2Shadow = sttA2 === true && sttA2ShadowCampaignMatched && sttA2ShadowBucket < sttA2ShadowConfig.percent
+
+        console.log(`[Rollout] callSid=${callSid} bucket=${rollout.bucket} percent=${rollout.percentAtStart} chunked=${rollout.useChunkedStreaming} legacyObserved=${legacyObserved} legacyObservedBucket=${legacyObservedBucket} legacyObservedPercent=${observedConfig.percent} campaignMatched=${legacyObservedCampaignMatched} legacyEarlyTts=${legacyEarlyTts} legacyEarlyTtsBucket=${legacyEarlyTtsBucket} legacyEarlyTtsPercent=${earlyTtsConfig.percent} earlyTtsCampaignMatched=${legacyEarlyTtsCampaignMatched} sttA2=${sttA2} sttA2Bucket=${sttA2Bucket} sttA2Percent=${sttA2Config.percent} sttA2CampaignMatched=${sttA2CampaignMatched} sttA2Shadow=${sttA2Shadow} sttA2ShadowBucket=${sttA2ShadowBucket} sttA2ShadowPercent=${sttA2ShadowConfig.percent} sttA2ShadowCampaignMatched=${sttA2ShadowCampaignMatched}`)
 
         // L1a: ต้องคำนวณหลัง rollout freeze แล้วเท่านั้น (ดูหมายเหตุที่ค่าคงที่ด้านบนไฟล์)
         const interimFinalizeMs = rollout.useChunkedStreaming ? STT_INTERIM_FINALIZE_MS_CHUNKED : 900
@@ -1533,6 +1554,19 @@ function registerWebSocket(fastify) {
           }
         }
 
+        // A2.1 Shadow Google Final Diagnostics (design revision 2026-08-21, Design Gate v2 PASS) — separate
+        // log line from [STT_DIAG] on purpose (design requirement: shadow events must be clearly separated
+        // from live-stream events, both in code and in logs). googleSTT.js's settleShadow() already wraps
+        // this callback in try/catch (a throwing diagnostic must never affect STT lifecycle) — the try/catch
+        // here mirrors emitSttDiag()'s own defensive pattern above for consistency, not because it's required.
+        const emitSttShadowDiag = (payload) => {
+          try {
+            console.log(`[STT_SHADOW_DIAG] ${JSON.stringify({ callSid, ...payload })}`)
+          } catch (e) {
+            console.error('[STT_SHADOW_DIAG] emit failed (non-fatal, ignored):', e.message)
+          }
+        }
+
         // เริ่ม STT stream
         sttStream = transcribeStream(async (transcript, sttMeta) => {
           if (!transcript || !callActive) return
@@ -1679,7 +1713,7 @@ function registerWebSocket(fastify) {
           if (!session) return
           if (rollout?.useChunkedStreaming) { startChunkedSpeculation(session, interimText); return }
           startPrewarm(session, interimText)
-        }, { interimFinalizeMs, maxAlternatives: sttA2 ? 3 : null })
+        }, { interimFinalizeMs, maxAlternatives: sttA2 ? 3 : null, enableShadow: sttA2Shadow, onShadowDiagnostic: emitSttShadowDiag })
 
         // AI ทักทายก่อนเลย — ใช้ pre-generated audio ถ้ามี (ลด latency)
         const playGreeting = async () => {

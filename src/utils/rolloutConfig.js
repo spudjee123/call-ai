@@ -148,6 +148,43 @@ function classifySttA2Config(rows) {
   return { percent, campaignId }
 }
 
+// A2.1 Shadow Google Final Diagnostics gate (design revision 2026-08-21, Design Gate v2 PASS) — same
+// fail-closed policy and atomic-snapshot shape as classifySttA2Config() above, own key names
+// (stt_a2_shadow_percent / stt_a2_shadow_campaign_id), own cache/log-signature state entirely (see
+// createRolloutConfig() below) — independent kill switch from A2 itself and from L2a/L2b/chunked. Same
+// "percent>0 requires a valid campaignId" rule. Deliberately NOT a reuse of stt_a2_percent/stt_a2_campaign_id
+// (Design Review Blocker 1): A2 is already live at 100%/camp10 in production, so reusing its gate would put
+// this new shadow-observation code live in production the instant it deploys, with no deploy→OFF→verify→
+// exposure window. audioStream.js additionally requires sttA2===true before honoring this gate at all.
+function classifySttA2ShadowConfig(rows) {
+  const percentRows = rows.filter(r => r.key === 'stt_a2_shadow_percent')
+  const campaignRows = rows.filter(r => r.key === 'stt_a2_shadow_campaign_id')
+
+  let percent = 0
+  if (percentRows.length === 1) {
+    const raw = String(percentRows[0].value ?? '').trim()
+    if (/^\d+$/.test(raw)) {
+      const n = Number(raw)
+      if (n >= 0 && n <= 100) percent = n
+    }
+  }
+
+  let campaignId = null
+  let campaignIdValid = true
+  if (campaignRows.length === 1) {
+    const raw = String(campaignRows[0].value ?? '').trim()
+    campaignId = raw || null
+  } else if (campaignRows.length > 1) {
+    campaignIdValid = false
+  }
+
+  if (percent > 0 && (campaignId == null || !campaignIdValid)) {
+    return { percent: 0, campaignId: null }
+  }
+  if (percent === 0) return { percent: 0, campaignId: null }
+  return { percent, campaignId }
+}
+
 function createRolloutConfig({ getRows = () => sheetsService.getStreamingConfig(), refreshIntervalMs = DEFAULT_REFRESH_INTERVAL_MS } = {}) {
   let cachedPercent = null // null = cold start, ยังไม่เคย fetch สำเร็จเลย
   let lastAttemptAt = null
@@ -161,6 +198,8 @@ function createRolloutConfig({ getRows = () => sheetsService.getStreamingConfig(
   let cachedEarlyTtsConfig = { percent: 0, campaignId: null }
   // STT-A2 — cache/policy แยกจากทั้ง L2a และ L2b โดยสิ้นเชิง (ดู comment ที่ classifySttA2Config ด้านบน)
   let cachedSttA2Config = { percent: 0, campaignId: null }
+  // A2.1 Shadow — cache/policy แยกจากทุก config อื่นโดยสิ้นเชิง รวมถึง A2 เอง (ดู comment ที่ classifySttA2ShadowConfig ด้านบน)
+  let cachedSttA2ShadowConfig = { percent: 0, campaignId: null }
 
   // C6b — log แบบ state-change เท่านั้น ไม่ log ทุกรอบ poll (30s) เพราะจะ spam production logs โดยไม่มีประโยชน์
   // log signature เปลี่ยนเมื่อไหร่ก็ต่อเมื่อผลลัพธ์เปลี่ยนจริง (success→success ค่าเดิม ไม่ log ซ้ำ, error เดิมซ้ำๆ
@@ -195,6 +234,14 @@ function createRolloutConfig({ getRows = () => sheetsService.getStreamingConfig(
   function logOnChangeSttA2(signature, logFn) {
     if (signature === lastSttA2LogSignature) return
     lastSttA2LogSignature = signature
+    logFn()
+  }
+
+  // A2.1 Shadow — signature ของตัวเองอีกชุด แยกจากทุก config อื่นรวมถึง A2 เอง (เหตุผลเดียวกัน)
+  let lastSttA2ShadowLogSignature = null
+  function logOnChangeSttA2Shadow(signature, logFn) {
+    if (signature === lastSttA2ShadowLogSignature) return
+    lastSttA2ShadowLogSignature = signature
     logFn()
   }
 
@@ -238,6 +285,14 @@ function createRolloutConfig({ getRows = () => sheetsService.getStreamingConfig(
           `sttA2:${sttA2Result.percent}:${sttA2Result.campaignId}`,
           () => console.log(`[RolloutConfig] stt-a2 config percent=${sttA2Result.percent} campaignId=${sttA2Result.campaignId ?? 'null'}`)
         )
+
+        // A2.1 Shadow — เขียนทับ cachedSttA2ShadowConfig ทุกรอบเช่นกัน (fail-closed ไม่ใช่ LKG) rows ชุดเดียวกัน ไม่ fetch ซ้ำ
+        const sttA2ShadowResult = classifySttA2ShadowConfig(rows)
+        cachedSttA2ShadowConfig = sttA2ShadowResult
+        logOnChangeSttA2Shadow(
+          `sttA2Shadow:${sttA2ShadowResult.percent}:${sttA2ShadowResult.campaignId}`,
+          () => console.log(`[RolloutConfig] stt-a2-shadow config percent=${sttA2ShadowResult.percent} campaignId=${sttA2ShadowResult.campaignId ?? 'null'}`)
+        )
       } catch (err) {
         // ใช้ last-known-good ต่อไปเฉพาะ rollout_percent ไม่ throw ให้กระทบ caller (ทั้ง background poll และ manual call)
         logOnChange(`failure:${err.message}`, () => console.error(`[RolloutConfig] refresh failed error=${JSON.stringify(err.message)} using_lkg=${cachedPercent ?? 0}`))
@@ -249,6 +304,9 @@ function createRolloutConfig({ getRows = () => sheetsService.getStreamingConfig(
         // STT-A2 — fetch ล้มเหลวเอง ก็ fail-closed เหมือนกัน ไม่ preserve ค่าเดิม
         cachedSttA2Config = { percent: 0, campaignId: null }
         logOnChangeSttA2('sttA2:fetch_failed', () => console.warn('[RolloutConfig] stt-a2 config fetch failed — fail-closed percent=0'))
+        // A2.1 Shadow — fetch ล้มเหลวเอง ก็ fail-closed เหมือนกัน ไม่ preserve ค่าเดิม
+        cachedSttA2ShadowConfig = { percent: 0, campaignId: null }
+        logOnChangeSttA2Shadow('sttA2Shadow:fetch_failed', () => console.warn('[RolloutConfig] stt-a2-shadow config fetch failed — fail-closed percent=0'))
       } finally {
         refreshInFlight = null
       }
@@ -298,7 +356,13 @@ function createRolloutConfig({ getRows = () => sheetsService.getStreamingConfig(
     return cachedSttA2Config
   }
 
-  return { getCurrentRolloutPercent, getCurrentLegacyObservedConfig, getCurrentLegacyEarlyTtsConfig, getCurrentSttA2Config, start, stop, refresh }
+  // A2.1 Shadow — atomic snapshot เดียวกัน pattern เป๊ะ แยก state จากทุก config อื่นโดยสิ้นเชิง รวมถึง A2 เอง
+  function getCurrentSttA2ShadowConfig() {
+    refreshIfStale()
+    return cachedSttA2ShadowConfig
+  }
+
+  return { getCurrentRolloutPercent, getCurrentLegacyObservedConfig, getCurrentLegacyEarlyTtsConfig, getCurrentSttA2Config, getCurrentSttA2ShadowConfig, start, stop, refresh }
 }
 
-module.exports = { createRolloutConfig, parseRolloutPercent, classifyLegacyObservedConfig, classifyLegacyEarlyTtsConfig, classifySttA2Config }
+module.exports = { createRolloutConfig, parseRolloutPercent, classifyLegacyObservedConfig, classifyLegacyEarlyTtsConfig, classifySttA2Config, classifySttA2ShadowConfig }

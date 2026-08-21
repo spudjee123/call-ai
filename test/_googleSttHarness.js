@@ -53,6 +53,17 @@ function emitFinal(stream, text, confidence, otherAlternatives) {
   stream.emit('data', { results: [{ isFinal: true, alternatives: [alt0, ...(otherAlternatives || [])] }] })
 }
 
+// A2.1 Shadow: fire 'error'/'end' directly on any stream reference (including an already-rotated-away old
+// stream) — streams here are plain EventEmitters so this works identically for current/next/shadowed streams,
+// same as emitInterim/emitFinal above already do for 'data'.
+function emitError(stream, err) {
+  stream.emit('error', err || new Error('simulated STT error'))
+}
+
+function emitStreamEnd(stream) {
+  stream.emit('end')
+}
+
 function delay(ms) { return new Promise(resolve => setTimeout(resolve, ms)) }
 
 module.exports = {
@@ -61,5 +72,7 @@ module.exports = {
   get capturedOptions() { return capturedOptions },
   emitInterim,
   emitFinal,
+  emitError,
+  emitStreamEnd,
   delay,
 }

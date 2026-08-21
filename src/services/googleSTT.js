@@ -58,15 +58,41 @@ function normalizeAlternatives(alternatives) {
   }))
 }
 
+// A2.1 Shadow Google Final Diagnostics (design revision 2026-08-21, Design Gate v2 PASS) — diagnostic
+// observation cap only, NOT a latency budget. No user-facing path (onTranscript/TIMER_FINAL delivery/TTS/
+// Claude) ever waits on this timer — it only bounds how long a settled-pending shadow object is allowed to
+// wait for a possible late native final on an already-demoted (rotated-away) stream before giving up.
+// Locked at 2000ms for the first production evidence run (Design Review). If that run shows 100% TIMEOUT
+// or 100% STREAM_END, do NOT guess-raise this value (5000/10000) — rotateForNextUtterance() below calls
+// draining.end() on the old stream immediately after TIMER_FINAL, which may half-close the gRPC call
+// before Google would ever send a late final at all, in which case a longer timeout changes nothing. That
+// scenario is its own follow-up design (A2.2 — not calling .end() immediately), evaluated separately
+// because it changes actual stream/resource lifetime, unlike this diagnostic-only observation window.
+const SHADOW_TIMEOUT_MS = 2000
+
 // L1a (latency optimization, rollout-scoped STT endpoint experiment): interimFinalizeMs รับจากภายนอกได้แล้ว
 // default 900ms เดิมทุกประการถ้า caller ไม่ส่งอะไรมา — googleSTT.js เป็น STT ตัวเดียวที่ legacy และ chunked
 // path ใช้ร่วมกัน เปลี่ยนค่า default ตรงๆ จะกระทบ legacy production ทุกสายทันทีโดยไม่ผูกกับ chunked rollout เลย
 // ต้องให้ audioStream.js เป็นคนตัดสินใจค่าต่อสาย (ตาม rollout ที่ freeze แล้วตอน 'start') แล้วส่งเข้ามาแทน
-function transcribeStream(onTranscript, onInterim, { interimFinalizeMs = 900, maxAlternatives = null } = {}) {
+//
+// A2.1 (design revision 2026-08-21): enableShadow/onShadowDiagnostic คนละ option จาก maxAlternatives ตั้งใจ
+// — A2 ON ไม่ได้แปลว่า shadow ต้อง ON เสมอ (independent rollout gate ของตัวเอง อยู่ที่ audioStream.js) ตัว
+// googleSTT.js เองยังบังคับซ้ำอีกชั้น (ดู activeShadow setup ด้านล่าง) ว่า shadow ทำงานได้เฉพาะเมื่อ
+// enableShadow===true "และ" maxAlternatives>1 พร้อมกันเท่านั้น — invariant "A2 OFF → A2.1 OFF" จึงเป็นจริง
+// ภายใน module นี้เอง ไม่ต้องพึ่ง caller (audioStream.js) ส่งค่ามาถูกเสมอ
+function transcribeStream(onTranscript, onInterim, { interimFinalizeMs = 900, maxAlternatives = null, enableShadow = false, onShadowDiagnostic = null } = {}) {
   let destroyed = false
   let currentStream = null
   let nextStream = null
   let errorRetryCount = 0
+
+  // A2.1 Shadow — at most ONE pending shadow observation per call (O(1) memory, design-approved). NOT reset
+  // by resetUtteranceState() — that function scopes to the CURRENT utterance's live state, but activeShadow
+  // tracks an OLD (already-rotated-away) stream's trailing native-final observation, spanning across the
+  // utterance boundary by design. { stream, streamId, utteranceId, timerFinalText, timerFinalAt, settled,
+  // timeoutHandle } while pending; null when no shadow is active. See settleShadow() below for the only
+  // place this is ever mutated to null or marked settled.
+  let activeShadow = null
 
   let writeCount = 0
   let code11Count = 0
@@ -118,6 +144,44 @@ function transcribeStream(onTranscript, onInterim, { interimFinalizeMs = 900, ma
     maxStability = null
     coldMutePackets = 0
     acceptedAlternatives = null
+  }
+
+  // A2.1 Shadow — the ONLY place a shadow is ever settled/cleared. Atomic ordering is mandatory (Design
+  // Review Blocker 2): mark settled → clear timer → snapshot payload → null out activeShadow, ALL before the
+  // diagnostic callback ever runs — so no shadow state is left half-updated no matter what the callback does.
+  // onShadowDiagnostic is called last, wrapped in try/catch: a throwing diagnostic callback must never affect
+  // STT lifecycle (observability failing must not break the call) — it only drops that one diagnostic emit.
+  //
+  // Implementation Review fix (identity binding): takes the exact `shadow` object being settled as a
+  // parameter instead of reading module-level `activeShadow` directly, and rejects unless
+  // `activeShadow === shadow` — this must not rely on clearTimeout() alone to prevent a stale/superseded
+  // shadow's timeout callback from settling whatever shadow happens to be active by the time it fires (a
+  // narrow but real race: clearTimeout() only reliably prevents a callback that hasn't already been queued
+  // to run). Every call site below captures `const shadow = activeShadow` locally first and passes that
+  // same reference through, so the check is against the shadow the caller actually intended to settle.
+  function settleShadow(shadow, outcome, resultData = {}) {
+    if (!shadow || activeShadow !== shadow || shadow.settled) return
+    shadow.settled = true
+    clearTimeout(shadow.timeoutHandle)
+
+    const payload = {
+      streamId: shadow.streamId,
+      utteranceId: shadow.utteranceId,
+      timerFinalText: shadow.timerFinalText,
+      timerFinalAt: shadow.timerFinalAt,
+      shadowFinalAt: resultData.shadowFinalAt ?? null,
+      shadowFinalDelayMs: resultData.shadowFinalDelayMs ?? null,
+      shadowAlternatives: resultData.shadowAlternatives ?? null,
+      shadowOutcome: outcome,
+    }
+
+    activeShadow = null
+
+    try {
+      onShadowDiagnostic?.(payload)
+    } catch (err) {
+      console.error('[STT_SHADOW_DIAG] onShadowDiagnostic threw, diagnostic dropped:', err.message)
+    }
   }
 
   function activatePrewarm() {
@@ -176,6 +240,16 @@ function transcribeStream(onTranscript, onInterim, { interimFinalizeMs = 900, ma
     })
     .on('error', (err) => {
       if (destroyed) return
+      // A2.1 Shadow — must settle BEFORE the stale-stream guard below, since a shadowed stream is by
+      // definition neither currentStream nor nextStream (it was already rotated away when the shadow
+      // started) and would otherwise be silently discarded by that guard with no ERROR outcome ever
+      // recorded. Returns immediately — must never fall into the recovery logic below (errorRetryCount,
+      // stream recreation) since that logic only applies to the live current/next streams.
+      const errorShadow = activeShadow
+      if (errorShadow && stream === errorShadow.stream && !errorShadow.settled) {
+        settleShadow(errorShadow, 'ERROR', {})
+        return
+      }
       if (stream !== currentStream && stream !== nextStream) return
 
       if (err.code === 11) {
@@ -205,6 +279,24 @@ function transcribeStream(onTranscript, onInterim, { interimFinalizeMs = 900, ma
       }
     })
     .on('data', (data) => {
+      // A2.1 Shadow — must run before the stale-stream guard below (a shadowed stream is always
+      // `!== currentStream`) and must `return` before touching errorRetryCount or any live utterance state
+      // (interimText/counters) — shadow observation is structurally a separate path from live processing,
+      // never onTranscript()'d, never mutating anything the live path reads.
+      const dataShadow = activeShadow
+      if (dataShadow && stream === dataShadow.stream && !dataShadow.settled) {
+        const shadowResult = data.results?.[0]
+        if (shadowResult?.isFinal) {
+          const nowTs = Date.now()
+          settleShadow(dataShadow, 'FINAL', {
+            shadowFinalAt: nowTs,
+            shadowFinalDelayMs: nowTs - dataShadow.timerFinalAt,
+            shadowAlternatives: normalizeAlternatives(shadowResult.alternatives),
+          })
+        }
+        return
+      }
+
       if (stream !== currentStream) return
       errorRetryCount = 0
 
@@ -279,6 +371,33 @@ function transcribeStream(onTranscript, onInterim, { interimFinalizeMs = 900, ma
               coldMutePackets,
               alternatives: acceptedAlternatives, // STT-A2: snapshot ที่ผูกกับ interimText นี้เป๊ะ (null เมื่อ A2 OFF)
             })
+
+            // A2.1 Shadow — start observing THIS stream (about to be rotated away) for a possible late
+            // native final, only when both the independent shadow gate (enableShadow) and A2 itself
+            // (maxAlternatives>1) are on — enforced here defense-in-depth, not just trusted from the caller.
+            // Must be set up before rotateForNextUtterance() below demotes `stream` from currentStream — the
+            // .on('data')/.on('error')/.on('end') branches above match on `stream === activeShadow.stream`
+            // by reference, so this has to run while `stream` is still the value being rotated away, not after.
+            if (enableShadow === true && typeof maxAlternatives === 'number' && maxAlternatives > 1) {
+              // at most one active shadow per call — supersede whatever's still pending via its own captured reference
+              if (activeShadow && !activeShadow.settled) settleShadow(activeShadow, 'SUPERSEDED', {})
+              const shadow = {
+                stream,
+                streamId: thisStreamId,
+                utteranceId: currentUtteranceId,
+                timerFinalText: deliveredText,
+                timerFinalAt: finalAt,
+                settled: false,
+                timeoutHandle: null,
+              }
+              // timeout closure captures THIS shadow object by reference (not activeShadow) — settleShadow()
+              // rejects it once activeShadow has moved on (SUPERSEDED/settled elsewhere), so a stale timer
+              // from an old, already-superseded shadow can never settle whatever shadow is active by the
+              // time it fires, regardless of clearTimeout() timing (Implementation Review fix)
+              shadow.timeoutHandle = setTimeout(() => settleShadow(shadow, 'TIMEOUT', {}), SHADOW_TIMEOUT_MS)
+              activeShadow = shadow
+            }
+
             rotateForNextUtterance() // ต้องอยู่ท้ายสุดเสมอ (ดูหมายเหตุที่ rotateForNextUtterance ด้านบน)
           }
         }, INTERIM_FINALIZE_MS)
@@ -324,6 +443,13 @@ function transcribeStream(onTranscript, onInterim, { interimFinalizeMs = 900, ma
     })
     .on('end', () => {
       if (destroyed) return
+      // A2.1 Shadow — a shadowed stream's 'end' previously fell through to the silent no-op case (it's
+      // neither currentStream nor nextStream). Must settle here before either branch below.
+      const endShadow = activeShadow
+      if (endShadow && stream === endShadow.stream && !endShadow.settled) {
+        settleShadow(endShadow, 'STREAM_END', {})
+        return
+      }
       if (stream === currentStream) {
         currentStream = null
         if (nextStream) {
@@ -379,6 +505,11 @@ function transcribeStream(onTranscript, onInterim, { interimFinalizeMs = 900, ma
     },
     end() {
       if (destroyed) return
+      // A2.1 Shadow — settle as CALL_ENDED BEFORE destroyed=true / stream teardown (Design Review lock):
+      // deterministic outcome, not a silent drop. Settling first (not after currentStream/nextStream.end())
+      // also removes any race where a teardown-triggered stream event could steal the outcome as STREAM_END
+      // instead of CALL_ENDED.
+      if (activeShadow) settleShadow(activeShadow, 'CALL_ENDED', {})
       destroyed = true
       clearTimeout(interimTimer)
       interimTimer = null

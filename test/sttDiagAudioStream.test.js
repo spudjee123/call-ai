@@ -62,6 +62,7 @@ beforeEach(() => {
   state.legacyObservedConfig = { percent: 0, campaignId: null }
   state.legacyEarlyTtsConfig = { percent: 0, campaignId: null }
   state.sttA2Config = { percent: 0, campaignId: null }
+  state.sttA2ShadowConfig = { percent: 0, campaignId: null }
   state.claudeConditionalImpl = null
 })
 
@@ -396,4 +397,138 @@ test('diagnostic failure ต้องไม่กระทบ call flow: field �
   } finally {
     harness.disconnect(socket)
   }
+})
+
+// A2.1 Shadow Google Final Diagnostics (design revision 2026-08-21, Design Gate v2 PASS) — wiring-level
+// tests: activation formula frozen at 'start' correctly reaches transcribeStream()'s options (enableShadow),
+// and [STT_SHADOW_DIAG] is a genuinely separate log line from [STT_DIAG] with the same diagnostic-failure
+// isolation guarantee. Bucket values below are pre-computed real fixtures from getSttA2Bucket()/
+// getSttA2ShadowBucket() (verified — see test/rolloutBucket.test.js) for the exact callSid strings used.
+const A21_SHADOW_CAMPAIGN_ID = 'CAMPAIGN_A21_SHADOW_TEST'
+function a21ShadowCampaign(overrides = {}) {
+  return { voice_id: 'voice1', script: 'ระบบทดสอบ', id: A21_SHADOW_CAMPAIGN_ID, ...overrides }
+}
+
+// จับ [STT_SHADOW_DIAG] JSON line จากช่วงที่ fn() รัน — คนละ prefix จาก [STT_DIAG] เจตนา (design requirement:
+// shadow events must be clearly separated from live-stream events ทั้งใน code และใน log)
+async function captureSttShadowDiag(fn) {
+  const originalLog = console.log
+  const originalError = console.error
+  const logs = []
+  const errors = []
+  console.log = (...args) => { logs.push(args.join(' ')); originalLog(...args) }
+  console.error = (...args) => { errors.push(args.join(' ')); originalError(...args) }
+  try {
+    await fn()
+  } finally {
+    console.log = originalLog
+    console.error = originalError
+  }
+  const diagLines = logs.filter(l => l.includes('[STT_SHADOW_DIAG]')).map(l => JSON.parse(l.slice(l.indexOf('{'))))
+  return { diagLines, logs, errors }
+}
+
+test('A2.1 Shadow wiring: A2 ON + matching campaign + qualifying shadow bucket → enableShadow=true reaches transcribeStream() options', async () => {
+  const callSid = 'CA_A21_Q1' // a2Bucket=51, shadowBucket=51
+  const state = harness.getState()
+  state.rolloutPercent = 0
+  state.sttA2Config = { percent: 100, campaignId: A21_SHADOW_CAMPAIGN_ID }
+  state.sttA2ShadowConfig = { percent: 100, campaignId: A21_SHADOW_CAMPAIGN_ID }
+  const session = makeSession({ campaign: a21ShadowCampaign(), greetingChunks: [Buffer.from('pregenerated-greeting')] })
+  callSessions.set(callSid, session)
+  const socket = harness.connect({ callSid })
+  harness.sendStart(socket)
+  await delay(10)
+
+  assert.equal(state.lastSttOptions?.maxAlternatives, 3, 'A2 ต้อง ON ด้วย (precondition ของ shadow)')
+  assert.equal(state.lastSttOptions?.enableShadow, true)
+  assert.equal(typeof state.lastSttOptions?.onShadowDiagnostic, 'function')
+
+  harness.disconnect(socket)
+})
+
+test('A2.1 Shadow wiring: A2 ON แต่ shadow bucket ของตัวเองไม่ผ่านเกณฑ์ → enableShadow=false แม้ A2 เอง ON อยู่ (พิสูจน์ independent gate)', async () => {
+  const callSid = 'CA_A21_NQ1' // a2Bucket=21 (qualifies for percent=100), shadowBucket=76 (ไม่ผ่านเกณฑ์ percent=50)
+  const state = harness.getState()
+  state.rolloutPercent = 0
+  state.sttA2Config = { percent: 100, campaignId: A21_SHADOW_CAMPAIGN_ID }
+  state.sttA2ShadowConfig = { percent: 50, campaignId: A21_SHADOW_CAMPAIGN_ID }
+  const session = makeSession({ campaign: a21ShadowCampaign(), greetingChunks: [Buffer.from('pregenerated-greeting')] })
+  callSessions.set(callSid, session)
+  const socket = harness.connect({ callSid })
+  harness.sendStart(socket)
+  await delay(10)
+
+  assert.equal(state.lastSttOptions?.maxAlternatives, 3, 'A2 เองยัง ON')
+  assert.equal(state.lastSttOptions?.enableShadow, false, 'shadow bucket ไม่ผ่านเกณฑ์ของตัวเอง ต้อง OFF แม้ A2 ON')
+
+  harness.disconnect(socket)
+})
+
+test('A2.1 Shadow wiring: A2 OFF (percent=0) แต่ shadow config เองตั้งไว้ครบ (percent=100 + campaign matched) → enableShadow ต้องยังเป็น false เสมอ (sttA2===true เป็นเงื่อนไขบังคับ)', async () => {
+  const callSid = 'CA_A21_A2OFF'
+  const state = harness.getState()
+  state.rolloutPercent = 0
+  state.sttA2Config = { percent: 0, campaignId: null } // A2 OFF (default fail-closed)
+  state.sttA2ShadowConfig = { percent: 100, campaignId: A21_SHADOW_CAMPAIGN_ID } // shadow's own gate ครบทุกอย่าง
+  const session = makeSession({ campaign: a21ShadowCampaign(), greetingChunks: [Buffer.from('pregenerated-greeting')] })
+  callSessions.set(callSid, session)
+  const socket = harness.connect({ callSid })
+  harness.sendStart(socket)
+  await delay(10)
+
+  assert.equal(state.lastSttOptions?.maxAlternatives, null, 'A2 ต้อง OFF ตาม config')
+  assert.equal(state.lastSttOptions?.enableShadow, false, 'A2 OFF ต้องทำให้ A2.1 OFF เสมอ ไม่ว่า shadow config ของตัวเองจะเป็นอะไร')
+
+  harness.disconnect(socket)
+})
+
+test('[STT_SHADOW_DIAG]: onShadowDiagnostic ที่ audioStream.js ส่งเข้า transcribeStream() เขียน log แยก prefix จาก [STT_DIAG] พร้อม inject callSid ให้ครบ', async () => {
+  const callSid = 'CA_A21_LOGLINE'
+  const state = harness.getState()
+  state.rolloutPercent = 0
+  const session = makeSession({ greetingChunks: [Buffer.from('pregenerated-greeting')] })
+  callSessions.set(callSid, session)
+  const socket = harness.connect({ callSid })
+  harness.sendStart(socket)
+  await delay(10)
+
+  const shadowPayload = {
+    streamId: 1, utteranceId: 1, timerFinalText: 'ทดสอบ', timerFinalAt: 1000,
+    shadowFinalAt: 1200, shadowFinalDelayMs: 200,
+    shadowAlternatives: [{ index: 0, text: 'ทดสอบครับ', confidence: null, selected: true }],
+    shadowOutcome: 'FINAL',
+  }
+  const { diagLines } = await captureSttShadowDiag(async () => {
+    state.lastSttOptions.onShadowDiagnostic(shadowPayload)
+  })
+
+  assert.equal(diagLines.length, 1)
+  assert.equal(diagLines[0].callSid, callSid)
+  assert.equal(diagLines[0].shadowOutcome, 'FINAL')
+  assert.equal(diagLines[0].timerFinalText, 'ทดสอบ')
+  assert.deepEqual(diagLines[0].shadowAlternatives, shadowPayload.shadowAlternatives)
+
+  harness.disconnect(socket)
+})
+
+test('[STT_SHADOW_DIAG] emit failure: field ที่ JSON.stringify ไม่ได้ (BigInt) → log error แบบ non-fatal เท่านั้น ไม่ throw ออกไปกระทบอะไรเลย', async () => {
+  const callSid = 'CA_A21_LOGFAIL'
+  const state = harness.getState()
+  state.rolloutPercent = 0
+  const session = makeSession({ greetingChunks: [Buffer.from('pregenerated-greeting')] })
+  callSessions.set(callSid, session)
+  const socket = harness.connect({ callSid })
+  harness.sendStart(socket)
+  await delay(10)
+
+  const badPayload = { shadowOutcome: 'FINAL', timerFinalAt: 10n } // BigInt ทำให้ JSON.stringify throw แน่นอน
+  const { diagLines, errors } = await captureSttShadowDiag(async () => {
+    assert.doesNotThrow(() => state.lastSttOptions.onShadowDiagnostic(badPayload))
+  })
+
+  assert.equal(diagLines.length, 0)
+  assert.ok(errors.some(e => e.includes('[STT_SHADOW_DIAG] emit failed')), 'ต้อง log error แบบ non-fatal แทนที่จะ throw ออกไป')
+
+  harness.disconnect(socket)
 })
