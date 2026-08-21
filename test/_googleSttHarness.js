@@ -38,16 +38,19 @@ function ensureStubbed() {
   return require('../src/services/googleSTT')
 }
 
-function emitInterim(stream, text, stability) {
-  const result = { isFinal: false, alternatives: [{ transcript: text }] }
+// STT-A2: optional 4th param `otherAlternatives` — array of extra alternative objects (e.g. { transcript, confidence })
+// appended after alt0 in result.alternatives, to simulate Google returning maxAlternatives>1 candidates.
+function emitInterim(stream, text, stability, otherAlternatives) {
+  const alt0 = { transcript: text }
+  const result = { isFinal: false, alternatives: [alt0, ...(otherAlternatives || [])] }
   if (stability !== undefined) result.stability = stability
   stream.emit('data', { results: [result] })
 }
 
-function emitFinal(stream, text, confidence) {
-  const alt = { transcript: text }
-  if (confidence !== undefined) alt.confidence = confidence
-  stream.emit('data', { results: [{ isFinal: true, alternatives: [alt] }] })
+function emitFinal(stream, text, confidence, otherAlternatives) {
+  const alt0 = { transcript: text }
+  if (confidence !== undefined) alt0.confidence = confidence
+  stream.emit('data', { results: [{ isFinal: true, alternatives: [alt0, ...(otherAlternatives || [])] }] })
 }
 
 function delay(ms) { return new Promise(resolve => setTimeout(resolve, ms)) }

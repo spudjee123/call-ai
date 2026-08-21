@@ -38,6 +38,8 @@ function ensureStubbed() {
     legacyObservedConfig: { percent: 0, campaignId: null },
     // L2b production exposure gate — default fail-closed เหมือนกันเป๊ะ
     legacyEarlyTtsConfig: { percent: 0, campaignId: null },
+    // STT-A2 diagnostic gate — default fail-closed เหมือนกันเป๊ะ
+    sttA2Config: { percent: 0, campaignId: null },
     lastSttCallbacks: null, // { onTranscript, onInterim } — set สดทุกครั้งที่มี connection ใหม่เปิด sttStream
   }
 
@@ -119,6 +121,7 @@ function ensureStubbed() {
         getCurrentRolloutPercent: () => state.rolloutPercent,
         getCurrentLegacyObservedConfig: () => state.legacyObservedConfig,
         getCurrentLegacyEarlyTtsConfig: () => state.legacyEarlyTtsConfig,
+        getCurrentSttA2Config: () => state.sttA2Config,
       }),
     },
   }

@@ -1,6 +1,6 @@
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
-const { createRolloutConfig, parseRolloutPercent, classifyLegacyObservedConfig, classifyLegacyEarlyTtsConfig } = require('../src/utils/rolloutConfig')
+const { createRolloutConfig, parseRolloutPercent, classifyLegacyObservedConfig, classifyLegacyEarlyTtsConfig, classifySttA2Config } = require('../src/utils/rolloutConfig')
 
 function delay(ms) { return new Promise(resolve => setTimeout(resolve, ms)) }
 
@@ -527,5 +527,99 @@ test('L2b: createRolloutConfig().getCurrentLegacyEarlyTtsConfig() — fail-close
   assert.equal(rc.getCurrentRolloutPercent(), 20, 'rollout_percent ต้องคง LKG')
   assert.deepEqual(rc.getCurrentLegacyObservedConfig(), { percent: 0, campaignId: null }, 'L2a ต้อง fail-closed')
   assert.deepEqual(rc.getCurrentLegacyEarlyTtsConfig(), { percent: 0, campaignId: null }, 'L2b ต้อง fail-closed เช่นกัน')
+  rc.stop()
+})
+
+// ---------------------------------------------------------------------------
+// STT-A2 diagnostic gate — classifySttA2Config() (design revision 2026-08-21)
+// same fail-closed shape as L2a/L2b, own keys/state entirely independent
+// ---------------------------------------------------------------------------
+
+test('classifySttA2Config: percent>0 + campaignId ถูกต้องครบคู่ → ใช้ค่านั้นจริง', () => {
+  assert.deepEqual(
+    classifySttA2Config([
+      { key: 'stt_a2_percent', value: '100' },
+      { key: 'stt_a2_campaign_id', value: 'CAMPAIGN_A2_TEST' },
+    ]),
+    { percent: 100, campaignId: 'CAMPAIGN_A2_TEST' }
+  )
+})
+
+test('classifySttA2Config: percent>0 แต่ไม่มีแถว campaign_id เลย → fail-closed {0, null}', () => {
+  assert.deepEqual(
+    classifySttA2Config([{ key: 'stt_a2_percent', value: '100' }]),
+    { percent: 0, campaignId: null }
+  )
+})
+
+test('classifySttA2Config: ไม่มีแถวใดๆ เลย (Sheets ยังไม่เคยเพิ่ม key พวกนี้) → {0, null} ปลอดภัยตั้งแต่วันแรก', () => {
+  assert.deepEqual(classifySttA2Config([]), { percent: 0, campaignId: null })
+})
+
+test('classifySttA2Config: duplicate percent row → invalid, fail-closed', () => {
+  assert.deepEqual(
+    classifySttA2Config([
+      { key: 'stt_a2_percent', value: '50' },
+      { key: 'stt_a2_percent', value: '100' },
+      { key: 'stt_a2_campaign_id', value: 'X' },
+    ]),
+    { percent: 0, campaignId: null }
+  )
+})
+
+test('classifySttA2Config: duplicate campaign_id row → invalid, fail-closed', () => {
+  assert.deepEqual(
+    classifySttA2Config([
+      { key: 'stt_a2_percent', value: '100' },
+      { key: 'stt_a2_campaign_id', value: 'X' },
+      { key: 'stt_a2_campaign_id', value: 'Y' },
+    ]),
+    { percent: 0, campaignId: null }
+  )
+})
+
+test('classifySttA2Config: independent จาก legacy_observed_*/legacy_early_tts_* โดยสิ้นเชิง — มีทั้งหมดในแถวเดียวกันไม่ปนกัน', () => {
+  const rows = [
+    { key: 'legacy_observed_percent', value: '100' },
+    { key: 'legacy_observed_campaign_id', value: 'CAMPAIGN_L2A' },
+    { key: 'legacy_early_tts_percent', value: '50' },
+    { key: 'legacy_early_tts_campaign_id', value: 'CAMPAIGN_L2B' },
+    { key: 'stt_a2_percent', value: '30' },
+    { key: 'stt_a2_campaign_id', value: 'CAMPAIGN_A2' },
+  ]
+  assert.deepEqual(classifyLegacyObservedConfig(rows), { percent: 100, campaignId: 'CAMPAIGN_L2A' })
+  assert.deepEqual(classifyLegacyEarlyTtsConfig(rows), { percent: 50, campaignId: 'CAMPAIGN_L2B' })
+  assert.deepEqual(classifySttA2Config(rows), { percent: 30, campaignId: 'CAMPAIGN_A2' })
+})
+
+test('STT-A2: createRolloutConfig().getCurrentSttA2Config() — fail-closed ทันทีตอน fetch ล้มเหลว ในขณะที่ rollout_percent ยัง LKG และ L2a/L2b ก็ fail-closed คู่ขนานกัน (สี่ policy ทำงานถูกต้องพร้อมกันจาก fetch เดียว)', async () => {
+  let shouldFail = false
+  const rc = createRolloutConfig({
+    getRows: async () => {
+      if (shouldFail) throw new Error('Sheets down')
+      return [
+        { key: 'rollout_percent', value: '20' },
+        { key: 'legacy_observed_percent', value: '100' },
+        { key: 'legacy_observed_campaign_id', value: 'A' },
+        { key: 'legacy_early_tts_percent', value: '100' },
+        { key: 'legacy_early_tts_campaign_id', value: 'B' },
+        { key: 'stt_a2_percent', value: '100' },
+        { key: 'stt_a2_campaign_id', value: 'C' },
+      ]
+    },
+    refreshIntervalMs: 50,
+  })
+  rc.start()
+  await delay(20)
+  assert.equal(rc.getCurrentRolloutPercent(), 20)
+  assert.deepEqual(rc.getCurrentLegacyObservedConfig(), { percent: 100, campaignId: 'A' })
+  assert.deepEqual(rc.getCurrentLegacyEarlyTtsConfig(), { percent: 100, campaignId: 'B' })
+  assert.deepEqual(rc.getCurrentSttA2Config(), { percent: 100, campaignId: 'C' })
+  shouldFail = true
+  await delay(100)
+  assert.equal(rc.getCurrentRolloutPercent(), 20, 'rollout_percent ต้องคง LKG')
+  assert.deepEqual(rc.getCurrentLegacyObservedConfig(), { percent: 0, campaignId: null }, 'L2a ต้อง fail-closed')
+  assert.deepEqual(rc.getCurrentLegacyEarlyTtsConfig(), { percent: 0, campaignId: null }, 'L2b ต้อง fail-closed เช่นกัน')
+  assert.deepEqual(rc.getCurrentSttA2Config(), { percent: 0, campaignId: null }, 'A2 ต้อง fail-closed เช่นกัน')
   rc.stop()
 })

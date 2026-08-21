@@ -39,4 +39,12 @@ function getLegacyEarlyTtsBucket(callSid) {
   return parseInt(hex, 16) % 100
 }
 
-module.exports = { getRolloutBucket, decideRollout, getLegacyObservedBucket, getLegacyEarlyTtsBucket }
+// STT-A2 diagnostic gate — dedicated helper, same reasoning as getLegacyObservedBucket()/getLegacyEarlyTtsBucket()
+// above: own namespace prefix so A2 assignment is independent of chunked/L2a/L2b even for the same callSid.
+// A collision between any two namespaces is statistically normal (%100 buckets) — never assert they differ.
+function getSttA2Bucket(callSid) {
+  const hex = crypto.createHash('sha256').update(`stt-a2:${String(callSid)}`).digest('hex').slice(0, 8)
+  return parseInt(hex, 16) % 100
+}
+
+module.exports = { getRolloutBucket, decideRollout, getLegacyObservedBucket, getLegacyEarlyTtsBucket, getSttA2Bucket }

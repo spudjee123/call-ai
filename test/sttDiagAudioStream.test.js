@@ -61,6 +61,7 @@ beforeEach(() => {
   state.rolloutPercent = 0
   state.legacyObservedConfig = { percent: 0, campaignId: null }
   state.legacyEarlyTtsConfig = { percent: 0, campaignId: null }
+  state.sttA2Config = { percent: 0, campaignId: null }
   state.claudeConditionalImpl = null
 })
 
@@ -329,6 +330,49 @@ test('DEFERRED/PENDING_TRANSCRIPT (3/3 — additional transcript ระหว่
     await delay(50)
     const lastUserMsg = session.messages.filter(m => m.role === 'user').at(-1)
     assert.equal(lastUserMsg.content, 'ประโยคที่สามที่ควรมาแทนที่คิวเดิม', 'latest-wins ต้องยังทำงานเหมือนเดิม — คิวที่สองแทนที่คิวแรกไปแล้ว ไม่ใช่ FIFO')
+  } finally {
+    harness.disconnect(socket)
+  }
+})
+
+// STT-A2 (design revision 2026-08-21): emitSttDiag ต้อง serialize sttMeta.alternatives เข้า [STT_DIAG] เฉพาะ
+// ตอนมีข้อมูลจริง (A2 ON) — non-A2 calls (FAKE_META ด้านบนไม่มี key นี้เลย) ต้องไม่มี key alternatives โผล่มา
+// ในทุก test ก่อนหน้านี้อยู่แล้วโดยปริยาย — เทสนี้ยืนยันฝั่งตรงข้าม: พอมีข้อมูลจริงต้อง serialize ออกมาถูกต้อง
+test('STT-A2: [STT_DIAG] serialize sttMeta.alternatives เข้าไปจริงเมื่อมีข้อมูล (A2 ON)', async () => {
+  const callSid = nextCallSid()
+  const { socket } = await connectPastGreeting(callSid)
+  try {
+    const metaWithAlternatives = {
+      ...FAKE_META,
+      alternatives: [
+        { index: 0, text: 'พอยต์เอาไปทำอะไร', confidence: null, selected: true },
+        { index: 1, text: 'พอยต์ใช้ทำอะไร', confidence: null, selected: false },
+      ],
+    }
+    const { diagLines } = await captureSttDiag(async () => {
+      await harness.sendFinalTranscript('พอยต์เอาไปทำอะไร', metaWithAlternatives)
+    })
+
+    assert.equal(diagLines.length, 1)
+    assert.equal(diagLines[0].disposition, 'DELIVERED')
+    assert.deepEqual(diagLines[0].alternatives, metaWithAlternatives.alternatives)
+  } finally {
+    harness.disconnect(socket)
+  }
+})
+
+test('STT-A2: [STT_DIAG] ไม่มี key "alternatives" เลยเมื่อ sttMeta.alternatives เป็น null (A2 OFF)', async () => {
+  const callSid = nextCallSid()
+  const { socket } = await connectPastGreeting(callSid)
+  try {
+    const { diagLines, logs } = await captureSttDiag(async () => {
+      await harness.sendFinalTranscript('สวัสดีค่ะ สนใจโปรโมชั่น', { ...FAKE_META, alternatives: null })
+    })
+
+    assert.equal(diagLines.length, 1)
+    assert.equal('alternatives' in diagLines[0], false)
+    const diagLine = logs.find(l => l.includes('[STT_DIAG]'))
+    assert.ok(!diagLine.includes('"alternatives"'), 'key alternatives ต้องไม่ปรากฏใน raw JSON เลยตอน A2 OFF')
   } finally {
     harness.disconnect(socket)
   }

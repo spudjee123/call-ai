@@ -4,7 +4,7 @@ const { askClaude, askClaudeStream, askClaudeObservedFullResponse, askClaudeCond
 const { synthesizeSpeechStream } = require('../services/tts')
 const healthMonitor = require('../utils/healthMonitor')
 const { createCallState, bumpGeneration, isCurrentGeneration, endCall } = require('../utils/generationGuard')
-const { decideRollout, getLegacyObservedBucket, getLegacyEarlyTtsBucket } = require('../utils/rolloutBucket')
+const { decideRollout, getLegacyObservedBucket, getLegacyEarlyTtsBucket, getSttA2Bucket } = require('../utils/rolloutBucket')
 const { createTurnMetrics, markOnce, computeDerivedMetrics } = require('../utils/turnMetrics')
 const { createTurnState, markTtsPending, markAudioCommitted, markDone, claimFallback } = require('../utils/turnState')
 const { runChunkedTurn, speakFixedText, createChunkedProducer, adoptChunkedProducer } = require('./chunkedTurn')
@@ -294,6 +294,13 @@ function registerWebSocket(fastify) {
     let legacyEarlyTtsBucket = null
     let legacyEarlyTtsPercentAtStart = null
     let legacyEarlyTtsCampaignMatched = null
+    // STT-A2 diagnostic gate (design revision 2026-08-21) — freeze ครั้งเดียวพร้อมกับตัวอื่นข้างบน same หลักการ
+    // เป๊ะ ห้ามคำนวณใหม่กลางสาย — false/null ปลอดภัยเสมอก่อนถึง 'start' event — independent จาก chunked/L2a/L2b
+    // โดยสิ้นเชิง (ไม่ผูก precedence chain ใดๆ กับสามตัวนั้นเลย ตามที่ล็อกไว้ตอน design)
+    let sttA2 = false
+    let sttA2Bucket = null
+    let sttA2PercentAtStart = null
+    let sttA2CampaignMatched = null
 
     console.log(`[WS] Connected callSid=${callSid}`)
 
@@ -667,7 +674,17 @@ function registerWebSocket(fastify) {
         legacyEarlyTtsPercentAtStart = earlyTtsConfig.percent
         legacyEarlyTts = !rollout.useChunkedStreaming && !legacyObserved && legacyEarlyTtsCampaignMatched && legacyEarlyTtsBucket < earlyTtsConfig.percent
 
-        console.log(`[Rollout] callSid=${callSid} bucket=${rollout.bucket} percent=${rollout.percentAtStart} chunked=${rollout.useChunkedStreaming} legacyObserved=${legacyObserved} legacyObservedBucket=${legacyObservedBucket} legacyObservedPercent=${observedConfig.percent} campaignMatched=${legacyObservedCampaignMatched} legacyEarlyTts=${legacyEarlyTts} legacyEarlyTtsBucket=${legacyEarlyTtsBucket} legacyEarlyTtsPercent=${earlyTtsConfig.percent} earlyTtsCampaignMatched=${legacyEarlyTtsCampaignMatched}`)
+        // STT-A2 (design revision 2026-08-21) — deliberately NOT chained with chunked/legacyObserved/legacyEarlyTts
+        // at all (unlike those three which are mutually exclusive with each other). A2 only changes what Google
+        // STT is asked for (maxAlternatives) — it can be ON simultaneously with any of the other three, or with
+        // none of them. Own bucket namespace ("stt-a2:"), own Sheet keys, own fail-closed atomic snapshot.
+        const sttA2Config = rolloutConfig.getCurrentSttA2Config()
+        sttA2Bucket = getSttA2Bucket(callSid)
+        sttA2CampaignMatched = sttA2Config.campaignId != null && session.campaign?.id === sttA2Config.campaignId
+        sttA2PercentAtStart = sttA2Config.percent
+        sttA2 = sttA2CampaignMatched && sttA2Bucket < sttA2Config.percent
+
+        console.log(`[Rollout] callSid=${callSid} bucket=${rollout.bucket} percent=${rollout.percentAtStart} chunked=${rollout.useChunkedStreaming} legacyObserved=${legacyObserved} legacyObservedBucket=${legacyObservedBucket} legacyObservedPercent=${observedConfig.percent} campaignMatched=${legacyObservedCampaignMatched} legacyEarlyTts=${legacyEarlyTts} legacyEarlyTtsBucket=${legacyEarlyTtsBucket} legacyEarlyTtsPercent=${earlyTtsConfig.percent} earlyTtsCampaignMatched=${legacyEarlyTtsCampaignMatched} sttA2=${sttA2} sttA2Bucket=${sttA2Bucket} sttA2Percent=${sttA2Config.percent} sttA2CampaignMatched=${sttA2CampaignMatched}`)
 
         // L1a: ต้องคำนวณหลัง rollout freeze แล้วเท่านั้น (ดูหมายเหตุที่ค่าคงที่ด้านบนไฟล์)
         const interimFinalizeMs = rollout.useChunkedStreaming ? STT_INTERIM_FINALIZE_MS_CHUNKED : 900
@@ -1478,6 +1495,10 @@ function registerWebSocket(fastify) {
         // Enum: disposition = DELIVERED | DROPPED | DEFERRED, reason = null | BARGE_IN_COOLDOWN | POST_MARK_ECHO |
         // SHORT_FRAGMENT_ECHO | TIER2_ACK | PENDING_TRANSCRIPT | BUSY
         //
+        // STT-A2 (design revision 2026-08-21) — `alternatives` key present only when sttMeta.alternatives is
+        // truthy (A2 ON for this utterance). Diagnostic-only: `text`/delivered transcript above always comes
+        // from alternatives[0] regardless of A2, this array is never used to select what enters conversation.
+        //
         // Review Gate round 2 amendment — DEFERRED/PENDING_TRANSCRIPT คือ disposition ณ ขณะที่ callback exit
         // เท่านั้น ไม่ใช่ final lifecycle outcome ของ transcript นั้น: ถ้า pendingTranscript ถูก latest-wins
         // แทนที่ด้วยตัวใหม่ทีหลัง (ดู 3 จุดที่ set pendingTranscript ด้านล่าง) หรือถูก bargeIn() ล้างทิ้ง ไม่มี
@@ -1503,6 +1524,8 @@ function registerWebSocket(fastify) {
               maxStability: sttMeta.maxStability,
               finalConfidence: sttMeta.finalConfidence,
               coldMutePackets: sttMeta.coldMutePackets,
+              // STT-A2 (diagnostic only): key ปรากฏเฉพาะตอน A2 มีข้อมูลจริง — non-A2 calls ต้องไม่มี key นี้เลย
+              ...(sttMeta.alternatives ? { alternatives: sttMeta.alternatives } : {}),
               text,
             })}`)
           } catch (e) {
@@ -1656,7 +1679,7 @@ function registerWebSocket(fastify) {
           if (!session) return
           if (rollout?.useChunkedStreaming) { startChunkedSpeculation(session, interimText); return }
           startPrewarm(session, interimText)
-        }, { interimFinalizeMs })
+        }, { interimFinalizeMs, maxAlternatives: sttA2 ? 3 : null })
 
         // AI ทักทายก่อนเลย — ใช้ pre-generated audio ถ้ามี (ลด latency)
         const playGreeting = async () => {

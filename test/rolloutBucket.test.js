@@ -1,6 +1,6 @@
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
-const { getRolloutBucket, decideRollout, getLegacyObservedBucket, getLegacyEarlyTtsBucket } = require('../src/utils/rolloutBucket')
+const { getRolloutBucket, decideRollout, getLegacyObservedBucket, getLegacyEarlyTtsBucket, getSttA2Bucket } = require('../src/utils/rolloutBucket')
 
 test('same callSid → bucket เดิมเสมอ ไม่ว่าจะเรียกกี่ครั้ง', () => {
   const a = getRolloutBucket('CA1234567890')
@@ -132,4 +132,39 @@ test('L2b: independent namespace จากทั้ง rollout และ legacy-
   assert.deepEqual(earlyTtsBuckets, [90, 77, 37, 22])
   const allThreeIdentical = samples.filter((_, i) => rolloutBuckets[i] === observedBuckets[i] && observedBuckets[i] === earlyTtsBuckets[i]).length
   assert.ok(allThreeIdentical < samples.length, 'ไม่ควรเห็นสาม bucket ชนกันทุกตัวอย่าง')
+})
+
+// ---------------------------------------------------------------------------
+// STT-A2 diagnostic gate — getSttA2Bucket() (design revision 2026-08-21)
+// ---------------------------------------------------------------------------
+
+test('STT-A2: getSttA2Bucket deterministic + อยู่ในช่วง 0-99', () => {
+  assert.equal(getSttA2Bucket('CA1'), getSttA2Bucket('CA1'))
+  for (let i = 0; i < 100; i++) {
+    const b = getSttA2Bucket('CA' + i)
+    assert.ok(b >= 0 && b <= 99)
+  }
+})
+
+test('STT-A2: fixed known fixtures — hash namespace "stt-a2:" ให้ค่าคงที่ตามที่คำนวณไว้ล่วงหน้า', () => {
+  assert.equal(getSttA2Bucket('CA1'), 93)
+  assert.equal(getSttA2Bucket('CA2'), 70)
+  assert.equal(getSttA2Bucket('CA3'), 6)
+})
+
+test('STT-A2: getRolloutBucket()/getLegacyObservedBucket()/getLegacyEarlyTtsBucket() เดิมต้องไม่ถูกกระทบเลย — fixture เดิมยังได้ค่าเดิมเป๊ะ', () => {
+  assert.equal(getRolloutBucket('CA1'), 8)
+  assert.equal(getLegacyObservedBucket('CA1'), 14)
+  assert.equal(getLegacyEarlyTtsBucket('CA1'), 90)
+})
+
+test('STT-A2: independent namespace จากทั้งสามตัวเดิม — bucket ของ callSid เดียวกันไม่ผูกกัน (ห้าม assert ว่าต้องต่างกันเสมอ — ชนกันได้บังเอิญ)', () => {
+  const samples = ['CA1', 'CA2', 'CA3', 'CA1234567890', 'CA160', 'CA22']
+  const a2Buckets = samples.map(getSttA2Bucket)
+  assert.deepEqual(a2Buckets, [93, 70, 6, 85, 83, 1])
+  // ยืนยันแค่ input string (hash namespace) ต่างจาก legacy-observed:/legacy-early-tts:/plain callSid จริง — ไม่ assert
+  // ว่าตัวเลขผลลัพธ์ต้องต่างกัน เพราะ %100 collision เป็นเรื่องปกติทางสถิติ
+  const rolloutBuckets = samples.map(getRolloutBucket)
+  const allIdenticalToRollout = samples.filter((_, i) => a2Buckets[i] === rolloutBuckets[i]).length
+  assert.ok(allIdenticalToRollout < samples.length, 'ไม่ควรเห็น A2 bucket ชนกับ rollout bucket ทุกตัวอย่าง')
 })

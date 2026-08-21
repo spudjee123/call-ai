@@ -83,6 +83,8 @@ beforeEach(() => {
   // L2b — reset เช่นกัน + คืน claudeConditionalImpl เป็น default (delegate ไป claudeStreamImpl)
   state.legacyEarlyTtsConfig = { percent: 0, campaignId: null }
   state.claudeConditionalImpl = null
+  // STT-A2 — reset เช่นกัน default fail-closed
+  state.sttA2Config = { percent: 0, campaignId: null }
 })
 
 // L2a exposure gate tests — campaign id คงที่ใช้ร่วมกันเพื่อจำลอง "dedicated test campaign" ตามแผน production จริง

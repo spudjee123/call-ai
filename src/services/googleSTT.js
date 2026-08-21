@@ -45,11 +45,24 @@ function isInterimRegression(previous, candidate) {
   return prevNorm.startsWith(candNorm)
 }
 
+// STT-A2 (diagnostic only, 2026-08-21): normalize Google's alternatives array into a stable shape for
+// [STT_DIAG] — never assume exactly 3 (Google may return fewer than maxAlternatives requested, or exactly 1
+// when A2 is OFF). confidence follows the same null-vs-fabricated-0 rule as STT-A1's finalConfidence — Google
+// typically only sets confidence on the top hypothesis and mainly on final results, not every alternative.
+function normalizeAlternatives(alternatives) {
+  return (alternatives || []).map((alt, index) => ({
+    index,
+    text: alt.transcript,
+    confidence: (typeof alt.confidence === 'number' && alt.confidence > 0) ? alt.confidence : null,
+    selected: index === 0,
+  }))
+}
+
 // L1a (latency optimization, rollout-scoped STT endpoint experiment): interimFinalizeMs รับจากภายนอกได้แล้ว
 // default 900ms เดิมทุกประการถ้า caller ไม่ส่งอะไรมา — googleSTT.js เป็น STT ตัวเดียวที่ legacy และ chunked
 // path ใช้ร่วมกัน เปลี่ยนค่า default ตรงๆ จะกระทบ legacy production ทุกสายทันทีโดยไม่ผูกกับ chunked rollout เลย
 // ต้องให้ audioStream.js เป็นคนตัดสินใจค่าต่อสาย (ตาม rollout ที่ freeze แล้วตอน 'start') แล้วส่งเข้ามาแทน
-function transcribeStream(onTranscript, onInterim, { interimFinalizeMs = 900 } = {}) {
+function transcribeStream(onTranscript, onInterim, { interimFinalizeMs = 900, maxAlternatives = null } = {}) {
   let destroyed = false
   let currentStream = null
   let nextStream = null
@@ -75,6 +88,10 @@ function transcribeStream(onTranscript, onInterim, { interimFinalizeMs = 900 } =
   let lastStability = null   // null = "ไม่มีค่าจริง" (0 กับ missing แยกไม่ออกใน proto3 float — ไม่ fabricate 0)
   let maxStability = null
   let coldMutePackets = 0
+  // STT-A2 (diagnostic only): snapshot ของ alternatives ที่ผูกกับ interim ที่ "ยอมรับจริง" เท่านั้น (ตัวเดียวกับ
+  // ที่ update interimText) — ต้อง update ใน branch เดียวกันเป๊ะ ไม่งั้น TIMER_FINAL อาจ deliver alternatives ของ
+  // interim ที่ถูก regression reject ไปแล้วแทนที่จะเป็นของ interimText จริงที่ deliver ออกไป
+  let acceptedAlternatives = null
   // เดิม 1500ms — วัดจาก log จริงพบว่า Google isFinal แทบไม่เคยมาทัน ต้องพึ่ง timer นี้ตัดสินใจแทบทุกครั้ง
   // ทำให้ลูกค้าต้องรอเงียบเต็ม 1.5 วิทุกรอบก่อน AI จะเริ่มคิดคำตอบด้วยซ้ำ ลดลงมาก่อนเป็นค่าที่ยังกันลูกค้าหยุดคิดกลางประโยคได้
   const INTERIM_FINALIZE_MS = interimFinalizeMs
@@ -100,6 +117,7 @@ function transcribeStream(onTranscript, onInterim, { interimFinalizeMs = 900 } =
     lastStability = null
     maxStability = null
     coldMutePackets = 0
+    acceptedAlternatives = null
   }
 
   function activatePrewarm() {
@@ -145,8 +163,14 @@ function transcribeStream(onTranscript, onInterim, { interimFinalizeMs = 900 } =
 
     const thisStreamId = ++streamIdCounter // STT-A1: monotonic per-call, ครอบคลุมทั้ง prewarm และ non-prewarm
 
+    // STT-A2 (diagnostic only): เมื่อ OFF (maxAlternatives ไม่ใช่ number > 1) ส่ง STT_CONFIG object เดิมตรงๆ
+    // ไม่ spread เลยแม้แต่ key เดียว — request shape ต้องเหมือน production เดิมทุกบิตตอน A2 ปิดอยู่
+    const recognitionConfig = (typeof maxAlternatives === 'number' && maxAlternatives > 1)
+      ? { ...STT_CONFIG, maxAlternatives }
+      : STT_CONFIG
+
     const stream = client.streamingRecognize({
-      config: STT_CONFIG,
+      config: recognitionConfig,
       interimResults: true,
       singleUtterance: true,
     })
@@ -222,6 +246,11 @@ function transcribeStream(onTranscript, onInterim, { interimFinalizeMs = 900 } =
           regressionCount++
         } else {
           interimText = text
+          // STT-A2: update เฉพาะ branch เดียวกันนี้เป๊ะ ที่ update interimText — กัน TIMER_FINAL หยิบ alternatives
+          // ของ interim ที่เพิ่ง regression-reject ไปแทนที่จะเป็นของ interimText จริงที่กำลังจะ deliver
+          if (typeof maxAlternatives === 'number' && maxAlternatives > 1) {
+            acceptedAlternatives = normalizeAlternatives(result.alternatives)
+          }
         }
 
         if (!nextStream && !destroyed) createStream(true)
@@ -248,6 +277,7 @@ function transcribeStream(onTranscript, onInterim, { interimFinalizeMs = 900 } =
               maxStability,
               finalConfidence: null, // TIMER_FINAL คือการตัดสินใจของเราเอง ไม่ใช่ final ที่ Google ส่ง confidence มาด้วย
               coldMutePackets,
+              alternatives: acceptedAlternatives, // STT-A2: snapshot ที่ผูกกับ interimText นี้เป๊ะ (null เมื่อ A2 OFF)
             })
             rotateForNextUtterance() // ต้องอยู่ท้ายสุดเสมอ (ดูหมายเหตุที่ rotateForNextUtterance ด้านบน)
           }
@@ -282,6 +312,9 @@ function transcribeStream(onTranscript, onInterim, { interimFinalizeMs = 900 } =
             maxStability,
             finalConfidence: (typeof rawConfidence === 'number' && rawConfidence > 0) ? rawConfidence : null,
             coldMutePackets,
+            // STT-A2: final event ของ Google เอง ใช้ alternatives ของ final result นั้นตรงๆ ไม่ผ่าน acceptedAlternatives
+            // (ไม่มี regression concept ฝั่ง final — result นี้คือ candidate ที่ Google ยืนยันแล้ว)
+            alternatives: (typeof maxAlternatives === 'number' && maxAlternatives > 1) ? normalizeAlternatives(result.alternatives) : null,
           })
         } else {
           console.log('[STT] Final result but empty transcript')
