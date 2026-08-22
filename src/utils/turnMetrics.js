@@ -78,6 +78,22 @@ function createTurnMetrics({
     // (turnState.audioCommitted) ก่อนที่ Claude tail จะ timeout/error ห้าม fabricate recovery/replay ทับเสียงที่
     // พูดไปแล้ว — ต้องแยกให้วิเคราะห์ทีหลังรู้ว่า "ไม่มีคำตอบเลย" กับ "มีคำตอบบางส่วนแล้วท้ายพัง" เป็นคนละเคสกัน
     legacyEarlyTtsOutcome: null,
+    // Track L (diagnostic only, design revision 2026-08-22, Design Gate R3 PASS) — request/response size
+    // telemetry for the L2b fresh-Claude-request path only (askClaudeConditionalStream()), prefixed l2b*
+    // deliberately so a future reader of [Metrics] never mistakes these for applying to every Claude path.
+    // Computed inside claude.js itself from the EXACT post-slice(-MAX_HISTORY) `history`/`systemPrompt` this
+    // request actually sends — never from audioStream.js's own copy of session.messages, which would
+    // over-count once a conversation exceeds MAX_HISTORY. null means "not measured" (out of scope, or the
+    // content at that point wasn't a string) — never fabricated as 0, since 0 and "unmeasurable" mean very
+    // different things for a size-vs-latency correlation analysis. No safeBoundaryDelayMs here on purpose —
+    // it would be byte-for-byte identical to the existing chunkDelay (duration(t3,t4) above), since L2b maps
+    // the same firstDeltaAt/firstSafeAt milestones to t3/t4.
+    l2bSystemPromptCharCount: null,
+    l2bPriorHistoryCharCount: null,
+    l2bRequestMessageCount: null,
+    l2bCurrentUserCharCount: null,
+    l2bApproxInputTextCharCount: null,
+    l2bResponseCharCount: null, // from Claude's own finalText.length, captured before audioStream.js can substitute/append anything (recovery phrase, END_CALL follow-up)
   }
 }
 

@@ -2471,6 +2471,13 @@ test('L2b precedence (required criterion 4): chunked=true → legacyEarlyTts=fal
   assert.equal(metrics.path, 'chunked')
   assert.equal(metrics.legacyEarlyTts, false)
   assert.equal(metrics.legacyEarlyTtsOutcome, null)
+  // Track L — chunked path ไม่เคยเรียก askClaudeConditionalStream เลย ต้องไม่มี l2b* field ไหนถูก populate
+  assert.equal(metrics.l2bSystemPromptCharCount, null)
+  assert.equal(metrics.l2bPriorHistoryCharCount, null)
+  assert.equal(metrics.l2bRequestMessageCount, null)
+  assert.equal(metrics.l2bCurrentUserCharCount, null)
+  assert.equal(metrics.l2bApproxInputTextCharCount, null)
+  assert.equal(metrics.l2bResponseCharCount, null)
   harness.disconnect(socket)
 })
 
@@ -2486,6 +2493,13 @@ test('L2b precedence (required criterion 4): legacyObserved=true → legacyEarly
   assert.equal(metrics.legacyEarlyTtsCampaignMatched, true, 'earlyTts campaign match เองต้องผ่าน (พิสูจน์ว่า precedence เป็นตัวบังคับจริง ไม่ใช่แค่บังเอิญ campaign ไม่ตรง)')
   assert.equal(metrics.legacyEarlyTts, false, 'legacyObserved ต้อง win แม้ legacyEarlyTts เองจะ qualify')
   assert.equal(metrics.legacyEarlyTtsOutcome, null)
+  // Track L — legacyObserved path ก็ไม่เคยเรียก askClaudeConditionalStream เช่นกัน ต้องไม่มี l2b* field ไหนถูก populate
+  assert.equal(metrics.l2bSystemPromptCharCount, null)
+  assert.equal(metrics.l2bPriorHistoryCharCount, null)
+  assert.equal(metrics.l2bRequestMessageCount, null)
+  assert.equal(metrics.l2bCurrentUserCharCount, null)
+  assert.equal(metrics.l2bApproxInputTextCharCount, null)
+  assert.equal(metrics.l2bResponseCharCount, null)
   harness.disconnect(socket)
 })
 
@@ -2499,6 +2513,70 @@ test('L2b precedence (required criterion 4): chunked=false, legacyObserved=false
   assert.equal(metrics.legacyObserved, false)
   assert.equal(metrics.legacyEarlyTts, true)
   assert.equal(metrics.legacyEarlyTtsOutcome, 'COMPLETED')
+  harness.disconnect(socket)
+})
+
+// ===== Track L — Claude request/response size diagnostics wiring (design locked 2026-08-22, R3) =====
+// Track L's actual computation (inputStats/responseCharCount) is proven against real claude.js in
+// test/claudeConditional.test.js — this section proves only the consumer-side wiring: onEarlyTtsMilestone
+// ใน audioStream.js ต้อง map ค่าที่ milestone ส่งมาเข้า turnMetrics.l2b* ให้ตรงเป๊ะ และ malformed payload ต้อง
+// fail-safe เป็น null โดยไม่กระทบ [Metrics] log ส่วนที่เหลือ
+
+test('Track L wiring: onMilestone("inputStats", {...}) และ ("responseCharCount", N) ต้อง map เข้า turnMetrics.l2b* ตรงเป๊ะใน [Metrics] log', async () => {
+  const callSid = 'CA_L2B_TRACKL_WIRING'
+  harness.getState().legacyEarlyTtsConfig = { percent: 100, campaignId: L2B_CAMPAIGN_ID }
+  const { socket, state } = await connectPastGreeting(callSid, { rolloutPercent: 0, sessionOverrides: { campaign: l2bCampaign() } })
+  state.claudeConditionalImpl = (sess, signal, onMilestone) => (async function* () {
+    onMilestone?.('requestAt', Date.now())
+    onMilestone?.('inputStats', {
+      systemPromptCharCount: 321,
+      priorHistoryCharCount: 45,
+      requestMessageCount: 7,
+      currentUserCharCount: 12,
+      approxInputTextCharCount: 378,
+    })
+    onMilestone?.('mode', 'SINGLE_SHOT')
+    yield 'คำตอบทดสอบ'
+    onMilestone?.('fullAt', Date.now())
+    onMilestone?.('finalText', 'คำตอบทดสอบ')
+    onMilestone?.('responseCharCount', 'คำตอบทดสอบ'.length)
+    onMilestone?.('endCallRequested', false)
+  })()
+
+  const metrics = await captureMetrics(() => harness.sendFinalTranscript('ทดสอบ'))
+
+  assert.equal(metrics.l2bSystemPromptCharCount, 321)
+  assert.equal(metrics.l2bPriorHistoryCharCount, 45)
+  assert.equal(metrics.l2bRequestMessageCount, 7)
+  assert.equal(metrics.l2bCurrentUserCharCount, 12)
+  assert.equal(metrics.l2bApproxInputTextCharCount, 378)
+  assert.equal(metrics.l2bResponseCharCount, 'คำตอบทดสอบ'.length)
+  harness.disconnect(socket)
+})
+
+test('Track L wiring: inputStats(null) จาก producer (เช่น computation ฝั่ง claude.js throw) → ทุก l2b* field เป็น null ไม่กระทบ [Metrics] log ส่วนอื่น', async () => {
+  const callSid = 'CA_L2B_TRACKL_NULL_INPUTSTATS'
+  harness.getState().legacyEarlyTtsConfig = { percent: 100, campaignId: L2B_CAMPAIGN_ID }
+  const { socket, state } = await connectPastGreeting(callSid, { rolloutPercent: 0, sessionOverrides: { campaign: l2bCampaign() } })
+  state.claudeConditionalImpl = (sess, signal, onMilestone) => (async function* () {
+    onMilestone?.('requestAt', Date.now())
+    onMilestone?.('inputStats', null)
+    onMilestone?.('mode', 'SINGLE_SHOT')
+    yield 'คำตอบทดสอบ'
+    onMilestone?.('fullAt', Date.now())
+    onMilestone?.('finalText', 'คำตอบทดสอบ')
+    onMilestone?.('endCallRequested', false)
+  })()
+
+  const metrics = await captureMetrics(() => harness.sendFinalTranscript('ทดสอบ'))
+
+  assert.equal(metrics.l2bSystemPromptCharCount, null)
+  assert.equal(metrics.l2bPriorHistoryCharCount, null)
+  assert.equal(metrics.l2bRequestMessageCount, null)
+  assert.equal(metrics.l2bCurrentUserCharCount, null)
+  assert.equal(metrics.l2bApproxInputTextCharCount, null)
+  assert.equal(metrics.l2bResponseCharCount, null, 'ไม่มี responseCharCount milestone ยิงเลยในเทสนี้ ต้องเหลือ default null')
+  assert.equal(metrics.legacyEarlyTtsOutcome, 'COMPLETED', 'inputStats(null) ต้องไม่กระทบ path การันตี turn อื่นๆ เลย')
   harness.disconnect(socket)
 })
 

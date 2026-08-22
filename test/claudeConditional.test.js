@@ -405,3 +405,143 @@ test('grace boundary: abort ก่อนถึง 150ms (หลัง first-safe
     mock.timers.reset()
   }
 })
+
+// ---------------------------------------------------------------------------
+// Track L (design revision 2026-08-22, Design Gate R3 PASS) — request/response size telemetry, diagnostic
+// only. Computed from the EXACT post-slice(-MAX_HISTORY) `history`/`systemPrompt` this request sends —
+// never from a caller-side copy of the full session. Must never affect the real Claude request/response.
+// ---------------------------------------------------------------------------
+
+function makeMultiMessageSession(messages, scriptOverride) {
+  return { name: 'ทดสอบ', campaign: { script: scriptOverride ?? 'สคริปต์ทดสอบ' }, messages }
+}
+
+test('Track L inputStats: turn ปกติ — ค่าตรงกับ history/systemPrompt ที่ request จริงใช้เป๊ะ', async () => {
+  const messages = [
+    { role: 'user', content: 'สวัสดีครับ' },
+    { role: 'assistant', content: 'สวัสดีค่ะ ยินดีให้บริการค่ะ' },
+    { role: 'user', content: 'สนใจโปรโมชั่นครับ' },
+  ]
+  const { events, onMilestone } = makeMilestoneRecorder()
+  await collect(askClaudeConditionalStream(makeMultiMessageSession(messages), null, onMilestone))
+
+  const inputStats = events.find(e => e.key === 'inputStats')?.value
+  assert.ok(inputStats, 'ต้องมี inputStats milestone จริง')
+  assert.equal(inputStats.requestMessageCount, 3, 'ยังไม่เกิน MAX_HISTORY — ต้องได้ทั้ง 3 ข้อความ')
+  assert.equal(inputStats.currentUserCharCount, 'สนใจโปรโมชั่นครับ'.length, 'current user ต้องเป็นข้อความสุดท้าย')
+  const expectedPriorChars = 'สวัสดีครับ'.length + 'สวัสดีค่ะ ยินดีให้บริการค่ะ'.length
+  assert.equal(inputStats.priorHistoryCharCount, expectedPriorChars, 'prior history ต้องไม่รวม current user (ข้อความสุดท้าย)')
+  assert.ok(typeof inputStats.systemPromptCharCount === 'number' && inputStats.systemPromptCharCount > 0, 'systemPromptCharCount ต้องเป็นตัวเลขจริง ไม่ null (มาจาก buildSystemPrompt() เสมอ)')
+  assert.equal(
+    inputStats.approxInputTextCharCount,
+    inputStats.systemPromptCharCount + inputStats.priorHistoryCharCount + inputStats.currentUserCharCount,
+    'approx ต้องเป็นผลรวมของ 3 ตัวเป๊ะ'
+  )
+})
+
+test('Track L inputStats: MAX_HISTORY truncation semantic — 21 ข้อความ, message[0] ยาวผิดปกติ ต้องไม่ถูกนับเลย ไม่ใช่แค่ count=20', async () => {
+  const veryLongFirstMessage = 'ก'.repeat(5000) // ยาวผิดปกติมาก ถ้าหลุดรอดมานับด้วยจะเห็นชัดทันที
+  const messages = [{ role: 'user', content: veryLongFirstMessage }]
+  for (let i = 0; i < 20; i++) {
+    messages.push({ role: i % 2 === 0 ? 'assistant' : 'user', content: `ข้อความที่ ${i}` })
+  }
+  // รวม 21 ข้อความ (1 ยาวผิดปกติ + 20 ปกติ) — ตัวสุดท้ายต้องเป็น user เพื่อให้ history ไม่ว่าง
+  if (messages[messages.length - 1].role !== 'user') messages.push({ role: 'user', content: 'ข้อความสุดท้าย' })
+
+  const { events, onMilestone } = makeMilestoneRecorder()
+  await collect(askClaudeConditionalStream(makeMultiMessageSession(messages), null, onMilestone))
+
+  const inputStats = events.find(e => e.key === 'inputStats')?.value
+  assert.equal(inputStats.requestMessageCount, 20, 'MAX_HISTORY=20 — ต้อง cap ที่ 20 เป๊ะ')
+  // ยืนยันว่า message[0] (5000 ตัวอักษร) ไม่ได้ถูกนับเลย — ถ้าหลุดรอดมา priorHistoryCharCount จะเกิน 5000 แน่นอน
+  assert.ok(inputStats.priorHistoryCharCount < 5000, `message[0] (5000 ตัวอักษร) ต้องไม่ถูกนับ ได้จริง priorHistoryCharCount=${inputStats.priorHistoryCharCount}`)
+})
+
+test('Track L inputStats: null-propagation policy — prior message ที่ content ไม่ใช่ string ทำให้ priorHistoryCharCount/approxInputTextCharCount เป็น null ทั้งคู่ ไม่ใช่ partial sum', async () => {
+  const messages = [
+    { role: 'user', content: 'ข้อความแรกปกติ' },
+    { role: 'assistant', content: { unexpected: 'shape' } }, // content ไม่ใช่ string โดยตั้งใจ
+    { role: 'user', content: 'ข้อความสุดท้ายปกติ' },
+  ]
+  const { events, onMilestone } = makeMilestoneRecorder()
+  await collect(askClaudeConditionalStream(makeMultiMessageSession(messages), null, onMilestone))
+
+  const inputStats = events.find(e => e.key === 'inputStats')?.value
+  assert.equal(inputStats.priorHistoryCharCount, null, 'มี message วัดไม่ได้แม้แต่ตัวเดียวใน prior history ต้อง null ทั้งก้อน ไม่ partial sum')
+  assert.equal(inputStats.approxInputTextCharCount, null, 'ต้อง null ตามไปด้วย เพราะพึ่ง priorHistoryCharCount')
+  // field อื่นที่ไม่ได้พึ่ง prior history ต้องยังใช้ได้ปกติ ไม่ถูกดึงลงไปเป็น null ไปด้วย
+  assert.equal(inputStats.currentUserCharCount, 'ข้อความสุดท้ายปกติ'.length)
+  assert.equal(inputStats.requestMessageCount, 3)
+  assert.ok(typeof inputStats.systemPromptCharCount === 'number')
+})
+
+test('Track L responseCharCount: ตรงกับ finalText.length เป๊ะ (SINGLE_SHOT)', async () => {
+  state.events = [textDelta('คำตอบสั้นๆ')]
+  const { events, onMilestone } = makeMilestoneRecorder()
+  await collect(askClaudeConditionalStream(makeSession(), null, onMilestone))
+
+  const finalText = events.find(e => e.key === 'finalText')?.value
+  const responseCharCount = events.find(e => e.key === 'responseCharCount')?.value
+  assert.equal(responseCharCount, finalText.length)
+})
+
+test('Track L responseCharCount: ตรงกับ finalText.length เป๊ะ (CHUNKED)', async () => {
+  const delaysMs = [0, 250]
+  state.streamImpl = (events, signal) => makeSlowFakeStream(events, delaysMs, signal)
+  state.events = [textDelta('ประโยคแรกครับ. '), textDelta('ประโยคสองยาวกว่านี้หน่อย.')]
+  const { events, onMilestone } = makeMilestoneRecorder()
+  await collect(askClaudeConditionalStream(makeSession(), null, onMilestone))
+
+  const finalText = events.find(e => e.key === 'finalText')?.value
+  const responseCharCount = events.find(e => e.key === 'responseCharCount')?.value
+  assert.equal(responseCharCount, finalText.length, 'responseCharCount ต้องมาจาก rawText/finalText เดียวกัน ไม่ใช่การรวม chunk ที่ yield ออกไป')
+})
+
+test('Track L computation-throw: prior history มี message ที่ผิดรูปแบบ (ไม่ใช่ object) จนทำให้ charLen() คำนวณพัง → outer catch จับได้ ยิง inputStats(null) แทน ไม่ throw ทะลุออกไปกระทบ request จริง', async () => {
+  // fixture design (verified against source ก่อนเขียนเทส): history=[valid, null, valid] — cachedMsgs.map()
+  // (บรรทัดก่อน Track L block) เข้าถึง m.role/m.content เฉพาะ index สุดท้ายเท่านั้น (`i === history.length-1
+  // ? {...} : m`), ตัวกลางที่เป็น null จึงผ่าน cachedMsgs ไปได้แบบ pass-through ไม่ throw ที่นั่น — การ throw จริง
+  // จึงเกิดครั้งแรกที่ Track L เอง ใน `priorMessages.map(m => charLen(m.content))` (m.content บน null throw
+  // TypeError ก่อน charLen() จะถูกเรียกด้วยซ้ำ) ซึ่งอยู่ใน outer try ของ Track L พอดี — ไม่ใช่ throw จาก
+  // existing request-preparation code ก่อนหน้า
+  const messages = [
+    { role: 'user', content: 'ข้อความปกติ' },
+    null, // ผิดรูปแบบโดยตั้งใจ — อยู่ไม่ใช่ index สุดท้าย จึงไม่โดน cachedMsgs.map() แตะเลย
+    { role: 'user', content: 'ข้อความสุดท้ายปกติ' },
+  ]
+  state.events = [textDelta('คำตอบทดสอบครับ')] // ไม่มี boundary char → SINGLE_SHOT ยิงเต็มก้อนครั้งเดียวตอนจบ ให้เช็ค output จริงได้
+
+  const { events, onMilestone } = makeMilestoneRecorder()
+  const chunks = await collect(askClaudeConditionalStream(makeMultiMessageSession(messages), null, onMilestone))
+
+  // (1) outer catch ถูก execute จริง — พิสูจน์ผ่านค่า: ทาง non-throw ปกติ onMilestone('inputStats', {...}) ส่ง
+  // OBJECT เสมอ (ดูเทส "turn ปกติ"/"null-propagation" — .value เป็น object ที่ field ข้างในอาจ null แต่ตัว value
+  // เองไม่ใช่ null) มีแค่บรรทัด `onMilestone?.('inputStats', null)` ใน catch(e) เท่านั้นที่ส่ง bare null ตรงๆ
+  // ดังนั้น .value===null (ไม่ใช่ object ที่มี field null) คือลายเซ็นเฉพาะของ outer catch เท่านั้น แยกออกจาก
+  // null-propagation policy (ซึ่งให้ value เป็น object เสมอ) ได้ชัดเจนไม่กำกวม
+  const inputStatsEvents = events.filter(e => e.key === 'inputStats')
+  assert.equal(inputStatsEvents.length, 1, 'ต้องยิง inputStats แค่ครั้งเดียว (จาก outer catch fallback) ไม่ใช่ยิงซ้ำหรือไม่ยิงเลย')
+  assert.equal(inputStatsEvents[0].value, null, 'ต้องเป็น bare null ตรงๆ (ลายเซ็นเฉพาะของ catch(e) branch) ไม่ใช่ object ที่มี field ข้างในเป็น null')
+
+  // (2) Claude request ยังเกิดจริง (ไม่ได้ short-circuit ออกไปก่อนถึง requestAt)
+  assert.ok(events.some(e => e.key === 'requestAt'), 'ต้องเห็น requestAt milestone แปลว่า request ไปต่อหลัง outer catch จับได้แล้วจริง')
+
+  // (3) stream สำเร็จปกติ ได้ finalText ตรงกับที่ fake stream ส่งมา ไม่ถูกทำให้พังหรือ corrupt จาก computation ที่ throw
+  const finalTextEvent = events.find(e => e.key === 'finalText')
+  assert.equal(finalTextEvent?.value, 'คำตอบทดสอบครับ')
+
+  // (4) yield ออกไปถึง caller จริง ไม่ค้าง ไม่ throw ทะลุออกมาจาก generator
+  assert.deepEqual(chunks, ['คำตอบทดสอบครับ'])
+})
+
+test('Track L throw-protection: onMilestone throw บน inputStats และ responseCharCount แยกกัน → stream ยังจบปกติ ไม่กระทบ chunk ที่ได้', async () => {
+  state.events = [textDelta('คำตอบปกติ')]
+  let inputStatsThrew = false, responseCharCountThrew = false
+  const throwingMilestone = (key, value) => {
+    if (key === 'inputStats') { inputStatsThrew = true; throw new Error('boom inputStats') }
+    if (key === 'responseCharCount') { responseCharCountThrew = true; throw new Error('boom responseCharCount') }
+  }
+  const chunks = await collect(askClaudeConditionalStream(makeSession(), null, throwingMilestone))
+  assert.deepEqual(chunks, ['คำตอบปกติ'], 'chunk ที่ได้ต้องไม่กระทบแม้ callback จะ throw ทั้งสองจุด')
+  assert.ok(inputStatsThrew && responseCharCountThrew, 'ต้องยืนยันว่า callback throw จริงทั้งสองจุด ไม่ใช่ไม่เคยถูกเรียก')
+})

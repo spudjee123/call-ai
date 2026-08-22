@@ -463,6 +463,44 @@ async function* askClaudeConditionalStream(session, signal = null, onMilestone =
       : m
   )
 
+  // Track L (diagnostic only, design revision 2026-08-22, Design Gate R3 PASS) — computed from the EXACT
+  // `history`/`systemPrompt` this request sends (post-slice(-MAX_HISTORY), same objects cachedMsgs is built
+  // from — verified cachedMsgs never transforms the .content TEXT VALUE itself, only re-wraps the last
+  // message into Anthropic's content-block array shape, so counting from `history` directly here is accurate
+  // for actual text; only structural/JSON overhead is excluded, which is exactly what "Approx" signals).
+  // Strictly typed: non-string content produces null for that count, never a fabricated 0 — and ANY
+  // unmeasurable message in prior history poisons the whole priorHistoryCharCount/approxInputTextCharCount
+  // to null rather than a partial sum that looks complete but silently has a gap.
+  // Both computation AND emission are wrapped in try/catch — this is a NEW milestone with more payload
+  // surface area than the existing scalar ones, and nothing upstream (onEarlyTtsMilestone/wrappedMilestone
+  // in audioStream.js) currently guards against a throwing callback, so the guard has to live here.
+  try {
+    const charLen = (c) => typeof c === 'string' ? c.length : null
+
+    const priorMessages = history.slice(0, -1)
+    const priorLens = priorMessages.map(m => charLen(m.content))
+    const priorHistoryCharCount = priorLens.some(l => l === null) ? null : priorLens.reduce((a, b) => a + b, 0)
+
+    const currentUserCharCount = charLen(history[history.length - 1].content)
+
+    const approxInputTextCharCount =
+      (priorHistoryCharCount === null || currentUserCharCount === null)
+        ? null
+        : systemPrompt.length + priorHistoryCharCount + currentUserCharCount
+
+    try {
+      onMilestone?.('inputStats', {
+        systemPromptCharCount: systemPrompt.length,
+        priorHistoryCharCount,
+        requestMessageCount: history.length,
+        currentUserCharCount,
+        approxInputTextCharCount,
+      })
+    } catch (_) { /* diagnostic only — must never affect the real request below */ }
+  } catch (e) {
+    try { onMilestone?.('inputStats', null) } catch (_) { /* diagnostic only */ }
+  }
+
   const requestAt = performance.now()
   onMilestone?.('requestAt', requestAt)
 
@@ -631,6 +669,10 @@ async function* askClaudeConditionalStream(session, signal = null, onMilestone =
       const finalText = rawText.replace(/\[END_CALL\]/g, '').trim()
       const endCallRequested = rawText.includes('[END_CALL]')
       onMilestone?.('finalText', finalText)
+      // Track L — Claude's own canonical response length, captured here (before audioStream.js can ever
+      // substitute a recovery phrase or append an END_CALL follow-up) so it reflects what the model actually
+      // produced, not what ends up spoken. Guarded independently — see the inputStats block above for why.
+      try { onMilestone?.('responseCharCount', finalText.length) } catch (_) { /* diagnostic only */ }
       onMilestone?.('endCallRequested', endCallRequested)
 
       if (mode === 'CHUNKED') {

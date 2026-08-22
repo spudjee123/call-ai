@@ -1351,6 +1351,25 @@ function registerWebSocket(fastify) {
                       // as legacy's existing fullText push, not earlier.
                       else if (key === 'finalText') canonicalFinalText = value
                       else if (key === 'endCallRequested') endCallRequestedResult = value
+                      // Track L (diagnostic only, design revision 2026-08-22, Design Gate R3 PASS) — object
+                      // payload, handled separately from the scalar fieldMap above. Wrapped in its own
+                      // try/catch (second independent guard, alongside the one already in claude.js around
+                      // the emission itself) so a malformed payload here can never affect turnMetrics beyond
+                      // these 5 fields, let alone propagate back into the Claude streaming loop.
+                      else if (key === 'inputStats') {
+                        try {
+                          if (value && typeof value === 'object') {
+                            turnMetrics.l2bSystemPromptCharCount = value.systemPromptCharCount ?? null
+                            turnMetrics.l2bPriorHistoryCharCount = value.priorHistoryCharCount ?? null
+                            turnMetrics.l2bRequestMessageCount = value.requestMessageCount ?? null
+                            turnMetrics.l2bCurrentUserCharCount = value.currentUserCharCount ?? null
+                            turnMetrics.l2bApproxInputTextCharCount = value.approxInputTextCharCount ?? null
+                          }
+                        } catch (_) { /* diagnostic only — leave fields at their null default */ }
+                      }
+                      else if (key === 'responseCharCount') {
+                        turnMetrics.l2bResponseCharCount = typeof value === 'number' ? value : null
+                      }
                       // Design review round 4 — Claude finishing (fullAt) must disarm the 6000ms watchdog.
                       // Without this, the SAME window also covers however long the tail TTS chunk(s) take
                       // after Claude is already fully done, so a slow-but-healthy ElevenLabs response could
