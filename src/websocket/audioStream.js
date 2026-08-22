@@ -272,6 +272,19 @@ function registerWebSocket(fastify) {
     let prewarmAbort = null      // AbortController for prewarm call
     let prewarmStartedAt = 0     // performance.now() ตอนเริ่ม request จริง — สำหรับ telemetry (prewarmAgeMs), คนละตัวกับ prewarmRetriggerAt (Date.now()-based throttle)
     let prewarmRetriggerAt = 0   // เวลาต่ำสุดที่อนุญาตเดาใหม่รอบถัดไป (throttle กันยิง Claude ถี่เกิน)
+    // Track P Prewarm Diagnostics (design revision 2026-08-22, Design Review R3 PASS) — diagnostic-only,
+    // ungated, legacy-prewarm-only (chunked never calls startPrewarm() at all, see onInterim below — this
+    // stays structurally null for every chunked call, no extra guard needed there). NOT reset by
+    // clearPrewarm() — that function is transport cleanup only, called mid-lifecycle on every retrigger (see
+    // startPrewarm() below), so diagnostic state has to live entirely separate from it or every retrigger
+    // would wipe retriggerCount/initialTriggerAt right when we want them to accumulate. See settlePrewarmDiag()
+    // for the only place this is ever settled/reset — { prewarmDiagId, initialTriggerAt, initialTriggerText,
+    // retriggerCount, settled, currentAttempt: { triggerAt, triggerText, settledAt, resultState } } while
+    // active; currentAttempt is a FRESH object every real (re)trigger, never mutated across retriggers — that
+    // per-attempt reference (not the outer lifecycle object) is what a superseded async attempt's identity
+    // guard checks against.
+    let prewarmDiag = null
+    let prewarmDiagIdCounter = 0   // connection-scoped, increments once per NEW lifecycle (not per retrigger)
     // L1b — chunked speculative prewarm: คนละ mechanism จาก prewarmPromise ข้างบน (Promise<string|null> เดิม
     // เป็นของ legacy เท่านั้น) ไม่แชร์ clock/state กันเลยแม้ในทางปฏิบัติสายหนึ่งจะใช้แค่ทางใดทางหนึ่งเสมอ (rollout
     // freeze ครั้งเดียวต่อสาย) — แยกไว้ชัดเจนกันความสับสน/regression ในอนาคตหากมีคนแก้แค่ฝั่งเดียว
@@ -337,6 +350,7 @@ function registerWebSocket(fastify) {
       if (currentSession) currentSession.hangupReason = 'max_duration'
 
       clearSilenceTimer()
+      if (prewarmDiag) settlePrewarmDiag(prewarmDiag, 'CALL_ENDED') // Track P: settle before transport cleanup below
       clearPrewarm()
       abortChunkedSpeculation()
       if (greetingAbortController) { greetingAbortController.abort(); greetingAbortController = null }
@@ -377,6 +391,22 @@ function registerWebSocket(fastify) {
       return n >= 2 && a.substring(0, n) === b.substring(0, n)
     }
 
+    // Track P (design revision 2026-08-22, Design Review R3 PASS) — diagnostic-only relation classifier
+    // between the last prewarm attempt's trigger text and the actual final transcript. Deliberately a
+    // SEPARATE function from isPrewarmUsable() above — never called from it, never referenced by the
+    // production decision at all — mirrors isPrewarmUsable()'s exact two-branch structure (EXACT is a named
+    // special-case of the first branch) so its output is directly comparable to what production actually
+    // decided, without being able to influence it.
+    function classifyPrewarmTextRelation(prewarmText, finalText) {
+      if (!prewarmText || !finalText) return 'MISMATCH'
+      const a = prewarmText.trim(), b = finalText.trim()
+      if (a === b) return 'EXACT'
+      if (a.length >= 2 && (b.includes(a) || a.includes(b))) return 'CONTAINS'
+      const n = Math.min(4, a.length, b.length)
+      if (n >= 2 && a.substring(0, n) === b.substring(0, n)) return 'PREFIX_HEAD'
+      return 'MISMATCH'
+    }
+
     // Adaptive re-trigger: ถ้าลูกค้าพูดยาวกว่าที่เดาไว้พอสมควร ยกเลิกคำเดาเก่าแล้วเดาใหม่จากข้อความล่าสุด
     // เดาแค่ครั้งเดียวตอนแรกมักพลาดเวลาลูกค้าพูดยาวกว่านั้น (isPrewarmUsable ปฏิเสธ ต้องเริ่มนับ latency ใหม่ทั้งหมด)
     //
@@ -404,23 +434,60 @@ function registerWebSocket(fastify) {
         clearPrewarm()
       }
       prewarmRetriggerAt = Date.now() + 700
-      prewarmStartedAt = performance.now()
+      // Track P: one capture reused for prewarmStartedAt AND the diagnostic trigger timestamps below — never
+      // call performance.now() a second time to fabricate an "equivalent" moment for the same real event.
+      const startedAt = performance.now()
+      prewarmStartedAt = startedAt
       prewarmStartText = interimText
       prewarmAbort = new AbortController()
       const signal = prewarmAbort.signal
       const snap = { ...session, messages: [...session.messages, { role: 'user', content: interimText }] }
       console.log(`[Prewarm] Starting for: "${interimText}"`)
+
+      // Track P — diagnostic-only lifecycle/per-attempt state. currentAttempt is a FRESH object every real
+      // trigger (first trigger and every retrigger alike), never mutated across retriggers — a superseded
+      // attempt's captured `myAttempt` reference stops matching `prewarmDiag.currentAttempt` the instant a
+      // retrigger replaces it, regardless of clearTimeout/abort timing (same identity-binding lesson as
+      // A2.1's settleShadow fix — checking the outer object's identity alone is not enough when the outer
+      // object gets mutated in place across retriggers rather than replaced).
+      if (!prewarmDiag) {
+        prewarmDiag = {
+          prewarmDiagId: ++prewarmDiagIdCounter,
+          initialTriggerAt: startedAt,
+          initialTriggerText: interimText,
+          retriggerCount: 0,
+          settled: false,
+          currentAttempt: null,
+        }
+      } else {
+        prewarmDiag.retriggerCount++
+      }
+      prewarmDiag.currentAttempt = { triggerAt: startedAt, triggerText: interimText, settledAt: null, resultState: 'PENDING' }
+      const myLifecycle = prewarmDiag
+      const myAttempt = prewarmDiag.currentAttempt
+      const settleAttempt = (resultState) => {
+        if (prewarmDiag === myLifecycle && prewarmDiag.currentAttempt === myAttempt) {
+          myAttempt.resultState = resultState
+          myAttempt.settledAt = performance.now()
+        }
+      }
+
       prewarmPromise = (async () => {
         try {
           let text = ''
           for await (const chunk of askClaudeStream(snap, false, signal)) {
-            if (signal.aborted) return null
+            // Track P: this is a real, distinct exit from the IIFE — bypasses the catch block entirely, so
+            // it needs its own settleAttempt() call (askClaudeStream() is blocking/full-response, not delta
+            // streaming, so this loop body runs at most once — still a genuine terminal path in its own right)
+            if (signal.aborted) { settleAttempt('SETTLED_NULL'); return null }
             text += (text ? ' ' : '') + chunk
           }
           if (text) console.log(`[Prewarm] Ready: "${text.substring(0, 60)}"`)
+          settleAttempt(text ? 'READY_TEXT' : 'SETTLED_NULL')
           return text || null
         } catch (err) {
           if (err.name !== 'AbortError') console.error('[Prewarm] Error:', err.message)
+          settleAttempt('SETTLED_NULL')
           return null
         }
       })()
@@ -430,6 +497,77 @@ function registerWebSocket(fastify) {
       if (prewarmAbort) { prewarmAbort.abort(); prewarmAbort = null }
       prewarmPromise = null
       prewarmStartText = null
+    }
+
+    // Track P — dumb emitter, same pattern as emitSttDiag/emitSttShadowDiag: only serializes already-decided
+    // fields, never derives outcome/decision logic itself. [PREWARM_DIAG] is legacy-prewarm-only by
+    // construction — chunked calls never call startPrewarm() at all (see onInterim below), so prewarmDiag
+    // stays null for their whole lifetime and this never fires for a chunked turn.
+    //
+    // Review Gate fix — full schema defaults live here, spread UNDER whatever the caller passes, so every
+    // [PREWARM_DIAG] line (including the synthetic NO_PREWARM record, which only ever supplies 3 fields)
+    // always carries the complete, consistent field set — missing fields are explicit `null`, never an
+    // absent key that would make NO_PREWARM records structurally different from settled ones downstream.
+    const emitPrewarmDiag = (payload) => {
+      try {
+        console.log(`[PREWARM_DIAG] ${JSON.stringify({
+          callSid,
+          prewarmDiagId: null,
+          generationId: null,
+          outcome: null,
+          initialTriggerText: null,
+          lastTriggerText: null,
+          retriggerCount: null,
+          initialPrewarmAgeAtFinalMs: null,
+          lastPrewarmAgeAtFinalMs: null,
+          prewarmStateAtFinal: null,
+          prewarmReadyBeforeFinal: null,
+          prewarmAttemptSettleRelativeToFinalMs: null,
+          prewarmTextRelation: null,
+          prewarmUsable: null,
+          graceWaitMs: null,
+          ...payload,
+        })}`)
+      } catch (e) {
+        console.error('[PREWARM_DIAG] emit failed (non-fatal, ignored):', e.message)
+      }
+    }
+
+    // Track P — the ONLY place a prewarmDiag lifecycle is ever settled/cleared. Exactly-once by construction:
+    // identity check (both the lifecycle object itself AND diag.settled) → mark settled → detach shared
+    // ownership → snapshot payload → emit. clearPrewarm() above is completely untouched by this — it's called
+    // mid-lifecycle on every retrigger and must never reset diagnostic state, so this lives entirely separate
+    // from it, called explicitly at each of its own terminal sites (primary legacy settlement, defensive
+    // catch settlement, bargeIn, handleMaxDuration, 'stop'/'close') — always BEFORE any clearPrewarm()/abort
+    // cleanup at that same site, so the diagnostic reason is locked in before transport teardown can race it.
+    //
+    // Review Gate fix — the whole settle+snapshot+emit body is now inside its own try/catch, not just
+    // emitPrewarmDiag()'s console.log: "diagnostics can never affect call flow" must hold even if payload
+    // construction itself throws, not only if serialization does.
+    function settlePrewarmDiag(diag, outcome, extra = {}) {
+      if (!diag || prewarmDiag !== diag || diag.settled) return false
+      diag.settled = true
+      prewarmDiag = null
+
+      try {
+        // NOTE: spread `extra` directly rather than re-keying each field as `extra.field` — an object
+        // literal with an explicit `key: undefined` still produces that key (with value undefined), which
+        // JSON.stringify then DROPS entirely, silently defeating emitPrewarmDiag()'s base-defaults fill-in
+        // for any field the caller didn't pass. Spreading `extra` means a field genuinely absent from the
+        // caller's extra object stays genuinely absent here too, so emitPrewarmDiag()'s `{...base, ...payload}`
+        // correctly fills it with an explicit null instead of silently omitting the key.
+        emitPrewarmDiag({
+          prewarmDiagId: diag.prewarmDiagId,
+          outcome,
+          initialTriggerText: diag.initialTriggerText,
+          lastTriggerText: diag.currentAttempt.triggerText,
+          retriggerCount: diag.retriggerCount,
+          ...extra,
+        })
+      } catch (e) {
+        console.error('[PREWARM_DIAG] settlement payload construction failed (non-fatal, ignored):', e.message)
+      }
+      return true
     }
 
     // L1b — เริ่ม chunked speculative Claude call จาก interim text ก่อน final transcript มาถึง สร้าง producer
@@ -572,6 +710,7 @@ function registerWebSocket(fastify) {
       bumpGeneration(callState) // C2: invalidate ก่อนทุกอย่าง — ยัง observational, ไม่ได้ใช้ gate การ abort จริงที่อยู่ถัดไป
       clearSilenceTimer()
       silencePromptCount = 0
+      if (prewarmDiag) settlePrewarmDiag(prewarmDiag, 'BARGE_IN') // Track P: settle before transport cleanup below
       clearPrewarm()
       abortChunkedSpeculation() // L1b — เหมือน clearPrewarm() ข้างบนทุกประการ แค่คนละ mechanism (chunked speculative producer)
       pendingShortAck = null // Design B: bargeIn() คือ central supersession point — turn ที่แข็งแรงกว่ากำลังมาแทนที่ ack สั้นที่ค้างไว้ก่อนหน้าต้องถูกทิ้งเสมอ ไม่พึ่งให้ caller แต่ละจุดจำ clear เอง
@@ -788,10 +927,24 @@ function registerWebSocket(fastify) {
           // L1b: snapshot เดียวกันเหตุผลเดียวกัน — chunkedPrewarmHandle เป็น mutable global ที่ startChunkedSpeculation()/
           // abortChunkedSpeculation() เปลี่ยน ref ได้ตลอดเวลา ต้อง snapshot ก่อนเข้า branch ไม่ใช่อ่านซ้ำทีหลัง
           const mySpecHandle = chunkedPrewarmHandle
+          // Track P — same snapshot-before-branch reasoning as myPrewarm/mySpecHandle above: prewarmDiag is a
+          // mutable global that startPrewarm()/settlePrewarmDiag() can move on at any time. Harmless no-op for
+          // a chunked call (prewarmDiag stays null all game — startPrewarm() is never called for one), so this
+          // line lives here in the shared pre-split code rather than duplicated into just the legacy branch.
+          const myPrewarmDiag = prewarmDiag
+          const myPrewarmAttempt = myPrewarmDiag?.currentAttempt ?? null
           // Correction #3 (design review รอบ 4): snapshot เวลา "final ถูกยอมรับ" ก่อน grace ใดๆ ทั้งสิ้น — ถ้าคำนวณ
           // prewarmAgeAtFinalMs หลังผ่าน grace (150ms) แล้ว ค่าจะบวก grace เข้าไปผิดๆ ทั้งที่ field นี้ควรวัด "อายุของ
           // speculation ณ ตอน final มาถึงจริง" เพื่อใช้ตัดสินว่า speculation ได้ head-start จริงกี่ ms
           const finalAcceptedAt = performance.now()
+          // Track P — state-at-final snapshot, derived from the exact myPrewarmAttempt captured above (never
+          // re-read prewarmDiag.currentAttempt later — that could theoretically be a newer attempt by the
+          // time we get around to it, even though sttProcessing=true structurally blocks retriggers after
+          // this point today; deriving from the frozen reference doesn't need to rely on that guard holding).
+          const prewarmStateAtFinal = myPrewarmAttempt?.resultState ?? null
+          const prewarmReadyBeforeFinal = prewarmStateAtFinal === 'READY_TEXT'
+          const initialPrewarmAgeAtFinalMs = myPrewarmDiag ? Math.round(finalAcceptedAt - myPrewarmDiag.initialTriggerAt) : null
+          const lastPrewarmAgeAtFinalMs = myPrewarmAttempt ? Math.round(finalAcceptedAt - myPrewarmAttempt.triggerAt) : null
 
           // C3a: ตัดสิน branch ก่อน Claude side effect แรกเสมอ — ห้ามมี code เรียก Claude ก่อนจุดนี้ไม่ว่า path ไหน
           // rollout ยัง 0% เสมอตอนนี้ จึงยังไม่มีสายไหนเข้า branch นี้จริงในโปรดักชัน (ดู C0/decideRollout)
@@ -1060,6 +1213,22 @@ function registerWebSocket(fastify) {
             // Use pre-warmed Claude response if available and applicable
             let aiText = null
             markOnce(turnMetrics, 't2') // legacy: askClaudeStream yield ข้อความเต็มก้อนเดียว จึงไม่มี t3/t4 ที่มีความหมาย
+
+            // Track P — synthetic record: no lifecycle object exists at all this turn, so it never goes
+            // through settlePrewarmDiag() (there's nothing to settle) — emitted directly here instead.
+            if (!myPrewarmDiag) {
+              emitPrewarmDiag({ prewarmDiagId: null, generationId, outcome: 'NO_PREWARM' })
+            }
+            // Track P — computed here purely for the diagnostic payload below. This is a SEPARATE call to
+            // isPrewarmUsable() from the one the production `if` still makes on its own a few lines down —
+            // deliberately not reused/cached, so the original `if (myPrewarm && isPrewarmUsable(...))` line
+            // stays byte-for-byte untouched (the more conservative option: isPrewarmUsable() is pure and
+            // side-effect-free, so calling it twice with identical args is guaranteed to agree both times —
+            // this diagnostic read can never disagree with, or influence, what production actually decided).
+            const prewarmUsableResult = myPrewarm ? isPrewarmUsable(myPrewarmText, transcript) : null
+            const prewarmTextRelation = myPrewarmDiag ? classifyPrewarmTextRelation(myPrewarmText, transcript) : null
+            let prewarmDiagOutcome = myPrewarmDiag ? 'MISMATCH' : null   // default when a lifecycle exists but isn't usable; overwritten below when it is
+            let prewarmDiagGraceWaitMs = null
             if (myPrewarm && isPrewarmUsable(myPrewarmText, transcript)) {
               const graceWaitStartedAt = performance.now() // เวลาเริ่ม "รอบรอ grace นี้" คนละตัวกับ myPrewarmStartedAt (เวลาที่ request เริ่มจริงตอน startPrewarm())
               console.log(`[Prewarm] Awaiting pre-warmed response for: "${transcript}" (grace=${PREWARM_GRACE_MS}ms)`)
@@ -1077,6 +1246,7 @@ function registerWebSocket(fastify) {
                 },
               })
               const waitedMs = Math.round(performance.now() - graceWaitStartedAt)
+              prewarmDiagGraceWaitMs = waitedMs
 
               // prewarm IIFE เองมี try/catch คลุมอยู่แล้ว (คืน null เสมอตอน error ไม่เคย throw ออกมาจริง) จึงต้อง
               // เช็คทั้ง outcome และ result ร่วมกัน — success+null ก็ต้องถือเป็น miss แล้วไป fresh call เหมือนกัน
@@ -1087,16 +1257,43 @@ function registerWebSocket(fastify) {
               // aiText ปล่อยเป็น null แล้วให้ guard เดิมด้านล่าง (!signal.aborted) กัน fresh call/TTS เองตามปกติพอ
               if (attempt.outcome === 'success' && attempt.result) {
                 aiText = attempt.result
+                prewarmDiagOutcome = 'HIT'
                 console.log(`[Prewarm] Grace success waitedMs=${waitedMs} — skipping fresh Claude call`)
               } else if (attempt.outcome === 'success') {
+                prewarmDiagOutcome = 'NULL_RESULT'
                 console.log(`[Prewarm] Grace success waitedMs=${waitedMs} but null result — falling back to fresh call`)
               } else if (attempt.outcome === 'timeout') {
+                prewarmDiagOutcome = 'GRACE_TIMEOUT'
                 console.log(`[Prewarm] Grace timeout waitedMs=${waitedMs} prewarmAgeMs=${Math.round(performance.now() - myPrewarmStartedAt)} — falling back to fresh call`)
               } else if (attempt.outcome === 'aborted') {
+                prewarmDiagOutcome = 'BARGE_IN'
                 console.log('[Prewarm] Grace wait aborted by barge-in — no fresh call, turn ends with no audio')
               } else {
+                prewarmDiagOutcome = 'ERROR'
                 console.log(`[Prewarm] Grace error waitedMs=${waitedMs} (${attempt.error?.message}) — falling back to fresh call`)
               }
+            }
+
+            // Track P — primary settlement, MUST happen before the existing clearPrewarm() line right below
+            // (locks the diagnostic outcome in before transport cleanup can race it — same ordering rule
+            // applied at bargeIn()/handleMaxDuration()/'stop'/'close'). myPrewarmAttempt.settledAt reflects
+            // whatever the identity-checked writer inside startPrewarm()'s IIFE last wrote to THIS exact
+            // attempt object — read once here, not re-derived from a live/possibly-newer prewarmDiag.
+            if (myPrewarmDiag) {
+              const prewarmAttemptSettleRelativeToFinalMs = myPrewarmAttempt?.settledAt != null
+                ? Math.round(myPrewarmAttempt.settledAt - finalAcceptedAt)
+                : null
+              settlePrewarmDiag(myPrewarmDiag, prewarmDiagOutcome, {
+                generationId,
+                initialPrewarmAgeAtFinalMs,
+                lastPrewarmAgeAtFinalMs,
+                prewarmStateAtFinal,
+                prewarmReadyBeforeFinal,
+                prewarmAttemptSettleRelativeToFinalMs,
+                prewarmTextRelation,
+                prewarmUsable: prewarmUsableResult,
+                graceWaitMs: prewarmDiagGraceWaitMs,
+              })
             }
             if (prewarmPromise === myPrewarm) clearPrewarm()
 
@@ -1446,6 +1643,30 @@ function registerWebSocket(fastify) {
               }
             }
           } catch (err) {
+            // Track P — defensive settlement: if an unexpected exception here happened BEFORE the primary
+            // settlePrewarmDiag() call above ever ran, prewarmDiag would otherwise be left dangling across the
+            // turn boundary. settlePrewarmDiag()'s own identity/settled guard makes this a pure no-op if
+            // primary settlement already happened normally — never a double emission. Diagnostic-only, must
+            // never alter the existing AI/TTS error handling below it.
+            //
+            // Review Gate fix — the 4 state-at-final fields (and settle-relative, if the attempt happened to
+            // have already settled by the time the exception hit) were already computed at the shared
+            // pre-split snapshot boundary above, before this turn ever entered the try block — passing them
+            // here means an ERROR record still carries real state-at-final data instead of going all-null
+            // just because the exception happened to land before primary settlement got a chance to run.
+            if (myPrewarmDiag) {
+              const prewarmAttemptSettleRelativeToFinalMs = myPrewarmAttempt?.settledAt != null
+                ? Math.round(myPrewarmAttempt.settledAt - finalAcceptedAt)
+                : null
+              settlePrewarmDiag(myPrewarmDiag, 'ERROR', {
+                generationId,
+                initialPrewarmAgeAtFinalMs,
+                lastPrewarmAgeAtFinalMs,
+                prewarmStateAtFinal,
+                prewarmReadyBeforeFinal,
+                prewarmAttemptSettleRelativeToFinalMs,
+              })
+            }
             console.error('[AI/TTS error]', err.message)
             healthMonitor.reportError('ai_tts', err.message)
           } finally {
@@ -1804,6 +2025,7 @@ function registerWebSocket(fastify) {
         callActive = false
         clearSilenceTimer()
         clearDurationTimer()
+        if (prewarmDiag) settlePrewarmDiag(prewarmDiag, 'CALL_ENDED') // Track P: settle before transport cleanup below
         clearPrewarm()
         abortChunkedSpeculation()
         endCall(callState)
@@ -1818,6 +2040,7 @@ function registerWebSocket(fastify) {
     socket.on('close', () => {
       console.log(`[WS] Disconnected: ${callSid}`)
       callActive = false
+      if (prewarmDiag) settlePrewarmDiag(prewarmDiag, 'CALL_ENDED') // Track P: settle before transport cleanup below
       clearPrewarm()
       abortChunkedSpeculation()
       clearSilenceTimer()
