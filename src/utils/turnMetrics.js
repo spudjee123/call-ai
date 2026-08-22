@@ -94,6 +94,16 @@ function createTurnMetrics({
     l2bCurrentUserCharCount: null,
     l2bApproxInputTextCharCount: null,
     l2bResponseCharCount: null, // from Claude's own finalText.length, captured before audioStream.js can substitute/append anything (recovery phrase, END_CALL follow-up)
+    // Track M (diagnostic only, design R3 LOCKED 2026-08-22) — explains WHY chunkDelay (t4-t3, first-safe-chunk
+    // latency) has the value it does, for the L2b fresh-Claude-request path only. Scoped to the FIRST safe
+    // chunk exclusively (same scope as chunkDelay itself) — never anything from later chunks in CHUNKED mode.
+    // All 6 fields null together whenever chunkDelay is null (no boundary ever found before stream completed).
+    l2bChunkReason: null, // STRONG_BOUNDARY | SOFT_BOUNDARY | NATURAL_BOUNDARY | NATURAL_BOUNDARY_HARD_MAX
+    l2bChunkCharCount: null, // length of the first safe chunk's text
+    l2bChunkDeltaCount: null, // count of Claude text deltas from turn start up to and including the one that produced first-safe — frozen there, never counts deltas arriving during the 150ms grace race
+    l2bChunkFirstCandidateElapsedMs: null, // elapsed ms from firstDeltaAt to when a cut candidate first became eligible — equals chunkDelay exactly for STRONG_BOUNDARY/SOFT_BOUNDARY (no separate candidate state exists for those); can be strictly less than chunkDelay for NATURAL_BOUNDARY* when numeric-tail protection or the SOFT_TIMEOUT/HARD_MAX gate delayed the actual cut
+    l2bChunkNumericProtectionBlocked: null, // true only if a natural-boundary candidate was policy-eligible AND held back by numeric-tail protection at least once before the eventual cut — false (not null) for STRONG_BOUNDARY/SOFT_BOUNDARY since numeric protection never applies to those by construction
+    l2bChunkPreSafeDeltaGapMs: null, // observed wall-clock gap between the delta immediately preceding the one that produced first-safe, and that delta itself — 0 if first-safe came from the very first delta of the turn. Correlational only: cannot by itself prove "waiting for the next delta" vs "Claude paced generation slowly" (deciding phase has no proactive wall-clock re-check, unlike drainChunked()'s CHUNKED-phase timer)
   }
 }
 

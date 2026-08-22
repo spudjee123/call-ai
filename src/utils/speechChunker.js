@@ -39,6 +39,15 @@ const STRONG_BOUNDARY_RE = /[.?!\n]/
 // เรียงจากยาว→สั้นตั้งใจ (นะครับ/นะคะ ต้องเช็คก่อน ครับ/คะ ไม่งั้น regex ตัดสั้นไปจับ "นะครับ" เป็นแค่ "ครับ" ผิดตำแหน่ง)
 const THAI_SOFT_BOUNDARY_RE = /(นะครับ|นะคะ|ได้เลย|ไม่เป็นไร|ครับ|ค่ะ|คะ|โอเค)(?=\s|$)/
 
+// Track M (diagnostic only, design R3 LOCKED 2026-08-22) — เหตุผลที่แต่ละ chunk ถูกตัด ตรงกับ 4 branch จริงใน
+// findChunkBoundary() เป๊ะ ไม่มีเพิ่ม ไม่มีตัด
+const CHUNK_REASON = {
+  STRONG_BOUNDARY: 'STRONG_BOUNDARY',
+  SOFT_BOUNDARY: 'SOFT_BOUNDARY',
+  NATURAL_BOUNDARY: 'NATURAL_BOUNDARY',
+  NATURAL_BOUNDARY_HARD_MAX: 'NATURAL_BOUNDARY_HARD_MAX',
+}
+
 // L1c1 — candidate chunk (ข้อความที่กำลังจะถูก flush ถ้าไม่ถูกกัน) ลงท้ายด้วยเลขอารบิกหรือเลขไทยไหม — ตั้งใจกว้าง
 // (ไม่ whitelist หน่วยเฉพาะ เช่น บาท/พอยต์/เปอร์เซ็นต์) เพราะเจอ pattern แบบนี้ได้หลายแบบ (100 บาท, 30%, 15.30 น.,
 // เบอร์โทร) — เช็คแค่ "ท้าย candidate เป็นตัวเลขไหม" พอ ถ้าหน่วย/สัญลักษณ์ตามมาแล้วจริง (เช่น "2,000 พอยต์") ท้าย
@@ -65,9 +74,39 @@ function findLastSafeBoundary(buffer, minLength) {
   return lastSpace
 }
 
+// Track M (diagnostic only, design R3 LOCKED 2026-08-22) — single source-of-truth สำหรับ "มี natural-boundary
+// candidate ที่ policy-eligible ไหม (ผ่าน gate เดียวกับที่ findChunkBoundary() ใช้ตัดสินใจจริงเป๊ะ) และถ้ามี ถูก
+// numeric-tail protection กันไว้จริงไหม" — ทั้ง findChunkBoundary() (ด้านล่าง) และ evaluateNumericProtectionDiagnostic()
+// (export สำหรับ Track M) เรียกจากจุดนี้จุดเดียว ป้องกัน drift ระหว่าง production decision กับ diagnostic
+//
+// ต้องเช็ค elapsedMs >= HARD_MAX_MS เป็นกรณีแรกสุด (ไม่ใช่ gate ด้วย FALLBACK_MIN_LENGTH ก่อนเสมอ) เพราะ
+// findChunkBoundary()'s เดิม (ก่อน refactor) มี code path ที่ยอมตัด natural boundary ที่ elapsedMs >= HARD_MAX_MS
+// แม้ buffer จะสั้นกว่า FALLBACK_MIN_LENGTH ก็ตาม (ขอแค่ผ่าน MIN_CHUNK_LENGTH) — ยืนยันด้วย equivalence table
+// ครบทุก branch ใน Track M Design R3 ก่อน implement จุดนี้
+function evaluateNaturalCandidate(buffer, elapsedMs) {
+  // ผ่าน HARD_MAX แล้ว: ตัดจาก natural boundary ใดๆ ที่มี (gate แค่ MIN_CHUNK_LENGTH) numeric-tail protection
+  // ไม่มีผลอีกต่อไปโดยนิยาม (ดู endsWithNumericToken check ด้านล่าง ซึ่งต้องการ elapsedMs < HARD_MAX_MS เสมอ)
+  if (elapsedMs >= HARD_MAX_MS) {
+    const naturalCut = findLastSafeBoundary(buffer, MIN_CHUNK_LENGTH)
+    return naturalCut === -1
+      ? { eligible: false, naturalCut: -1, blockedByNumericProtection: false }
+      : { eligible: true, naturalCut, blockedByNumericProtection: false }
+  }
+  // ก่อน HARD_MAX: ต้องผ่าน SOFT_TIMEOUT_MS และ FALLBACK_MIN_LENGTH ก่อน (soft-window path เท่านั้น)
+  if (elapsedMs < SOFT_TIMEOUT_MS) return { eligible: false, naturalCut: -1, blockedByNumericProtection: false }
+  if (buffer.length < FALLBACK_MIN_LENGTH) return { eligible: false, naturalCut: -1, blockedByNumericProtection: false }
+  const naturalCut = findLastSafeBoundary(buffer, MIN_CHUNK_LENGTH)
+  if (naturalCut === -1) return { eligible: false, naturalCut: -1, blockedByNumericProtection: false }
+  // L1c1: candidate ลงท้ายด้วยตัวเลข + ยังไม่ครบ HARD_MAX_MS → กันไว้ก่อน รอ delta ถัดไปที่น่าจะเป็นหน่วยนับ
+  // ตามมา (ถ้า Claude เงียบผิดปกติจริง protection จะหมดอายุเองที่ HARD_MAX_MS ผ่านสาขาบนสุดของฟังก์ชันนี้)
+  const candidate = buffer.slice(0, naturalCut).trim()
+  return { eligible: true, naturalCut, blockedByNumericProtection: endsWithNumericToken(candidate) }
+}
+
 // buffer: ข้อความที่สะสมมาตั้งแต่ flush ครั้งล่าสุด
 // elapsedMs: เวลาผ่านไปนับจากตัวอักษรแรกของ buffer นี้มาถึง
-// คืน { chunk, remainder } ถ้าพร้อม flush หรือ null ถ้ายังไม่ควรตัด
+// คืน { chunk, remainder, reason } ถ้าพร้อม flush หรือ null ถ้ายังไม่ควรตัด — reason เพิ่มเข้ามาสำหรับ Track M
+// (diagnostic เท่านั้น, additive field, ไม่กระทบ caller เดิมที่อ่านแค่ .chunk/.remainder)
 function findChunkBoundary(buffer, elapsedMs) {
   if (!buffer || buffer.length < MIN_CHUNK_LENGTH) return null
 
@@ -78,36 +117,29 @@ function findChunkBoundary(buffer, elapsedMs) {
   const candidates = [strongCut, softCut].filter(c => c !== -1)
   if (candidates.length) {
     const cutAt = Math.min(...candidates)
-    return split(buffer, cutAt)
+    const reason = (strongCut !== -1 && strongCut === cutAt) ? CHUNK_REASON.STRONG_BOUNDARY : CHUNK_REASON.SOFT_BOUNDARY
+    return split(buffer, cutAt, reason)
   }
 
-  // ยังไม่ครบ soft timeout — ไม่ผ่อนเกณฑ์ รอต่อ
-  if (elapsedMs < SOFT_TIMEOUT_MS) return null
-
-  // ครบ soft timeout แล้ว — ผ่อนเป็น natural boundary ได้ แต่ buffer ต้องยาวพอสมควรก่อน
-  if (buffer.length >= FALLBACK_MIN_LENGTH) {
-    const naturalCut = findLastSafeBoundary(buffer, MIN_CHUNK_LENGTH)
-    if (naturalCut !== -1) {
-      // L1c1: candidate ลงท้ายด้วยตัวเลข + ยังไม่ครบ HARD_MAX_MS → กันไว้ก่อน รอ delta ถัดไปที่น่าจะเป็นหน่วยนับ
-      // ตามมา (ถ้า Claude เงียบผิดปกติจริง protection จะหมดอายุเองที่ HARD_MAX_MS ด้านล่าง ไม่รอไม่มีที่สิ้นสุด)
-      const candidate = buffer.slice(0, naturalCut).trim()
-      const protectedByNumericTail = elapsedMs < HARD_MAX_MS && endsWithNumericToken(candidate)
-      if (!protectedByNumericTail) return split(buffer, naturalCut)
-    }
-  }
-
-  // ครบ hard max แล้ว — ยังต้องหา natural boundary อยู่ดี ห้ามตัดกลางคำเด็ดขาด
-  if (elapsedMs >= HARD_MAX_MS) {
-    const naturalCut = findLastSafeBoundary(buffer, MIN_CHUNK_LENGTH)
-    if (naturalCut !== -1) return split(buffer, naturalCut)
-    // ไม่มีช่องว่างเลยแม้แต่ตัวเดียวใน buffer (คำเดียวยาวผิดปกติ) — รอต่อไป ไม่มีทางเลือกที่ปลอดภัย
+  const { eligible, naturalCut, blockedByNumericProtection } = evaluateNaturalCandidate(buffer, elapsedMs)
+  if (eligible && !blockedByNumericProtection) {
+    const reason = elapsedMs >= HARD_MAX_MS ? CHUNK_REASON.NATURAL_BOUNDARY_HARD_MAX : CHUNK_REASON.NATURAL_BOUNDARY
+    return split(buffer, naturalCut, reason)
   }
 
   return null
 }
 
-function split(buffer, cutAt) {
-  return { chunk: buffer.slice(0, cutAt).trim(), remainder: buffer.slice(cutAt) }
+function split(buffer, cutAt, reason) {
+  return { chunk: buffer.slice(0, cutAt).trim(), remainder: buffer.slice(cutAt), reason }
+}
+
+// Track M (diagnostic only, design R3 LOCKED 2026-08-22) — read-only export, mirrors findChunkBoundary()'s
+// เกณฑ์ตัดสินใจเป๊ะผ่าน evaluateNaturalCandidate() ตัวเดียวกัน ห้ามใช้ผลลัพธ์จากฟังก์ชันนี้ไปตัดสินใจ cut จริง
+// ที่ไหนเลย — เป็น observer เท่านั้น ไม่มี side effect
+function evaluateNumericProtectionDiagnostic(buffer, elapsedMs) {
+  const { eligible, blockedByNumericProtection } = evaluateNaturalCandidate(buffer, elapsedMs)
+  return { candidateEligible: eligible, blockedByNumericProtection }
 }
 
 // L1c1 follow-up — คืนค่า:
@@ -140,4 +172,4 @@ function getNumericProtectionRemainingMs(buffer, elapsedMs) {
   return HARD_MAX_MS - elapsedMs
 }
 
-module.exports = { findChunkBoundary, getNumericProtectionRemainingMs }
+module.exports = { findChunkBoundary, getNumericProtectionRemainingMs, evaluateNumericProtectionDiagnostic, CHUNK_REASON }

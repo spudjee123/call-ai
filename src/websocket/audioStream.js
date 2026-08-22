@@ -11,6 +11,7 @@ const { runChunkedTurn, speakFixedText, createChunkedProducer, adoptChunkedProdu
 const { runAttemptWithWatchdog, bridgeAbort } = require('../utils/attemptWithWatchdog')
 const { isSpeculationMatch, classifyForAdoption } = require('../utils/chunkedSpeculation')
 const { createRolloutConfig } = require('../utils/rolloutConfig')
+const { CHUNK_REASON } = require('../utils/speechChunker')
 const { performance } = require('perf_hooks')
 
 const MAX_CALL_DURATION_MS = (parseInt(process.env.MAX_CALL_DURATION_SECONDS) || 300) * 1000
@@ -238,6 +239,25 @@ async function applyChunkedEndCallGuard({ endCallRequested, fullText, totalSent,
     }
   }
   return { fullText: fullText.trim() + ' ' + followUp, endCallRequested: false, totalSent: newTotalSent }
+}
+
+// Track M Review Fix 1 (2026-08-22) — `value && typeof value === 'object'` alone lets a structurally
+// malformed chunkReasonStats payload (wrong enum string, non-numeric/NaN/negative in a numeric field,
+// non-boolean flag) still pass through and get written into turnMetrics. Validate every field BEFORE
+// assigning any of them — atomic: if one field fails, the whole payload is rejected and all 6 fields stay
+// at their turnMetrics null default, never a partial mix of real + garbage values. Checks reason against
+// CHUNK_REASON (imported from speechChunker.js, the single source of truth) rather than a hardcoded string
+// list, so this can never silently drift from the real enum.
+const VALID_CHUNK_REASONS = new Set(Object.values(CHUNK_REASON))
+function isValidChunkReasonStats(value) {
+  if (!value || typeof value !== 'object') return false
+  if (!VALID_CHUNK_REASONS.has(value.reason)) return false
+  if (!Number.isFinite(value.charCount) || value.charCount < 0) return false
+  if (!Number.isInteger(value.deltaCount) || value.deltaCount < 1) return false
+  if (!Number.isFinite(value.firstCandidateElapsedMs) || value.firstCandidateElapsedMs < 0) return false
+  if (typeof value.numericProtectionBlocked !== 'boolean') return false
+  if (!Number.isFinite(value.preSafeDeltaGapMs) || value.preSafeDeltaGapMs < 0) return false
+  return true
 }
 
 function registerWebSocket(fastify) {
@@ -1369,6 +1389,22 @@ function registerWebSocket(fastify) {
                       }
                       else if (key === 'responseCharCount') {
                         turnMetrics.l2bResponseCharCount = typeof value === 'number' ? value : null
+                      }
+                      // Track M (diagnostic only, design R3 LOCKED 2026-08-22) — object payload, same pattern
+                      // as inputStats above: own try/catch, malformed payload → fields stay/default null,
+                      // never affects the rest of turnMetrics or the Claude/TTS streams themselves.
+                      else if (key === 'chunkReasonStats') {
+                        try {
+                          if (isValidChunkReasonStats(value)) {
+                            turnMetrics.l2bChunkReason = value.reason
+                            turnMetrics.l2bChunkCharCount = value.charCount
+                            turnMetrics.l2bChunkDeltaCount = value.deltaCount
+                            turnMetrics.l2bChunkFirstCandidateElapsedMs = value.firstCandidateElapsedMs
+                            turnMetrics.l2bChunkNumericProtectionBlocked = value.numericProtectionBlocked
+                            turnMetrics.l2bChunkPreSafeDeltaGapMs = value.preSafeDeltaGapMs
+                          }
+                          // invalid payload → all 6 fields stay at their null default, atomic (never partial)
+                        } catch (_) { /* diagnostic only — leave fields at their null default */ }
                       }
                       // Design review round 4 — Claude finishing (fullAt) must disarm the 6000ms watchdog.
                       // Without this, the SAME window also covers however long the tail TTS chunk(s) take

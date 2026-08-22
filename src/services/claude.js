@@ -1,6 +1,6 @@
 const Anthropic = require('@anthropic-ai/sdk')
 const { performance } = require('perf_hooks')
-const { findChunkBoundary, getNumericProtectionRemainingMs } = require('../utils/speechChunker')
+const { findChunkBoundary, getNumericProtectionRemainingMs, evaluateNumericProtectionDiagnostic, CHUNK_REASON } = require('../utils/speechChunker')
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
 
@@ -551,11 +551,20 @@ async function* askClaudeConditionalStream(session, signal = null, onMilestone =
       const view = safeView()
       const result = findChunkBoundary(view, elapsedMs)
       if (!result) return null
-      return { chunk: result.chunk, remainder: result.remainder + buffer.slice(view.length) }
+      return { chunk: result.chunk, remainder: result.remainder + buffer.slice(view.length), reason: result.reason }
     }
     function numericProtectionRemainingMs(elapsedMs) {
       return getNumericProtectionRemainingMs(safeView(), elapsedMs)
     }
+
+    // Track M (diagnostic only, design R3 LOCKED 2026-08-22) — state for the FIRST safe chunk only (mirrors
+    // chunkDelay's own scope: t3→t4, never anything after). All frozen the instant firstSafeAt is set — see
+    // the guard in the delta-processing loop below (mandatory per R2 Blocker 3: deltas arriving during the
+    // 150ms grace race, while mode is still null, must NOT keep incrementing/updating these).
+    let deltaCount = 0
+    let lastDeltaAt = null
+    let firstCandidateAt = null
+    let numericProtectionEverBlocked = false
 
     // phase 2 (mode === 'CHUNKED'): drain every safe chunk as found, same continuous-flush shape as
     // chunkedTurn.js's drainReadyChunks() — arms its own wall-clock numeric-protection timer so a
@@ -637,16 +646,53 @@ async function* askClaudeConditionalStream(session, signal = null, onMilestone =
         if (mode === 'CHUNKED') {
           drainChunked()
         } else if (mode === null) {
-          const elapsedMs = performance.now() - segmentStartMs
-          const result = tryFindBoundary(elapsedMs)
-          if (result && firstSafeAt === null) {
-            firstSafeAt = performance.now()
-            onMilestone?.('firstSafeAt', firstSafeAt)
-            pendingFirstChunk = result.chunk
-            buffer = result.remainder
-            gracePromise = armGrace()
+          if (firstSafeAt === null) {
+            // Track M bookkeeping — ONLY runs before first-safe is found. Once firstSafeAt is set below,
+            // this whole block is skipped for any further deltas arriving during the 150ms grace race (mode
+            // still null then, per the outer if/else here) — that is exactly the freeze R2 Blocker 3 requires.
+            deltaCount++
+            const deltaArrivedAt = performance.now()
+            const gapFromPreviousDeltaMs = lastDeltaAt === null ? 0 : (deltaArrivedAt - lastDeltaAt)
+            lastDeltaAt = deltaArrivedAt
+
+            const elapsedMs = performance.now() - segmentStartMs
+
+            try {
+              // read-only diagnostic, mirrors findChunkBoundary()'s own eligibility gate exactly (single
+              // source of truth in speechChunker.js) — never used to decide the real cut below
+              const diag = evaluateNumericProtectionDiagnostic(safeView(), elapsedMs)
+              if (diag.candidateEligible && firstCandidateAt === null) firstCandidateAt = performance.now()
+              if (diag.blockedByNumericProtection) numericProtectionEverBlocked = true
+            } catch (_) { /* diagnostic only — must never affect the real cut decision below */ }
+
+            const result = tryFindBoundary(elapsedMs)
+            if (result) {
+              firstSafeAt = performance.now()
+              onMilestone?.('firstSafeAt', firstSafeAt)
+              try {
+                // locked implementation detail (R3 review): for STRONG/SOFT the candidate IS the emit instant
+                // by construction — reuse the timestamps already captured directly, never re-measure via a
+                // fresh performance.now() call and claim it's "exactly equal"
+                const isStrongOrSoft = result.reason === CHUNK_REASON.STRONG_BOUNDARY || result.reason === CHUNK_REASON.SOFT_BOUNDARY
+                const firstCandidateElapsedMs = isStrongOrSoft
+                  ? (firstSafeAt - firstDeltaAt)
+                  : (firstCandidateAt !== null ? (firstCandidateAt - firstDeltaAt) : (firstSafeAt - firstDeltaAt))
+                onMilestone?.('chunkReasonStats', {
+                  reason: result.reason,
+                  charCount: result.chunk.length,
+                  deltaCount,
+                  firstCandidateElapsedMs,
+                  numericProtectionBlocked: isStrongOrSoft ? false : numericProtectionEverBlocked,
+                  preSafeDeltaGapMs: gapFromPreviousDeltaMs,
+                })
+              } catch (_) { /* diagnostic only */ }
+              pendingFirstChunk = result.chunk
+              buffer = result.remainder
+              gracePromise = armGrace()
+            }
+            // no boundary yet: keep accumulating, nothing to flush
           }
-          // no boundary yet (or already found — waiting on grace): keep accumulating, nothing to flush
+          // else: firstSafeAt already found, still waiting on the grace race (mode still null) — nothing to do
         }
       }
 

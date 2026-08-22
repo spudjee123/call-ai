@@ -2478,6 +2478,13 @@ test('L2b precedence (required criterion 4): chunked=true → legacyEarlyTts=fal
   assert.equal(metrics.l2bCurrentUserCharCount, null)
   assert.equal(metrics.l2bApproxInputTextCharCount, null)
   assert.equal(metrics.l2bResponseCharCount, null)
+  // Track M — เช่นกัน ไม่มี l2bChunk* field ไหนถูก populate สำหรับ chunked path
+  assert.equal(metrics.l2bChunkReason, null)
+  assert.equal(metrics.l2bChunkCharCount, null)
+  assert.equal(metrics.l2bChunkDeltaCount, null)
+  assert.equal(metrics.l2bChunkFirstCandidateElapsedMs, null)
+  assert.equal(metrics.l2bChunkNumericProtectionBlocked, null)
+  assert.equal(metrics.l2bChunkPreSafeDeltaGapMs, null)
   harness.disconnect(socket)
 })
 
@@ -2500,6 +2507,13 @@ test('L2b precedence (required criterion 4): legacyObserved=true → legacyEarly
   assert.equal(metrics.l2bCurrentUserCharCount, null)
   assert.equal(metrics.l2bApproxInputTextCharCount, null)
   assert.equal(metrics.l2bResponseCharCount, null)
+  // Track M — เช่นกัน
+  assert.equal(metrics.l2bChunkReason, null)
+  assert.equal(metrics.l2bChunkCharCount, null)
+  assert.equal(metrics.l2bChunkDeltaCount, null)
+  assert.equal(metrics.l2bChunkFirstCandidateElapsedMs, null)
+  assert.equal(metrics.l2bChunkNumericProtectionBlocked, null)
+  assert.equal(metrics.l2bChunkPreSafeDeltaGapMs, null)
   harness.disconnect(socket)
 })
 
@@ -2577,6 +2591,106 @@ test('Track L wiring: inputStats(null) จาก producer (เช่น computat
   assert.equal(metrics.l2bApproxInputTextCharCount, null)
   assert.equal(metrics.l2bResponseCharCount, null, 'ไม่มี responseCharCount milestone ยิงเลยในเทสนี้ ต้องเหลือ default null')
   assert.equal(metrics.legacyEarlyTtsOutcome, 'COMPLETED', 'inputStats(null) ต้องไม่กระทบ path การันตี turn อื่นๆ เลย')
+  harness.disconnect(socket)
+})
+
+// ===== Track M — chunk boundary telemetry wiring (design locked 2026-08-22, R3) =====
+// Track M's actual computation (reason/candidate/gap/deltaCount) is proven against real claude.js in
+// test/claudeConditional.test.js — this section proves only the consumer-side wiring: onEarlyTtsMilestone
+// ใน audioStream.js ต้อง map ค่าที่ chunkReasonStats ส่งมาเข้า turnMetrics.l2bChunk* ให้ตรงเป๊ะ และ malformed
+// payload ต้อง fail-safe เป็น null โดยไม่กระทบ [Metrics] log ส่วนที่เหลือ
+
+test('Track M wiring: onMilestone("chunkReasonStats", {...}) ต้อง map เข้า turnMetrics.l2bChunk* ตรงเป๊ะใน [Metrics] log', async () => {
+  const callSid = 'CA_L2B_TRACKM_WIRING'
+  harness.getState().legacyEarlyTtsConfig = { percent: 100, campaignId: L2B_CAMPAIGN_ID }
+  const { socket, state } = await connectPastGreeting(callSid, { rolloutPercent: 0, sessionOverrides: { campaign: l2bCampaign() } })
+  state.claudeConditionalImpl = (sess, signal, onMilestone) => (async function* () {
+    onMilestone?.('requestAt', Date.now())
+    onMilestone?.('firstDeltaAt', Date.now())
+    onMilestone?.('chunkReasonStats', {
+      reason: 'NATURAL_BOUNDARY_HARD_MAX',
+      charCount: 42,
+      deltaCount: 3,
+      firstCandidateElapsedMs: 350,
+      numericProtectionBlocked: true,
+      preSafeDeltaGapMs: 480,
+    })
+    onMilestone?.('firstSafeAt', Date.now())
+    onMilestone?.('mode', 'SINGLE_SHOT')
+    yield 'คำตอบทดสอบ'
+    onMilestone?.('fullAt', Date.now())
+    onMilestone?.('finalText', 'คำตอบทดสอบ')
+    onMilestone?.('endCallRequested', false)
+  })()
+
+  const metrics = await captureMetrics(() => harness.sendFinalTranscript('ทดสอบ'))
+
+  assert.equal(metrics.l2bChunkReason, 'NATURAL_BOUNDARY_HARD_MAX')
+  assert.equal(metrics.l2bChunkCharCount, 42)
+  assert.equal(metrics.l2bChunkDeltaCount, 3)
+  assert.equal(metrics.l2bChunkFirstCandidateElapsedMs, 350)
+  assert.equal(metrics.l2bChunkNumericProtectionBlocked, true)
+  assert.equal(metrics.l2bChunkPreSafeDeltaGapMs, 480)
+  harness.disconnect(socket)
+})
+
+test('Track M wiring — Review Fix 1: chunkReasonStats ที่เป็น object จริงแต่ field ผิดรูปแบบ (reason ไม่อยู่ใน enum, charCount เป็น string, deltaCount null, firstCandidateElapsedMs=NaN, numericProtectionBlocked เป็น string, preSafeDeltaGapMs ติดลบ) → ทุก l2bChunk* field ต้องเป็น null ทั้ง 6 ไม่ partial และไม่กระทบ turn จริง', async () => {
+  const callSid = 'CA_L2B_TRACKM_MALFORMED'
+  harness.getState().legacyEarlyTtsConfig = { percent: 100, campaignId: L2B_CAMPAIGN_ID }
+  const { socket, state } = await connectPastGreeting(callSid, { rolloutPercent: 0, sessionOverrides: { campaign: l2bCampaign() } })
+  state.claudeConditionalImpl = (sess, signal, onMilestone) => (async function* () {
+    onMilestone?.('requestAt', Date.now())
+    onMilestone?.('firstDeltaAt', Date.now())
+    onMilestone?.('chunkReasonStats', {
+      reason: 'BAD_REASON',
+      charCount: 'abc',
+      deltaCount: null,
+      firstCandidateElapsedMs: NaN,
+      numericProtectionBlocked: 'yes',
+      preSafeDeltaGapMs: -10,
+    })
+    onMilestone?.('firstSafeAt', Date.now())
+    onMilestone?.('mode', 'SINGLE_SHOT')
+    yield 'คำตอบทดสอบ'
+    onMilestone?.('fullAt', Date.now())
+    onMilestone?.('finalText', 'คำตอบทดสอบ')
+    onMilestone?.('endCallRequested', false)
+  })()
+
+  const metrics = await captureMetrics(() => harness.sendFinalTranscript('ทดสอบ'))
+
+  assert.equal(metrics.l2bChunkReason, null, 'reason ไม่อยู่ใน CHUNK_REASON enum ต้องไม่ผ่าน')
+  assert.equal(metrics.l2bChunkCharCount, null)
+  assert.equal(metrics.l2bChunkDeltaCount, null)
+  assert.equal(metrics.l2bChunkFirstCandidateElapsedMs, null)
+  assert.equal(metrics.l2bChunkNumericProtectionBlocked, null)
+  assert.equal(metrics.l2bChunkPreSafeDeltaGapMs, null)
+  assert.equal(metrics.legacyEarlyTtsOutcome, 'COMPLETED', 'malformed payload ต้องไม่กระทบ turn จริงเลย')
+  harness.disconnect(socket)
+})
+
+test('Track M wiring: ไม่มี chunkReasonStats milestone ยิงเลย (chunkDelay=null เคส) → ทุก l2bChunk* field เหลือ default null ไม่กระทบ [Metrics] log ส่วนอื่น', async () => {
+  const callSid = 'CA_L2B_TRACKM_NULL'
+  harness.getState().legacyEarlyTtsConfig = { percent: 100, campaignId: L2B_CAMPAIGN_ID }
+  const { socket, state } = await connectPastGreeting(callSid, { rolloutPercent: 0, sessionOverrides: { campaign: l2bCampaign() } })
+  state.claudeConditionalImpl = (sess, signal, onMilestone) => (async function* () {
+    onMilestone?.('requestAt', Date.now())
+    onMilestone?.('mode', 'SINGLE_SHOT')
+    yield 'คำตอบทดสอบ'
+    onMilestone?.('fullAt', Date.now())
+    onMilestone?.('finalText', 'คำตอบทดสอบ')
+    onMilestone?.('endCallRequested', false)
+  })()
+
+  const metrics = await captureMetrics(() => harness.sendFinalTranscript('ทดสอบ'))
+
+  assert.equal(metrics.l2bChunkReason, null)
+  assert.equal(metrics.l2bChunkCharCount, null)
+  assert.equal(metrics.l2bChunkDeltaCount, null)
+  assert.equal(metrics.l2bChunkFirstCandidateElapsedMs, null)
+  assert.equal(metrics.l2bChunkNumericProtectionBlocked, null)
+  assert.equal(metrics.l2bChunkPreSafeDeltaGapMs, null)
+  assert.equal(metrics.legacyEarlyTtsOutcome, 'COMPLETED', 'ไม่มี chunkReasonStats ต้องไม่กระทบ path การันตี turn อื่นๆ เลย')
   harness.disconnect(socket)
 })
 

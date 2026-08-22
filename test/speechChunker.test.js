@@ -1,6 +1,6 @@
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
-const { findChunkBoundary, getNumericProtectionRemainingMs } = require('../src/utils/speechChunker')
+const { findChunkBoundary, getNumericProtectionRemainingMs, evaluateNumericProtectionDiagnostic, CHUNK_REASON } = require('../src/utils/speechChunker')
 
 // chunk ผ่าน .trim() มาแล้วเลยสั้นกว่า cut point จริงได้ (เสียช่องว่างที่ตัดขอบไป) — ไม่ควรเช็คด้วย
 // buffer.slice(r.chunk.length) ตรงๆ เพราะจะเข้าใจผิดว่าช่องว่างที่ trim ทิ้งไปคือ "ตัวอักษรหาย" เช็คแค่ 2 คุณสมบัติที่สำคัญจริง:
@@ -173,4 +173,80 @@ test('getNumericProtectionRemainingMs: buffer สั้นกว่า FALLBACK_
 test('getNumericProtectionRemainingMs: buffer ว่างเปล่า → null', () => {
   assert.equal(getNumericProtectionRemainingMs('', 100), null)
   assert.equal(getNumericProtectionRemainingMs(null, 100), null)
+})
+
+// ---------------------------------------------------------------------------
+// Track M (diagnostic only, design R3 LOCKED 2026-08-22) — reason field ใน findChunkBoundary() ต้องตรงกับ
+// 4 branch จริงเป๊ะ และ evaluateNumericProtectionDiagnostic() ต้อง gate ด้วย SOFT_TIMEOUT_MS เหมือน
+// findChunkBoundary() จริง (แก้ false-positive ที่ R1 เคยพลาดตอนใช้ getNumericProtectionRemainingMs() ตรงๆ)
+// ---------------------------------------------------------------------------
+
+test('Track M reason: strong boundary → CHUNK_REASON.STRONG_BOUNDARY', () => {
+  const r = findChunkBoundary('มีอะไรสอบถามเพิ่มเติมไหมคะ? แล้วอันนี้อีกเรื่อง', 0)
+  assert.equal(r.reason, CHUNK_REASON.STRONG_BOUNDARY)
+})
+
+test('Track M reason: Thai soft boundary → CHUNK_REASON.SOFT_BOUNDARY', () => {
+  const r = findChunkBoundary('ยินดีค่ะ พี่สนใจกิจกรรมนี้ไหมคะ', 0)
+  assert.equal(r.reason, CHUNK_REASON.SOFT_BOUNDARY)
+})
+
+test('Track M reason: natural boundary ใน soft-window (elapsed=300, buffer>=25) → CHUNK_REASON.NATURAL_BOUNDARY', () => {
+  const buffer = 'aaaaaaaaaa bbbbbbbbbb cccccccccc dddddddddd'
+  const r = findChunkBoundary(buffer, 300)
+  assert.equal(r.reason, CHUNK_REASON.NATURAL_BOUNDARY)
+})
+
+test('Track M reason: natural boundary ที่ hard max (elapsed=900, buffer>=25) → CHUNK_REASON.NATURAL_BOUNDARY_HARD_MAX', () => {
+  const buffer = 'aaaaaaaaaa bbbbbbbbbb cccccccccc dddddddddd'
+  const r = findChunkBoundary(buffer, 900)
+  assert.equal(r.reason, CHUNK_REASON.NATURAL_BOUNDARY_HARD_MAX)
+})
+
+test('Track M Final Blocker 1: buffer สั้นกว่า FALLBACK_MIN_LENGTH(25) แต่ยาวกว่า MIN_CHUNK_LENGTH(6) — ต้องยังไม่ตัดก่อน HARD_MAX แต่ตัดได้ที่ HARD_MAX พอดี (source บรรทัด 99-104 ไม่มี FALLBACK_MIN_LENGTH gate)', () => {
+  const buffer = 'aaaaaaaaaa bb' // 13 ตัวอักษร: 6<=13<25, มี natural boundary ที่ position 10 (>=MIN_CHUNK_LENGTH)
+  assert.equal(buffer.length < 25 && buffer.length >= 6, true, 'sanity: buffer ต้องอยู่ในช่วงที่ R2 เคยพลาด')
+
+  const before = findChunkBoundary(buffer, 799)
+  assert.equal(before, null, 'ก่อน HARD_MAX, buffer<FALLBACK_MIN_LENGTH → soft-window path ปฏิเสธ ต้องยังไม่ตัด')
+
+  const after = findChunkBoundary(buffer, 800)
+  assert.ok(after, 'ที่ HARD_MAX พอดี ต้องตัดได้แม้ buffer<25 เพราะ branch นี้ gate แค่ MIN_CHUNK_LENGTH')
+  assert.equal(after.reason, CHUNK_REASON.NATURAL_BOUNDARY_HARD_MAX)
+  assert.equal(after.chunk, 'aaaaaaaaaa')
+  assert.equal(after.remainder, 'bb', 'naturalCut อยู่หลัง space ทันที (findLastSafeBoundary คืน i+1) — remainder จึงไม่มี space นำหน้า')
+})
+
+// ใช้ NUMERIC_TAIL_BUFFER (ประกาศไว้ด้านบน มี trailing space ท้าย "2,000") ตรงๆ — ไม่ retype literal เอง เพราะ
+// ถ้าพลาด trailing space จะทำให้ findLastSafeBoundary หาจุดตัดผิดตำแหน่ง (candidate ไม่ลงท้ายตัวเลขอีกต่อไป)
+test('Track M evaluateNumericProtectionDiagnostic: elapsedMs=50 (ก่อน SOFT_TIMEOUT_MS) แม้ buffer ลงท้ายตัวเลขและยาวพอ → candidateEligible=false, blockedByNumericProtection=false (R2 false-positive fix)', () => {
+  const d = evaluateNumericProtectionDiagnostic(NUMERIC_TAIL_BUFFER, 50)
+  assert.equal(d.candidateEligible, false)
+  assert.equal(d.blockedByNumericProtection, false)
+})
+
+test('Track M evaluateNumericProtectionDiagnostic: elapsedMs=400, natural candidate ยาวพอ ไม่ลงท้ายตัวเลข → candidateEligible=true, blocked=false', () => {
+  const d = evaluateNumericProtectionDiagnostic('aaaaaaaaaa bbbbbbbbbb cccccccccc dddddddddd', 400)
+  assert.equal(d.candidateEligible, true)
+  assert.equal(d.blockedByNumericProtection, false)
+})
+
+test('Track M evaluateNumericProtectionDiagnostic: elapsedMs=400, natural candidate ลงท้ายตัวเลข → candidateEligible=true, blocked=true', () => {
+  const d = evaluateNumericProtectionDiagnostic(NUMERIC_TAIL_BUFFER, 400)
+  assert.equal(d.candidateEligible, true)
+  assert.equal(d.blockedByNumericProtection, true)
+})
+
+test('Track M evaluateNumericProtectionDiagnostic: elapsedMs=850 (>=HARD_MAX) เดียวกับข้างบน → blocked=false (protection หมดอายุ)', () => {
+  const d = evaluateNumericProtectionDiagnostic(NUMERIC_TAIL_BUFFER, 850)
+  assert.equal(d.candidateEligible, true)
+  assert.equal(d.blockedByNumericProtection, false)
+})
+
+test('Track M regression: .chunk/.remainder เดิมไม่เปลี่ยนค่าจากการเพิ่ม .reason (byte-for-byte เดิม)', () => {
+  const buffer = 'ยินดีค่ะ พี่สนใจกิจกรรมนี้ไหมคะ'
+  const r = findChunkBoundary(buffer, 0)
+  assertCleanSplit(buffer, r)
+  assert.equal(r.chunk, 'ยินดีค่ะ')
+  assert.equal(r.remainder, ' พี่สนใจกิจกรรมนี้ไหมคะ')
 })

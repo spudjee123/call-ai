@@ -545,3 +545,115 @@ test('Track L throw-protection: onMilestone throw บน inputStats และ re
   assert.deepEqual(chunks, ['คำตอบปกติ'], 'chunk ที่ได้ต้องไม่กระทบแม้ callback จะ throw ทั้งสองจุด')
   assert.ok(inputStatsThrew && responseCharCountThrew, 'ต้องยืนยันว่า callback throw จริงทั้งสองจุด ไม่ใช่ไม่เคยถูกเรียก')
 })
+
+// ---------------------------------------------------------------------------
+// Track M (design revision 2026-08-22, Design Gate R3 PASS/LOCKED) — chunk boundary telemetry สำหรับ first
+// safe chunk เท่านั้น (scope เดียวกับ chunkDelay=t4-t3) diagnostic only ไม่มีการเปลี่ยน timing/threshold ใดๆ
+// ---------------------------------------------------------------------------
+
+function findMilestone(events, key) { return events.find(e => e.key === key) }
+
+test('Track M: STRONG_BOUNDARY → l2bChunkFirstCandidateElapsedMs ต้องเท่ากับ chunkDelay (firstSafeAt-firstDeltaAt) เป๊ะ ไม่ใช่แค่ใกล้เคียง', async () => {
+  state.events = [textDelta('ขอบคุณค่ะ! ยินดีให้บริการ')] // strong boundary (!) ตัดทันที elapsedMs~0
+  const { events, onMilestone } = makeMilestoneRecorder()
+  await collect(askClaudeConditionalStream(makeSession(), null, onMilestone))
+
+  const firstDeltaAt = findMilestone(events, 'firstDeltaAt')?.value
+  const firstSafeAt = findMilestone(events, 'firstSafeAt')?.value
+  const stats = findMilestone(events, 'chunkReasonStats')?.value
+  assert.equal(stats.reason, 'STRONG_BOUNDARY')
+  assert.equal(stats.firstCandidateElapsedMs, firstSafeAt - firstDeltaAt, 'ต้องมาจาก timestamp เดิมที่ capture ไว้แล้ว ไม่ใช่ re-measure ใหม่')
+  assert.equal(stats.numericProtectionBlocked, false, 'STRONG_BOUNDARY ต้องเป็น false เสมอ (ไม่ใช่ null) เพราะ numeric protection ไม่เกี่ยวข้องกับ path นี้โดยนิยาม')
+})
+
+test('Track M: SOFT_BOUNDARY → l2bChunkFirstCandidateElapsedMs เท่ากับ chunkDelay เป๊ะเช่นกัน', async () => {
+  state.events = [textDelta('ยินดีค่ะ พี่สนใจไหมคะ')]
+  const { events, onMilestone } = makeMilestoneRecorder()
+  await collect(askClaudeConditionalStream(makeSession(), null, onMilestone))
+
+  const firstDeltaAt = findMilestone(events, 'firstDeltaAt')?.value
+  const firstSafeAt = findMilestone(events, 'firstSafeAt')?.value
+  const stats = findMilestone(events, 'chunkReasonStats')?.value
+  assert.equal(stats.reason, 'SOFT_BOUNDARY')
+  assert.equal(stats.firstCandidateElapsedMs, firstSafeAt - firstDeltaAt)
+  assert.equal(stats.numericProtectionBlocked, false)
+})
+
+test('Track M: NATURAL_BOUNDARY_HARD_MAX กับ numeric-protection ที่เคย block จริง → firstCandidateElapsedMs ต้องน้อยกว่า chunkDelay อย่างมีนัยสำคัญ (candidate พร้อมตั้งแต่ก่อน HARD_MAX แต่ emit ช้าไปถึง HARD_MAX)', { timeout: 5000 }, async () => {
+  state.streamImpl = (events, signal) => ({
+    async *[Symbol.asyncIterator]() {
+      yield textDelta('ตอนนี้สมาชิกใหม่ฝาก 100 บาท รับ 2,000 ') // >=25 ตัวอักษร ลงท้ายตัวเลข+space, elapsedMs~0 ยังไม่ครบ SOFT_TIMEOUT
+      await new Promise(r => setTimeout(r, 400)) // ตอนนี้ elapsedMs~400 อยู่ใน [300,800) → candidate eligible+blocked (ไม่มีจุดตัดใหม่ ไม่มี strong/soft trigger)
+      yield textDelta('ก') // ตัวอักษรเดี่ยวไม่ trigger boundary ใหม่ ไม่เพิ่ม space ใหม่ — candidate เดิมยัง blocked อยู่
+      await new Promise(r => setTimeout(r, 500)) // รวม elapsedMs~900 (>=HARD_MAX 800) — ไม่มี delta ใหม่มาปลุกจนกว่าจะถึงตอนนี้
+      yield textDelta('ข') // delta ที่ทำให้ evaluate ใหม่ที่ elapsedMs>=HARD_MAX → cut ที่ตำแหน่งเดิม (ก่อนตัวเลข)
+    },
+  })
+  const { events, onMilestone } = makeMilestoneRecorder()
+  await collect(askClaudeConditionalStream(makeSession(), null, onMilestone))
+
+  const firstDeltaAt = findMilestone(events, 'firstDeltaAt')?.value
+  const firstSafeAt = findMilestone(events, 'firstSafeAt')?.value
+  const chunkDelay = firstSafeAt - firstDeltaAt
+  const stats = findMilestone(events, 'chunkReasonStats')?.value
+
+  assert.equal(stats.reason, 'NATURAL_BOUNDARY_HARD_MAX')
+  assert.equal(stats.numericProtectionBlocked, true, 'ต้องจับได้ว่าเคย blocked จริงระหว่างทาง')
+  assert.ok(chunkDelay >= 850, `chunkDelay ต้องสูงจริง (~900ms) วัดได้จริง ${chunkDelay}ms`)
+  assert.ok(stats.firstCandidateElapsedMs < chunkDelay - 300, `candidate ต้องพร้อมเร็วกว่า emit มากจริง (candidate=${stats.firstCandidateElapsedMs}ms, chunkDelay=${chunkDelay}ms)`)
+  assert.ok(stats.firstCandidateElapsedMs >= 350 && stats.firstCandidateElapsedMs < 500, `candidate ต้องมาจากรอบที่ 400ms ไม่ใช่รอบแรก(~0) หรือรอบสุดท้าย(~900) ได้จริง ${stats.firstCandidateElapsedMs}ms`)
+  assert.equal(stats.deltaCount, 3, 'ต้องนับ delta ทั้ง 3 ก้อนที่มาก่อน cut (รวมก้อนที่ทำให้ cut ด้วย)')
+  assert.ok(stats.preSafeDeltaGapMs >= 450, `gap ระหว่าง delta ก่อนหน้ากับ delta ที่ cut ต้อง ~500ms ได้จริง ${stats.preSafeDeltaGapMs}ms`)
+})
+
+test('Track M: SINGLE_SHOT ที่มี firstSafeAt จริง (grace ทัน) → l2bChunk* fields ยัง populate ปกติ ไม่ null เพราะ mode', async () => {
+  const delaysMs = [0, 20] // เร็วกว่า grace (150ms) มาก
+  state.streamImpl = (events, signal) => makeSlowFakeStream(events, delaysMs, signal)
+  state.events = [textDelta('ประโยคแรกครับ. '), textDelta('ประโยคสอง.')]
+  const { events, onMilestone } = makeMilestoneRecorder()
+  await collect(askClaudeConditionalStream(makeSession(), null, onMilestone))
+
+  assert.equal(findMilestone(events, 'mode')?.value, 'SINGLE_SHOT')
+  const stats = findMilestone(events, 'chunkReasonStats')?.value
+  assert.ok(stats, 'ต้องมี chunkReasonStats แม้ mode สุดท้ายจะเป็น SINGLE_SHOT เพราะ firstSafeAt ถูกจับไปแล้วก่อนจะรู้ผล grace')
+  assert.equal(stats.reason, 'STRONG_BOUNDARY')
+})
+
+test('Track M: stream จบก่อนเจอ boundary ใดๆ เลย (chunkDelay=null) → chunkReasonStats ไม่ถูกยิงเลย', async () => {
+  state.events = [textDelta('ครับผม')] // ไม่มี boundary ใดๆ เลยตลอด stream
+  const { events, onMilestone } = makeMilestoneRecorder()
+  await collect(askClaudeConditionalStream(makeSession(), null, onMilestone))
+
+  assert.equal(findMilestone(events, 'chunkReasonStats'), undefined, 'ไม่เจอ boundary เลย ต้องไม่มี milestone นี้ยิงออกมา (fields เหลือ default null ตามธรรมชาติของ turnMetrics)')
+})
+
+test('Track M Blocker 3 regression: delta ที่มาระหว่าง 150ms grace race (หลัง firstSafeAt ถูกจับแล้ว) ต้องไม่ถูกนับเข้า deltaCount', { timeout: 5000 }, async () => {
+  state.streamImpl = (events, signal) => ({
+    async *[Symbol.asyncIterator]() {
+      yield textDelta('ประโยคแรกครับ. ') // strong boundary ทันที elapsedMs~0 → firstSafeAt จับที่นี่, deltaCount ต้อง freeze ที่ 1
+      await new Promise(r => setTimeout(r, 60)) // ยังอยู่ใน grace window (150ms)
+      yield textDelta('เพิ่มเข้ามาอีก ') // delta นี้มาระหว่าง grace — mode ยังเป็น null แต่ firstSafeAt ไม่ null แล้ว
+      await new Promise(r => setTimeout(r, 60))
+      yield textDelta('อีกก้อนนึง ') // อีกก้อนระหว่าง grace เช่นกัน
+      await new Promise(r => setTimeout(r, 300)) // เลย grace ไปแน่นอน → mode ต้องกลายเป็น CHUNKED
+    },
+  })
+  const { events, onMilestone } = makeMilestoneRecorder()
+  await collect(askClaudeConditionalStream(makeSession(), null, onMilestone))
+
+  const stats = findMilestone(events, 'chunkReasonStats')?.value
+  assert.equal(stats.deltaCount, 1, 'ต้อง freeze ที่ 1 (delta แรกที่ทำให้เกิด first-safe) ไม่ขยับตาม delta ที่มาระหว่าง grace')
+  assert.equal(stats.preSafeDeltaGapMs, 0, 'delta แรกสุดของ turn ต้อง gap=0 (ไม่มี delta ก่อนหน้า)')
+  assert.equal(findMilestone(events, 'mode')?.value, 'CHUNKED', 'sanity: ต้องเลย grace จริง ไม่ใช่ SINGLE_SHOT โดยไม่ตั้งใจ')
+})
+
+test('Track M throw-protection: onMilestone throw บน chunkReasonStats → stream/chunk จริงยังจบปกติ ไม่กระทบ', async () => {
+  state.events = [textDelta('ขอบคุณค่ะ!')] // strong boundary จริง — ต้องเจอ chunkReasonStats ถูกยิงจริง ไม่ใช่ fixture ที่ไม่มี boundary เลย
+  let threw = false
+  const throwingMilestone = (key, value) => {
+    if (key === 'chunkReasonStats') { threw = true; throw new Error('boom chunkReasonStats') }
+  }
+  const chunks = await collect(askClaudeConditionalStream(makeSession(), null, throwingMilestone))
+  assert.deepEqual(chunks, ['ขอบคุณค่ะ!'])
+  assert.ok(threw, 'ต้องยืนยันว่า callback throw จริง ไม่ใช่ไม่เคยถูกเรียก')
+})
