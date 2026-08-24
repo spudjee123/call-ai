@@ -1,6 +1,6 @@
 const Anthropic = require('@anthropic-ai/sdk')
 const { performance } = require('perf_hooks')
-const { findChunkBoundary, getNumericProtectionRemainingMs, evaluateNumericProtectionDiagnostic, CHUNK_REASON } = require('../utils/speechChunker')
+const { findChunkBoundary, getNumericProtectionRemainingMs, evaluateNumericProtectionDiagnostic, CHUNK_REASON, SOFT_TIMEOUT_MS: CHUNKER_SOFT_TIMEOUT_MS } = require('../utils/speechChunker')
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
 
@@ -566,6 +566,22 @@ async function* askClaudeConditionalStream(session, signal = null, onMilestone =
     let firstCandidateAt = null
     let numericProtectionEverBlocked = false
 
+    // Track N (design R6 LOCKED 2026-08-22) — deciding phase (mode===null, before firstSafeAt) previously
+    // had no proactive wakeup: it only re-evaluated findChunkBoundary() on real delta arrival, so a
+    // numeric-protected candidate whose protection expires at HARD_MAX_MS could overshoot by however long
+    // the NEXT delta happened to take. hardMaxRecheckPromise is a third racer (mirrors gracePromise's shape
+    // exactly) that lets the driver wake itself once HARD_MAX_MS is reached, without waiting on Claude.
+    let hardMaxRecheckTimer = null
+    let hardMaxRecheckPromise = null
+    // wall-clock instant (performance.now() coordinate) the CURRENT numeric-protection episode first became
+    // policy-eligible — derived from the arming decision itself (numericProtectionRemainingMs, production-
+    // relevant, never try/catch-wrapped), not from the Track M diagnostic observer (which is deliberately
+    // non-fatal and can miss the exact instant). Reset to null whenever the episode ends (remainingMs
+    // becomes null) — proven safe (R6): within an already-armed episode with append-only buffer growth and
+    // no successful cut yet, "cut fails AND remainingMs===null" is unreachable past SOFT_TIMEOUT_MS, so this
+    // reset only ever fires for a candidate that never actually reached eligibility (R4's Case A).
+    let firstNumericCandidateEligibleAt = null
+
     // phase 2 (mode === 'CHUNKED'): drain every safe chunk as found, same continuous-flush shape as
     // chunkedTurn.js's drainReadyChunks() — arms its own wall-clock numeric-protection timer so a
     // protected buffer still resolves even if Claude goes quiet before HARD_MAX_MS
@@ -598,6 +614,80 @@ async function* askClaudeConditionalStream(session, signal = null, onMilestone =
       })
     }
 
+    // Track N (design R6 LOCKED 2026-08-22) — Track-N owns full cleanup of its own timer; never retrofits
+    // graceTimer/numericProtectionTimer's own (pre-existing, unrelated) cleanup behavior.
+    function clearHardMaxRecheckTimer() {
+      if (hardMaxRecheckTimer) { clearTimeout(hardMaxRecheckTimer); hardMaxRecheckTimer = null }
+      hardMaxRecheckPromise = null
+    }
+
+    // Track N — arms (or re-arms) the HARD_MAX recheck racer whenever the current buffer is genuinely
+    // numeric-protection-blocked. Self-healing (R4 Blocker 1): if the timer wakes early/spuriously (e.g. a
+    // fractional-ms setTimeout delay got truncated) and the cut attempt still fails, the caller re-invokes
+    // this with the freshly-recomputed elapsedMs, which re-arms for whatever tiny remainder is left — never
+    // silently falls back to depending on a future Claude delta.
+    function armHardMaxRecheckIfNeeded(elapsedMs) {
+      const remainingMs = numericProtectionRemainingMs(elapsedMs)
+      if (remainingMs == null) {
+        // the episode firstNumericCandidateEligibleAt (if any) was tracking has ended — proven safe (R6) to
+        // discard here: past SOFT_TIMEOUT_MS this can only happen alongside a cut that JUST succeeded
+        // (meaning armHardMaxRecheckIfNeeded wouldn't even be called — see the `if (!cut)` guards below), so
+        // reaching this branch means the candidate never actually reached eligibility (R4 Case A).
+        firstNumericCandidateEligibleAt = null
+        return
+      }
+      if (firstNumericCandidateEligibleAt === null) {
+        firstNumericCandidateEligibleAt = elapsedMs >= CHUNKER_SOFT_TIMEOUT_MS
+          ? (segmentStartMs + elapsedMs)        // already eligible right now — exact wall-clock instant
+          : (segmentStartMs + CHUNKER_SOFT_TIMEOUT_MS) // not yet eligible — this is the precise instant it will become so
+      }
+      hardMaxRecheckPromise = new Promise(resolve => {
+        hardMaxRecheckTimer = setTimeout(() => { hardMaxRecheckTimer = null; resolve() }, remainingMs)
+      })
+    }
+
+    // Track N — single source of truth for "a safe first chunk was found and everything that follows from
+    // that (milestones, grace arm, pendingFirstChunk/buffer split) happened correctly," shared by both the
+    // real-delta path and the HARD_MAX-timer-fire path so they can never emit different milestone shapes or
+    // drift out of sync with each other.
+    function attemptFirstSafeCut(elapsedMs, trigger, deltaGapMs) {
+      const result = tryFindBoundary(elapsedMs)
+      if (!result) return false
+      firstSafeAt = performance.now()
+      onMilestone?.('firstSafeAt', firstSafeAt)
+      try {
+        const isStrongOrSoft = result.reason === CHUNK_REASON.STRONG_BOUNDARY || result.reason === CHUNK_REASON.SOFT_BOUNDARY
+        // R5 Case C fix — prefer the EARLIEST proven candidate timestamp across both sources, not
+        // unconditionally "prefer diagnostic": the diagnostic observer can only latch on a real delta
+        // arrival, so if no delta happens to land at/after the candidate's true eligible instant, the
+        // arming-derived firstNumericCandidateEligibleAt is the earlier (and correct) answer.
+        const candidateTimestamps = [firstCandidateAt, firstNumericCandidateEligibleAt].filter(v => v !== null)
+        const candidateAt = candidateTimestamps.length ? Math.min(...candidateTimestamps) : null
+        const firstCandidateElapsedMs = isStrongOrSoft
+          ? (firstSafeAt - firstDeltaAt) // candidate IS the emit instant by construction — reuse existing timestamps, never re-measure
+          : (candidateAt !== null ? (candidateAt - firstDeltaAt) : (firstSafeAt - firstDeltaAt))
+        const preSafeDeltaGapMs = trigger === 'DELTA' ? deltaGapMs : (firstSafeAt - lastDeltaAt)
+        const numericProtectionBlocked = isStrongOrSoft
+          ? false
+          : trigger === 'HARD_MAX_TIMER'
+            ? true // structurally guaranteed — this trigger only ever fires from an armed numeric-protection timer
+            : numericProtectionEverBlocked
+        onMilestone?.('chunkReasonStats', {
+          reason: result.reason,
+          charCount: result.chunk.length,
+          deltaCount,
+          firstCandidateElapsedMs,
+          numericProtectionBlocked,
+          preSafeDeltaGapMs,
+          firstSafeTrigger: trigger,
+        })
+      } catch (_) { /* diagnostic only */ }
+      pendingFirstChunk = result.chunk
+      buffer = result.remainder
+      gracePromise = armGrace()
+      return true
+    }
+
     // exactly-once guarantee: waitForItem() on the consumer side only ever resolves via push() — every
     // driver exit path (abort mid-stream, normal completion, error) MUST push something or the consumer
     // hangs forever awaiting a promise nothing will ever resolve. Caught this before running any test by
@@ -614,9 +704,10 @@ async function* askClaudeConditionalStream(session, signal = null, onMilestone =
       while (true) {
         const racers = [pendingNext.then(r => ({ kind: 'stream', r }))]
         if (gracePromise) racers.push(gracePromise.then(() => ({ kind: 'grace' })))
+        if (hardMaxRecheckPromise) racers.push(hardMaxRecheckPromise.then(() => ({ kind: 'hardMaxRecheck' })))
         const winner = await Promise.race(racers)
 
-        if (signal?.aborted) { sendDone(); return }
+        if (signal?.aborted) { clearHardMaxRecheckTimer(); sendDone(); return }
 
         if (winner.kind === 'grace') {
           gracePromise = null
@@ -629,12 +720,35 @@ async function* askClaudeConditionalStream(session, signal = null, onMilestone =
           continue
         }
 
+        // Track N — HARD_MAX recheck fired: either genuinely at/past HARD_MAX_MS (cuts immediately) or an
+        // early/spurious wake (Blocker 1 — re-arms for whatever tiny remainder is left, never gives up and
+        // falls back to waiting on a future Claude delta). firstSafeAt===null is structurally guaranteed
+        // here (this promise only exists while it's null, and gets cleared on every real delta) — checked
+        // anyway as a defensive belt-and-braces guard, matching this codebase's general style.
+        if (winner.kind === 'hardMaxRecheck') {
+          hardMaxRecheckPromise = null
+          if (firstSafeAt === null) {
+            const elapsedMs = performance.now() - segmentStartMs
+            const cut = attemptFirstSafeCut(elapsedMs, 'HARD_MAX_TIMER')
+            if (!cut) armHardMaxRecheckIfNeeded(elapsedMs)
+          }
+          continue
+        }
+
         const { value: event, done } = winner.r
         if (done) break
         pendingNext = iterator.next()
 
-        if (signal?.aborted) { sendDone(); return }
+        if (signal?.aborted) { clearHardMaxRecheckTimer(); sendDone(); return }
         if (event.type !== 'content_block_delta' || event.delta?.type !== 'text_delta') continue
+
+        // Track N Review Fix 2 — captured here, before rawText/buffer are mutated or any other bookkeeping
+        // runs, so this is a genuine pre-supersession observation instant. deltaArrivedAt (below) is captured
+        // later, after that mutation/bookkeeping — fine for its own use (lastDeltaAt/gapFromPreviousDeltaMs,
+        // both Track M metrics measuring processing-relative gaps), but too late for comparing against
+        // firstNumericCandidateEligibleAt: near SOFT_TIMEOUT, the mutation/bookkeeping work between this line
+        // and that capture could itself push the comparison timestamp across the threshold.
+        const deltaObservedAt = performance.now()
 
         if (firstDeltaAt === null) { firstDeltaAt = performance.now(); onMilestone?.('firstDeltaAt', firstDeltaAt) }
         rawText += event.delta.text
@@ -650,10 +764,29 @@ async function* askClaudeConditionalStream(session, signal = null, onMilestone =
             // Track M bookkeeping — ONLY runs before first-safe is found. Once firstSafeAt is set below,
             // this whole block is skipped for any further deltas arriving during the 150ms grace race (mode
             // still null then, per the outer if/else here) — that is exactly the freeze R2 Blocker 3 requires.
+            // Track N — a real delta always supersedes a pending HARD_MAX recheck: clear it first so a
+            // stale timer (armed against an outdated buffer) can never fire after being superseded.
+            clearHardMaxRecheckTimer()
+
             deltaCount++
             const deltaArrivedAt = performance.now()
             const gapFromPreviousDeltaMs = lastDeltaAt === null ? 0 : (deltaArrivedAt - lastDeltaAt)
             lastDeltaAt = deltaArrivedAt
+
+            // Track N Review Fix 1 (timestamp corrected in Review Fix 2) — a numeric-protection episode can
+            // genuinely reach its eligible instant with NO delta arriving in between (that's the entire
+            // reason the HARD_MAX timer exists). If THIS delta was observed at/after that instant, the
+            // previous episode was truly being blocked for real wall-clock time right up until this delta
+            // supersedes it — even though the diagnostic below will now observe the NEW (already-superseded)
+            // buffer and correctly report blockedByNumericProtection=false for it. Must promote
+            // numericProtectionEverBlocked here, BEFORE that diagnostic evaluates the new state, using
+            // deltaObservedAt (captured above the moment this event was confirmed a text delta, before any
+            // mutation/bookkeeping) rather than deltaArrivedAt — deltaArrivedAt is captured after
+            // rawText/buffer mutation and other bookkeeping, so near SOFT_TIMEOUT that gap could itself push
+            // the comparison timestamp across the threshold and produce a false positive.
+            if (firstNumericCandidateEligibleAt !== null && deltaObservedAt >= firstNumericCandidateEligibleAt) {
+              numericProtectionEverBlocked = true
+            }
 
             const elapsedMs = performance.now() - segmentStartMs
 
@@ -665,32 +798,8 @@ async function* askClaudeConditionalStream(session, signal = null, onMilestone =
               if (diag.blockedByNumericProtection) numericProtectionEverBlocked = true
             } catch (_) { /* diagnostic only — must never affect the real cut decision below */ }
 
-            const result = tryFindBoundary(elapsedMs)
-            if (result) {
-              firstSafeAt = performance.now()
-              onMilestone?.('firstSafeAt', firstSafeAt)
-              try {
-                // locked implementation detail (R3 review): for STRONG/SOFT the candidate IS the emit instant
-                // by construction — reuse the timestamps already captured directly, never re-measure via a
-                // fresh performance.now() call and claim it's "exactly equal"
-                const isStrongOrSoft = result.reason === CHUNK_REASON.STRONG_BOUNDARY || result.reason === CHUNK_REASON.SOFT_BOUNDARY
-                const firstCandidateElapsedMs = isStrongOrSoft
-                  ? (firstSafeAt - firstDeltaAt)
-                  : (firstCandidateAt !== null ? (firstCandidateAt - firstDeltaAt) : (firstSafeAt - firstDeltaAt))
-                onMilestone?.('chunkReasonStats', {
-                  reason: result.reason,
-                  charCount: result.chunk.length,
-                  deltaCount,
-                  firstCandidateElapsedMs,
-                  numericProtectionBlocked: isStrongOrSoft ? false : numericProtectionEverBlocked,
-                  preSafeDeltaGapMs: gapFromPreviousDeltaMs,
-                })
-              } catch (_) { /* diagnostic only */ }
-              pendingFirstChunk = result.chunk
-              buffer = result.remainder
-              gracePromise = armGrace()
-            }
-            // no boundary yet: keep accumulating, nothing to flush
+            const cut = attemptFirstSafeCut(elapsedMs, 'DELTA', gapFromPreviousDeltaMs)
+            if (!cut) armHardMaxRecheckIfNeeded(elapsedMs)
           }
           // else: firstSafeAt already found, still waiting on the grace race (mode still null) — nothing to do
         }
@@ -698,6 +807,7 @@ async function* askClaudeConditionalStream(session, signal = null, onMilestone =
 
       clearNumericProtectionTimer()
       clearGraceTimer()
+      clearHardMaxRecheckTimer()
       if (signal?.aborted) { sendDone(); return }
 
       const fullAt = performance.now()
@@ -733,6 +843,7 @@ async function* askClaudeConditionalStream(session, signal = null, onMilestone =
     } catch (err) {
       clearNumericProtectionTimer()
       clearGraceTimer()
+      clearHardMaxRecheckTimer()
       if (!signal?.aborted) push({ type: 'error', err })
       else sendDone() // abort surfaced as a rejected iterator.next() instead of a clean stream end — still must not hang the consumer
     }

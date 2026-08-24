@@ -103,7 +103,13 @@ function createTurnMetrics({
     l2bChunkDeltaCount: null, // count of Claude text deltas from turn start up to and including the one that produced first-safe — frozen there, never counts deltas arriving during the 150ms grace race
     l2bChunkFirstCandidateElapsedMs: null, // elapsed ms from firstDeltaAt to when a cut candidate first became eligible — equals chunkDelay exactly for STRONG_BOUNDARY/SOFT_BOUNDARY (no separate candidate state exists for those); can be strictly less than chunkDelay for NATURAL_BOUNDARY* when numeric-tail protection or the SOFT_TIMEOUT/HARD_MAX gate delayed the actual cut
     l2bChunkNumericProtectionBlocked: null, // true only if a natural-boundary candidate was policy-eligible AND held back by numeric-tail protection at least once before the eventual cut — false (not null) for STRONG_BOUNDARY/SOFT_BOUNDARY since numeric protection never applies to those by construction
-    l2bChunkPreSafeDeltaGapMs: null, // observed wall-clock gap between the delta immediately preceding the one that produced first-safe, and that delta itself — 0 if first-safe came from the very first delta of the turn. Correlational only: cannot by itself prove "waiting for the next delta" vs "Claude paced generation slowly" (deciding phase has no proactive wall-clock re-check, unlike drainChunked()'s CHUNKED-phase timer)
+    l2bChunkPreSafeDeltaGapMs: null, // DELTA trigger: observed wall-clock gap between the delta immediately preceding the causal one and the causal delta itself — 0 if first-safe came from the very first delta of the turn. HARD_MAX_TIMER trigger: gap between the last real delta observed and the timer-established firstSafeAt instant (no causal delta exists for this trigger). Correlational only — cannot by itself prove Claude paced generation slowly vs. simply nothing more being needed once the HARD_MAX window closed. (Track N, design R6 LOCKED 2026-08-22 — the deciding phase now HAS a proactive HARD_MAX wall-clock re-check via l2bChunkFirstSafeTrigger='HARD_MAX_TIMER'; it previously did not, matching drainChunked()'s CHUNKED-phase timer.)
+    // Track N (design R6 LOCKED 2026-08-22) — 'DELTA' | 'HARD_MAX_TIMER'. Distinguishes a first-safe cut
+    // caused by a real Claude delta from one caused by the new HARD_MAX proactive-wakeup timer (which no
+    // longer depends on a future delta once a numeric-protected candidate's protection window expires).
+    // Always populated whenever l2bChunkReason is non-null (never a third, unpopulated state for this field
+    // specifically) — HARD_MAX_TIMER can only ever co-occur with l2bChunkReason='NATURAL_BOUNDARY_HARD_MAX'.
+    l2bChunkFirstSafeTrigger: null,
   }
 }
 

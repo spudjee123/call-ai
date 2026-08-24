@@ -2485,6 +2485,7 @@ test('L2b precedence (required criterion 4): chunked=true → legacyEarlyTts=fal
   assert.equal(metrics.l2bChunkFirstCandidateElapsedMs, null)
   assert.equal(metrics.l2bChunkNumericProtectionBlocked, null)
   assert.equal(metrics.l2bChunkPreSafeDeltaGapMs, null)
+  assert.equal(metrics.l2bChunkFirstSafeTrigger, null) // Track N
   harness.disconnect(socket)
 })
 
@@ -2514,6 +2515,7 @@ test('L2b precedence (required criterion 4): legacyObserved=true → legacyEarly
   assert.equal(metrics.l2bChunkFirstCandidateElapsedMs, null)
   assert.equal(metrics.l2bChunkNumericProtectionBlocked, null)
   assert.equal(metrics.l2bChunkPreSafeDeltaGapMs, null)
+  assert.equal(metrics.l2bChunkFirstSafeTrigger, null) // Track N
   harness.disconnect(socket)
 })
 
@@ -2614,6 +2616,7 @@ test('Track M wiring: onMilestone("chunkReasonStats", {...}) ต้อง map �
       firstCandidateElapsedMs: 350,
       numericProtectionBlocked: true,
       preSafeDeltaGapMs: 480,
+      firstSafeTrigger: 'HARD_MAX_TIMER',
     })
     onMilestone?.('firstSafeAt', Date.now())
     onMilestone?.('mode', 'SINGLE_SHOT')
@@ -2631,6 +2634,44 @@ test('Track M wiring: onMilestone("chunkReasonStats", {...}) ต้อง map �
   assert.equal(metrics.l2bChunkFirstCandidateElapsedMs, 350)
   assert.equal(metrics.l2bChunkNumericProtectionBlocked, true)
   assert.equal(metrics.l2bChunkPreSafeDeltaGapMs, 480)
+  assert.equal(metrics.l2bChunkFirstSafeTrigger, 'HARD_MAX_TIMER') // Track N
+  harness.disconnect(socket)
+})
+
+test('Track N wiring — Review Fix 1 pattern extended: chunkReasonStats ที่มี field อื่นถูกหมดแต่ firstSafeTrigger ผิด enum → ทุก 7 field ต้องเป็น null (atomic รวม field ใหม่ด้วย)', async () => {
+  const callSid = 'CA_L2B_TRACKN_BAD_TRIGGER'
+  harness.getState().legacyEarlyTtsConfig = { percent: 100, campaignId: L2B_CAMPAIGN_ID }
+  const { socket, state } = await connectPastGreeting(callSid, { rolloutPercent: 0, sessionOverrides: { campaign: l2bCampaign() } })
+  state.claudeConditionalImpl = (sess, signal, onMilestone) => (async function* () {
+    onMilestone?.('requestAt', Date.now())
+    onMilestone?.('firstDeltaAt', Date.now())
+    onMilestone?.('chunkReasonStats', {
+      reason: 'SOFT_BOUNDARY',
+      charCount: 10,
+      deltaCount: 1,
+      firstCandidateElapsedMs: 20,
+      numericProtectionBlocked: false,
+      preSafeDeltaGapMs: 0,
+      firstSafeTrigger: 'SOMETHING_ELSE', // ไม่อยู่ใน DELTA|HARD_MAX_TIMER
+    })
+    onMilestone?.('firstSafeAt', Date.now())
+    onMilestone?.('mode', 'SINGLE_SHOT')
+    yield 'คำตอบทดสอบ'
+    onMilestone?.('fullAt', Date.now())
+    onMilestone?.('finalText', 'คำตอบทดสอบ')
+    onMilestone?.('endCallRequested', false)
+  })()
+
+  const metrics = await captureMetrics(() => harness.sendFinalTranscript('ทดสอบ'))
+
+  assert.equal(metrics.l2bChunkReason, null, 'field อื่นถูกหมดก็ไม่ช่วย — payload ต้องถูกปฏิเสธทั้งชุดเพราะ firstSafeTrigger ผิด')
+  assert.equal(metrics.l2bChunkCharCount, null)
+  assert.equal(metrics.l2bChunkDeltaCount, null)
+  assert.equal(metrics.l2bChunkFirstCandidateElapsedMs, null)
+  assert.equal(metrics.l2bChunkNumericProtectionBlocked, null)
+  assert.equal(metrics.l2bChunkPreSafeDeltaGapMs, null)
+  assert.equal(metrics.l2bChunkFirstSafeTrigger, null)
+  assert.equal(metrics.legacyEarlyTtsOutcome, 'COMPLETED')
   harness.disconnect(socket)
 })
 
@@ -2648,6 +2689,7 @@ test('Track M wiring — Review Fix 1: chunkReasonStats ที่เป็น ob
       firstCandidateElapsedMs: NaN,
       numericProtectionBlocked: 'yes',
       preSafeDeltaGapMs: -10,
+      firstSafeTrigger: 'BAD_TRIGGER',
     })
     onMilestone?.('firstSafeAt', Date.now())
     onMilestone?.('mode', 'SINGLE_SHOT')
@@ -2665,6 +2707,7 @@ test('Track M wiring — Review Fix 1: chunkReasonStats ที่เป็น ob
   assert.equal(metrics.l2bChunkFirstCandidateElapsedMs, null)
   assert.equal(metrics.l2bChunkNumericProtectionBlocked, null)
   assert.equal(metrics.l2bChunkPreSafeDeltaGapMs, null)
+  assert.equal(metrics.l2bChunkFirstSafeTrigger, null) // Track N
   assert.equal(metrics.legacyEarlyTtsOutcome, 'COMPLETED', 'malformed payload ต้องไม่กระทบ turn จริงเลย')
   harness.disconnect(socket)
 })
@@ -2690,6 +2733,7 @@ test('Track M wiring: ไม่มี chunkReasonStats milestone ยิงเล
   assert.equal(metrics.l2bChunkFirstCandidateElapsedMs, null)
   assert.equal(metrics.l2bChunkNumericProtectionBlocked, null)
   assert.equal(metrics.l2bChunkPreSafeDeltaGapMs, null)
+  assert.equal(metrics.l2bChunkFirstSafeTrigger, null) // Track N
   assert.equal(metrics.legacyEarlyTtsOutcome, 'COMPLETED', 'ไม่มี chunkReasonStats ต้องไม่กระทบ path การันตี turn อื่นๆ เลย')
   harness.disconnect(socket)
 })

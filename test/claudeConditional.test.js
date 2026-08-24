@@ -4,6 +4,7 @@
 // the shared `state` object below, reset in beforeEach).
 const { test, beforeEach, mock } = require('node:test')
 const assert = require('node:assert/strict')
+const { getNumericProtectionRemainingMs } = require('../src/utils/speechChunker')
 
 // deterministic grace-boundary tests need a fake clock (real setTimeout at exactly 149/150/151ms is not
 // reliably distinguishable under real scheduler jitter) — node:test's built-in mock.timers patches the
@@ -564,6 +565,7 @@ test('Track M: STRONG_BOUNDARY → l2bChunkFirstCandidateElapsedMs ต้อง�
   assert.equal(stats.reason, 'STRONG_BOUNDARY')
   assert.equal(stats.firstCandidateElapsedMs, firstSafeAt - firstDeltaAt, 'ต้องมาจาก timestamp เดิมที่ capture ไว้แล้ว ไม่ใช่ re-measure ใหม่')
   assert.equal(stats.numericProtectionBlocked, false, 'STRONG_BOUNDARY ต้องเป็น false เสมอ (ไม่ใช่ null) เพราะ numeric protection ไม่เกี่ยวข้องกับ path นี้โดยนิยาม')
+  assert.equal(stats.firstSafeTrigger, 'DELTA', 'Track N regression: cut ปกติจาก delta ต้อง trigger=DELTA เสมอ')
 })
 
 test('Track M: SOFT_BOUNDARY → l2bChunkFirstCandidateElapsedMs เท่ากับ chunkDelay เป๊ะเช่นกัน', async () => {
@@ -577,16 +579,17 @@ test('Track M: SOFT_BOUNDARY → l2bChunkFirstCandidateElapsedMs เท่าก
   assert.equal(stats.reason, 'SOFT_BOUNDARY')
   assert.equal(stats.firstCandidateElapsedMs, firstSafeAt - firstDeltaAt)
   assert.equal(stats.numericProtectionBlocked, false)
+  assert.equal(stats.firstSafeTrigger, 'DELTA')
 })
 
-test('Track M: NATURAL_BOUNDARY_HARD_MAX กับ numeric-protection ที่เคย block จริง → firstCandidateElapsedMs ต้องน้อยกว่า chunkDelay อย่างมีนัยสำคัญ (candidate พร้อมตั้งแต่ก่อน HARD_MAX แต่ emit ช้าไปถึง HARD_MAX)', { timeout: 5000 }, async () => {
+test('Track M+N: NATURAL_BOUNDARY_HARD_MAX กับ numeric-protection ที่เคย block จริง → ตั้งแต่ Track N แล้ว HARD_MAX_TIMER ต้องตัดเองที่ ~800ms ไม่ต้องรอ delta ถัดไปที่มาช้าถึง 900ms อีกต่อไป (นี่คือ scenario เดียวกับ production turn ที่ Track M เคยจับ overshoot ~420ms ได้ก่อน Track N จะแก้)', { timeout: 5000 }, async () => {
   state.streamImpl = (events, signal) => ({
     async *[Symbol.asyncIterator]() {
-      yield textDelta('ตอนนี้สมาชิกใหม่ฝาก 100 บาท รับ 2,000 ') // >=25 ตัวอักษร ลงท้ายตัวเลข+space, elapsedMs~0 ยังไม่ครบ SOFT_TIMEOUT
-      await new Promise(r => setTimeout(r, 400)) // ตอนนี้ elapsedMs~400 อยู่ใน [300,800) → candidate eligible+blocked (ไม่มีจุดตัดใหม่ ไม่มี strong/soft trigger)
-      yield textDelta('ก') // ตัวอักษรเดี่ยวไม่ trigger boundary ใหม่ ไม่เพิ่ม space ใหม่ — candidate เดิมยัง blocked อยู่
-      await new Promise(r => setTimeout(r, 500)) // รวม elapsedMs~900 (>=HARD_MAX 800) — ไม่มี delta ใหม่มาปลุกจนกว่าจะถึงตอนนี้
-      yield textDelta('ข') // delta ที่ทำให้ evaluate ใหม่ที่ elapsedMs>=HARD_MAX → cut ที่ตำแหน่งเดิม (ก่อนตัวเลข)
+      yield textDelta('ตอนนี้สมาชิกใหม่ฝาก 100 บาท รับ 2,000 ') // >=25 ตัวอักษร ลงท้ายตัวเลข+space, elapsedMs~0 ยังไม่ครบ SOFT_TIMEOUT — arms HARD_MAX recheck ทันที
+      await new Promise(r => setTimeout(r, 400)) // ตอนนี้ elapsedMs~400 อยู่ใน [300,800) → candidate eligible+blocked (diagnostic เพิ่งเห็นตอนนี้ที่ ~400ms)
+      yield textDelta('ก') // ตัวอักษรเดี่ยวไม่ trigger boundary ใหม่ ไม่เพิ่ม space ใหม่ — candidate เดิมยัง blocked อยู่ — re-arms recheck
+      await new Promise(r => setTimeout(r, 500)) // รวม elapsedMs~900 — HARD_MAX recheck timer (armed for ~400ms more, targeting ~800ms) ต้องปลุก driver เองก่อนถึงตรงนี้
+      yield textDelta('ข') // delta นี้มาถึงหลัง first-safe (จาก timer) ไปแล้ว — ต้องไม่ทำให้เกิด cut ที่สอง ไม่กระทบ deltaCount/telemetry ที่ freeze ไปแล้ว
     },
   })
   const { events, onMilestone } = makeMilestoneRecorder()
@@ -596,14 +599,30 @@ test('Track M: NATURAL_BOUNDARY_HARD_MAX กับ numeric-protection ที่�
   const firstSafeAt = findMilestone(events, 'firstSafeAt')?.value
   const chunkDelay = firstSafeAt - firstDeltaAt
   const stats = findMilestone(events, 'chunkReasonStats')?.value
+  const firstSafeAtEvents = events.filter(e => e.key === 'firstSafeAt')
+  const chunkReasonStatsEvents = events.filter(e => e.key === 'chunkReasonStats')
 
+  assert.equal(firstSafeAtEvents.length, 1, 'firstSafeAt ต้องยิงครั้งเดียวเท่านั้น (exactly-once) แม้ delta ที่ 3 จะมาถึงทีหลัง')
+  assert.equal(chunkReasonStatsEvents.length, 1, 'chunkReasonStats ต้องยิงครั้งเดียวเท่านั้น')
   assert.equal(stats.reason, 'NATURAL_BOUNDARY_HARD_MAX')
-  assert.equal(stats.numericProtectionBlocked, true, 'ต้องจับได้ว่าเคย blocked จริงระหว่างทาง')
-  assert.ok(chunkDelay >= 850, `chunkDelay ต้องสูงจริง (~900ms) วัดได้จริง ${chunkDelay}ms`)
-  assert.ok(stats.firstCandidateElapsedMs < chunkDelay - 300, `candidate ต้องพร้อมเร็วกว่า emit มากจริง (candidate=${stats.firstCandidateElapsedMs}ms, chunkDelay=${chunkDelay}ms)`)
-  assert.ok(stats.firstCandidateElapsedMs >= 350 && stats.firstCandidateElapsedMs < 500, `candidate ต้องมาจากรอบที่ 400ms ไม่ใช่รอบแรก(~0) หรือรอบสุดท้าย(~900) ได้จริง ${stats.firstCandidateElapsedMs}ms`)
-  assert.equal(stats.deltaCount, 3, 'ต้องนับ delta ทั้ง 3 ก้อนที่มาก่อน cut (รวมก้อนที่ทำให้ cut ด้วย)')
-  assert.ok(stats.preSafeDeltaGapMs >= 450, `gap ระหว่าง delta ก่อนหน้ากับ delta ที่ cut ต้อง ~500ms ได้จริง ${stats.preSafeDeltaGapMs}ms`)
+  assert.equal(stats.firstSafeTrigger, 'HARD_MAX_TIMER', 'ต้องมาจาก timer ไม่ใช่รอ delta ที่ 3 ที่มาช้าถึง 900ms')
+  assert.equal(stats.numericProtectionBlocked, true, 'structurally guaranteed สำหรับ HARD_MAX_TIMER trigger')
+  // Review Fix 1 — R2's own locked wording: "~800-850ms is a production performance TARGET, not a strict
+  // correctness guarantee" (Node event-loop stall can push real scheduler jitter past 50ms). Real setTimeout
+  // (not mocked — this Node version's mock.timers doesn't support mocking performance.now(), only
+  // setTimeout/Date, so exact-elapsed-ms determinism isn't achievable here without also faking the clock the
+  // implementation measures elapsedMs against). The correctness property that actually matters —
+  // firstSafeTrigger==='HARD_MAX_TIMER' (asserted above) — already proves this did NOT wait for the delayed
+  // 3rd delta. This range only needs to be wide enough to not be flaky on a loaded CI box while still being
+  // comfortably below the ~900ms mark the 3rd delta arrives at (which would indicate the timer mechanism
+  // wasn't actually the cause).
+  assert.ok(chunkDelay >= 750 && chunkDelay < 890, `chunkDelay ต้องมาก่อนหน้า delta ที่ 3 (~900ms) อย่างชัดเจนได้จริง ${chunkDelay}ms — ถ้าใกล้ 900ms แปลว่า timer ไม่ได้เป็นตัวทำให้เกิด cut จริง`)
+  // Math.min fix (R5 Case C): candidate ต้อง prefer ค่า arming-derived (~300ms, จาก delta แรกที่ elapsedMs<300)
+  // เหนือค่า diagnostic-observed (~400ms, จาก delta ที่สองที่เพิ่งมีโอกาสสังเกตเห็น) เพราะ 300ms คือเวลาจริงที่
+  // candidate เริ่ม eligible ตาม policy ไม่ใช่แค่เวลาที่ observer บังเอิญมีโอกาสได้เห็นมันครั้งแรก
+  assert.ok(stats.firstCandidateElapsedMs >= 280 && stats.firstCandidateElapsedMs < 350, `candidate ต้องมาจาก arming-derived ~300ms (earliest proven) ไม่ใช่ diagnostic ~400ms ได้จริง ${stats.firstCandidateElapsedMs}ms`)
+  assert.equal(stats.deltaCount, 2, 'ต้อง freeze ที่ 2 (delta แรก+delta ที่สอง) ไม่นับ delta ที่ 3 ที่มาหลัง timer cut ไปแล้ว')
+  assert.ok(stats.preSafeDeltaGapMs >= 350 && stats.preSafeDeltaGapMs <= 450, `gap สำหรับ HARD_MAX_TIMER = firstSafeAt - lastDeltaAt (จาก delta ที่สองที่ ~400ms ถึง timer fire ที่ ~800ms) ได้จริง ${stats.preSafeDeltaGapMs}ms`)
 })
 
 test('Track M: SINGLE_SHOT ที่มี firstSafeAt จริง (grace ทัน) → l2bChunk* fields ยัง populate ปกติ ไม่ null เพราะ mode', async () => {
@@ -656,4 +675,414 @@ test('Track M throw-protection: onMilestone throw บน chunkReasonStats → st
   const chunks = await collect(askClaudeConditionalStream(makeSession(), null, throwingMilestone))
   assert.deepEqual(chunks, ['ขอบคุณค่ะ!'])
   assert.ok(threw, 'ต้องยืนยันว่า callback throw จริง ไม่ใช่ไม่เคยถูกเรียก')
+})
+
+// ---------------------------------------------------------------------------
+// Track N (design R6 LOCKED 2026-08-22) — HARD_MAX proactive-wakeup racer, dedicated safety-case tests
+// (Design §16 Case 1-6, R4 Case A). Case 7 (exact tie) relies on the same Promise.race determinism already
+// proven for grace-vs-stream (R1 comment) — gracePromise/hardMaxRecheckPromise are structurally mutually
+// exclusive (never both armed at once, see design §D), so this never becomes a genuine 3-way race needing
+// separate tie-break proof.
+// ---------------------------------------------------------------------------
+
+test('Track N Case 2: unit word arrives BEFORE the armed HARD_MAX timer fires → real delta wins, completes the numeric+unit as one SOFT_BOUNDARY chunk, stale timer never fires', { timeout: 5000 }, async () => {
+  state.streamImpl = (events, signal) => ({
+    async *[Symbol.asyncIterator]() {
+      yield textDelta('ตอนนี้สมาชิกใหม่ฝาก 100 บาท รับ 2,000 ') // arms HARD_MAX recheck (targets ~800ms out)
+      await new Promise(r => setTimeout(r, 300)) // well before the armed timer (elapsedMs~300, still protected)
+      yield textDelta('พอยต์นะคะ') // unit word arrives — candidate now ends in "นะคะ" soft boundary, not a digit
+    },
+  })
+  const { events, onMilestone } = makeMilestoneRecorder()
+  const chunks = await collect(askClaudeConditionalStream(makeSession(), null, onMilestone))
+
+  assert.deepEqual(chunks, ['ตอนนี้สมาชิกใหม่ฝาก 100 บาท รับ 2,000 พอยต์นะคะ'], 'ตัวเลขกับหน่วยนับต้องอยู่ chunk เดียวกัน ไม่ถูก timer ตัดก่อนเวลา')
+  const stats = findMilestone(events, 'chunkReasonStats')?.value
+  assert.equal(stats.reason, 'SOFT_BOUNDARY')
+  assert.equal(stats.firstSafeTrigger, 'DELTA', 'ต้องมาจาก delta จริง ไม่ใช่ timer ที่ควรถูกยกเลิกไปแล้ว')
+})
+
+test('Track N Case 3: strong/soft boundary arrives via a NEW delta before the armed timer fires → cuts immediately, cancels the pending recheck', { timeout: 5000 }, async () => {
+  state.streamImpl = (events, signal) => ({
+    async *[Symbol.asyncIterator]() {
+      yield textDelta('ตอนนี้สมาชิกใหม่ฝาก 100 บาท รับ 2,000 ') // arms HARD_MAX recheck (numeric-protected)
+      await new Promise(r => setTimeout(r, 100)) // well before the armed timer
+      yield textDelta('เท่านั้นเองค่ะ!') // introduces a strong boundary (!) — wins immediately, independent of numeric state
+      await new Promise(r => setTimeout(r, 900)) // if the stale timer were NOT cancelled, it would have fired by now
+    },
+  })
+  const { events, onMilestone } = makeMilestoneRecorder()
+  await collect(askClaudeConditionalStream(makeSession(), null, onMilestone))
+
+  const chunkReasonStatsEvents = events.filter(e => e.key === 'chunkReasonStats')
+  assert.equal(chunkReasonStatsEvents.length, 1, 'ต้องยิงแค่ครั้งเดียว — ถ้า stale timer ไม่ถูกยกเลิกจริงจะยิงซ้ำครั้งที่สอง')
+  assert.equal(chunkReasonStatsEvents[0].value.reason, 'STRONG_BOUNDARY')
+  assert.equal(chunkReasonStatsEvents[0].value.firstSafeTrigger, 'DELTA')
+})
+
+test('Track N Case 4 (Review Fix 1 rewrite): a REAL numeric HARD_MAX timer is armed (buffer ends in digit + trailing space, verified this arms via getNumericProtectionRemainingMs), then stream completes (done) with no second delta at all — must clear the timer, no chunkReasonStats/firstSafeAt ever fires, SINGLE_SHOT of the raw buffer, and no late milestone after the original ~800ms deadline passes', { timeout: 5000 }, async () => {
+  // sanity: buffer เดียวกับที่ delta นี้จะส่ง ต้อง arm timer ได้จริง (ตรวจ precondition ก่อนใช้ ไม่ใช่แค่สมมติ — นี่คือ
+  // ข้อผิดพลาดที่ Case 4 เดิมพลาด: buffer ไม่มี trailing space หลัง "2,000" ทำให้ candidate จริงคือ "...รับ" ไม่ใช่
+  // "...2,000" และ getNumericProtectionRemainingMs คืน null ตั้งแต่แรก ไม่เคย arm timer เลย)
+  const buffer = 'ตอนนี้สมาชิกใหม่ฝาก 100 บาท รับ 2,000 ' // มี trailing space หลังตัวเลข
+  assert.notEqual(getNumericProtectionRemainingMs(buffer, 0), null, 'sanity precondition: buffer นี้ต้อง arm timer ได้จริงที่ elapsedMs=0 ไม่งั้น test นี้จะพลาดแบบเดียวกับ Case 4 เดิม')
+
+  state.events = [textDelta(buffer)] // delta เดียวเท่านั้น — ไม่มี delta ที่สองเลย stream จบทันทีหลัง delta นี้ (done มาถึงก่อน 800ms มาก ไม่ต้องพึ่ง timing แม่นยำ)
+  const { events, onMilestone } = makeMilestoneRecorder()
+  const chunks = await collect(askClaudeConditionalStream(makeSession(), null, onMilestone))
+  await new Promise(r => setTimeout(r, 900)) // เลยเวลาที่ timer เดิม (armed ~800ms) ควร fire ไปมาก — ยืนยันไม่มี late milestone หลุดมาทีหลัง
+
+  assert.equal(findMilestone(events, 'firstSafeAt'), undefined, 'ไม่เคยเจอ boundary เลยระหว่าง deciding phase (elapsedMs<300 ตลอดจนกว่า stream จะจบ) → ต้องไม่มี firstSafeAt')
+  assert.equal(findMilestone(events, 'chunkReasonStats'), undefined, 'timer ต้องถูก clear ตอน stream จบจริง ไม่ fire ทีหลัง (ยืนยันด้วยการรอ 900ms ข้างบนแล้วไม่มี milestone ใหม่)')
+  assert.equal(findMilestone(events, 'mode')?.value, 'SINGLE_SHOT')
+  assert.deepEqual(chunks, [buffer.trim()], 'SINGLE_SHOT ต้อง yield ข้อความเต็มก้อน (trim แล้ว) จาก rawText ตรงๆ')
+})
+
+test('Track N Case 5: abort/barge-in arrives before the armed HARD_MAX timer fires → generator ends cleanly, no late mutation after abort', { timeout: 5000 }, async () => {
+  const controller = new AbortController()
+  state.streamImpl = (events, signal) => ({
+    async *[Symbol.asyncIterator]() {
+      yield textDelta('ตอนนี้สมาชิกใหม่ฝาก 100 บาท รับ 2,000 ') // arms HARD_MAX recheck
+      await new Promise(r => setTimeout(r, 100))
+      controller.abort()
+      await new Promise(r => setTimeout(r, 900)) // if abort didn't clear the timer, it would fire well within this window
+      if (signal?.aborted) { const err = new Error('aborted'); err.name = 'AbortError'; throw err }
+    },
+  })
+  const { events, onMilestone } = makeMilestoneRecorder()
+  const chunks = await collect(askClaudeConditionalStream(makeSession(), controller.signal, onMilestone))
+
+  assert.deepEqual(chunks, [], 'abort ก่อนเจอ boundary ใดๆ ต้องไม่มี chunk ใดๆ ถูก yield เลย')
+  assert.equal(events.filter(e => e.key === 'chunkReasonStats').length, 0, 'ต้องไม่มี late chunkReasonStats หลุดออกมาหลัง abort')
+})
+
+test('Track N Case 6: HARD_MAX reached, buffer has no natural boundary at all (single long word) → timer never arms, no invented cut, ห้าม force cut กลางคำ', { timeout: 5000 }, async () => {
+  state.streamImpl = (events, signal) => ({
+    async *[Symbol.asyncIterator]() {
+      yield textDelta('httpswwwexamplecompromotionverylongurlwithoutanyspacesatallwhatsoever') // ไม่มี space เลย
+      await new Promise(r => setTimeout(r, 900)) // เลย HARD_MAX(800) ไปมาก — ถ้า timer ถูก arm ผิดจะพยายาม cut กลางคำ
+      yield textDelta(' จบแล้วค่ะ') // delta ถัดไป มี space+soft boundary — cut ได้ตามปกติตอนนี้
+    },
+  })
+  const { events, onMilestone } = makeMilestoneRecorder()
+  const chunks = await collect(askClaudeConditionalStream(makeSession(), null, onMilestone))
+
+  const stats = findMilestone(events, 'chunkReasonStats')?.value
+  assert.equal(stats.firstSafeTrigger, 'DELTA', 'ต้องมาจาก delta ที่สองเท่านั้น — timer ไม่เคย arm เพราะไม่มี natural boundary ให้ protect ตั้งแต่แรก')
+  assert.ok(chunks[0].startsWith('httpswwwexamplecompromotionverylongurlwithoutanyspacesatallwhatsoever'), 'ห้ามตัดกลางคำ URL ที่ไม่มี space เลย')
+})
+
+test('Track N Case A (R4): numeric candidate ถูก invalidate ก่อนถึง policy-eligible (elapsed<300) แล้วมี candidate ใหม่ตามมาทีหลัง → ต้อง forget candidate เก่า ไม่เอา timestamp มันมาใช้', { timeout: 5000 }, async () => {
+  state.streamImpl = (events, signal) => ({
+    async *[Symbol.asyncIterator]() {
+      yield textDelta('ตอนนี้สมาชิกใหม่ฝาก 100 บาท รับ 2,000 ') // candidate A: numeric-tailed, arms timer, elapsedMs~0 (<300, ไม่ policy-eligible)
+      await new Promise(r => setTimeout(r, 200)) // elapsedMs~200 — ยังไม่ถึง SOFT_TIMEOUT(300), candidate A ยังไม่เคย eligible จริง
+      yield textDelta('บาทถ้วน ') // candidate A หายไป (ไม่ลงท้ายตัวเลขอีกต่อไป) ก่อนจะเคย eligible — ต้อง reset firstNumericCandidateEligibleAt
+      await new Promise(r => setTimeout(r, 500)) // elapsedMs~700 รวม — ระหว่างนี้ไม่มี strong/soft, ยังไม่ตัด (candidate ใหม่ยังไม่ policy-eligible จนกว่า accumulate ต่อ)
+      yield textDelta('รับสิทธิ์เพิ่มอีก 500 ') // candidate B: numeric-tailed ใหม่ ที่ elapsedMs~700 (>=300 แล้ว) — eligible+blocked ทันที
+      await new Promise(r => setTimeout(r, 150)) // รวม ~850ms — เลย HARD_MAX แล้ว, timer (armed จาก candidate B) ต้องปลุกเอง
+    },
+  })
+  const { events, onMilestone } = makeMilestoneRecorder()
+  await collect(askClaudeConditionalStream(makeSession(), null, onMilestone))
+
+  const firstDeltaAt = findMilestone(events, 'firstDeltaAt')?.value
+  const stats = findMilestone(events, 'chunkReasonStats')?.value
+  assert.equal(stats.reason, 'NATURAL_BOUNDARY_HARD_MAX')
+  assert.equal(stats.firstSafeTrigger, 'HARD_MAX_TIMER')
+  // candidate B ปรากฏจริงตอน ~700ms (elapsed>=300 อยู่แล้วตอนที่มันเกิด) — ต้องไม่ใช่ค่าเก่าจาก candidate A (~300ms) ที่ถูก reset ไปแล้ว
+  assert.ok(stats.firstCandidateElapsedMs >= 650, `ต้องเป็น candidate B (~700ms) ไม่ใช่ candidate A ที่ถูก invalidate ไปแล้วก่อนเคย eligible จริง ได้จริง ${stats.firstCandidateElapsedMs}ms`)
+})
+
+test('Track N Review Fix 1 (Blocker 1 regression): numeric candidate ผ่าน policy-eligible instant จริงโดยไม่มี delta คั่น แล้วถูก delta ใหม่ supersede เป็น non-numeric ก่อนตัดผ่าน DELTA/NATURAL_BOUNDARY → numericProtectionBlocked ต้องเป็น true (เคย block จริงช่วง 300→350ms) ไม่ใช่ false เพราะ diagnostic เห็นแค่ buffer หลัง supersede', { timeout: 5000 }, async () => {
+  state.streamImpl = (events, signal) => ({
+    async *[Symbol.asyncIterator]() {
+      yield textDelta('ตอนนี้สมาชิกใหม่ฝาก 100 บาท รับ 2,000 ') // numeric-tailed, arms timer ที่ elapsedMs~0, firstNumericCandidateEligibleAt ≈ 300ms
+      await new Promise(r => setTimeout(r, 400)) // ไม่มี delta คั่นระหว่างนี้เลย — candidate ผ่าน policy-eligible instant (300ms) มาแล้วจริงตาม wall-clock ก่อน delta ถัดไปจะมาถึง
+      yield textDelta('บาท ') // delta นี้มาถึงที่ elapsedMs~400 (>=300 ที่ candidate เคย eligible ไปแล้ว) — supersede เป็น non-numeric candidate → cut ทันทีผ่าน NATURAL_BOUNDARY
+    },
+  })
+  const { events, onMilestone } = makeMilestoneRecorder()
+  await collect(askClaudeConditionalStream(makeSession(), null, onMilestone))
+
+  const stats = findMilestone(events, 'chunkReasonStats')?.value
+  assert.equal(stats.reason, 'NATURAL_BOUNDARY')
+  assert.equal(stats.firstSafeTrigger, 'DELTA')
+  assert.ok(stats.firstCandidateElapsedMs >= 280 && stats.firstCandidateElapsedMs < 350, `candidate ต้องมาจาก arming-derived ~300ms ได้จริง ${stats.firstCandidateElapsedMs}ms`)
+  assert.equal(stats.numericProtectionBlocked, true, 'candidate เคยผ่าน policy-eligible instant จริงก่อนถูก supersede — ต้องรายงาน true แม้ diagnostic จะเห็นแค่ buffer หลัง supersede ที่ไม่ numeric แล้ว')
+})
+
+// ---------------------------------------------------------------------------
+// Track N Review Fix 2 — timestamp-order regression. The Blocker 1 fix (above) promotes
+// numericProtectionEverBlocked by comparing a delta's own arrival instant against
+// firstNumericCandidateEligibleAt. That instant must be captured BEFORE rawText/buffer are mutated and
+// before the rest of the deciding-phase bookkeeping runs (deltaObservedAt) — not the later timestamp
+// already used for lastDeltaAt/gap metrics (deltaArrivedAt), which is captured after that
+// mutation/bookkeeping and can drift across the threshold near SOFT_TIMEOUT_MS.
+//
+// Both tests below force delta 2 to arrive at a genuine real elapsedMs~400ms (>=SOFT_TIMEOUT_MS, so the
+// NATURAL_BOUNDARY cut condition is met on its own merits) while overriding exactly the two
+// performance.now() calls inside delta 2's own processing (confirmed via direct instrumentation of the
+// driver to be back-to-back with zero other calls between them: deltaObservedAt then deltaArrivedAt) to
+// straddle the known eligibleAt instant (captured from the real firstDeltaAt milestone + SOFT_TIMEOUT_MS,
+// accurate to a fraction of a millisecond since segmentStartMs is set immediately after firstDeltaAt with
+// no intervening performance.now() calls). This isolates the pure timestamp-selection logic from real
+// wall-clock timing, and proves which of the two variables actually drives the comparison.
+// ---------------------------------------------------------------------------
+
+test('Track N Review Fix 2 Case A: superseding delta OBSERVED before eligibleAt, but its later (post-mutation) arrival-capture would land after it → must NOT promote numericProtectionEverBlocked (proves deltaObservedAt, not deltaArrivedAt, drives the comparison)', { timeout: 5000 }, async () => {
+  const { performance } = require('perf_hooks')
+  const originalNow = performance.now.bind(performance)
+  let eligibleAt = null
+  let overrideWindow = false
+  let overrideCount = 0
+
+  performance.now = (...args) => {
+    const real = originalNow(...args)
+    if (overrideWindow && overrideCount < 2) {
+      overrideCount++
+      if (overrideCount === 1) return eligibleAt - 50 // deltaObservedAt override — clearly BEFORE eligibility
+      overrideWindow = false // second capture consumed — stop intercepting, everything after uses the real clock
+      return eligibleAt + 50 // deltaArrivedAt override — clearly AFTER eligibility (would wrongly promote under the pre-Fix-2 code, which compared this variable)
+    }
+    return real
+  }
+
+  try {
+    state.streamImpl = (events, signal) => ({
+      async *[Symbol.asyncIterator]() {
+        yield textDelta('ตอนนี้สมาชิกใหม่ฝาก 100 บาท รับ 2,000 ') // arms numeric episode
+        await new Promise(r => setTimeout(r, 400)) // real elapsedMs~400 by delta 2 — genuine NATURAL_BOUNDARY cut condition met regardless of the overrides below
+        overrideWindow = true // only delta 2's own timestamp-capture pair gets overridden
+        yield textDelta('บาท ') // supersedes the numeric candidate
+      },
+    })
+    const events = []
+    function onMilestone(key, value) {
+      events.push({ key, value })
+      if (key === 'firstDeltaAt' && eligibleAt === null) eligibleAt = value + 300 // segmentStartMs is set immediately after firstDeltaAt with no intervening calls — accurate proxy well within our ±50ms margin
+    }
+    await collect(askClaudeConditionalStream(makeSession(), null, onMilestone))
+
+    const stats = findMilestone(events, 'chunkReasonStats')?.value
+    assert.equal(stats.reason, 'NATURAL_BOUNDARY')
+    assert.equal(stats.numericProtectionBlocked, false, 'delta ที่ supersede candidate เดิมถูก observe ก่อน eligibleAt จริง (แม้ arrival-capture ในเวอร์ชันเก่าจะดันเลย threshold ไปแล้ว) — ต้องไม่ promote')
+  } finally {
+    performance.now = originalNow
+  }
+})
+
+test('Track N Review Fix 2 Case B: superseding delta OBSERVED after eligibleAt → must promote numericProtectionEverBlocked', { timeout: 5000 }, async () => {
+  const { performance } = require('perf_hooks')
+  const originalNow = performance.now.bind(performance)
+  let eligibleAt = null
+  let overrideWindow = false
+  let overrideCount = 0
+
+  performance.now = (...args) => {
+    const real = originalNow(...args)
+    if (overrideWindow && overrideCount < 2) {
+      overrideCount++
+      if (overrideCount === 1) return eligibleAt + 50 // deltaObservedAt override — clearly AFTER eligibility
+      overrideWindow = false
+      return eligibleAt + 60 // deltaArrivedAt override — also after, order irrelevant now that only deltaObservedAt drives the comparison
+    }
+    return real
+  }
+
+  try {
+    state.streamImpl = (events, signal) => ({
+      async *[Symbol.asyncIterator]() {
+        yield textDelta('ตอนนี้สมาชิกใหม่ฝาก 100 บาท รับ 2,000 ')
+        await new Promise(r => setTimeout(r, 400))
+        overrideWindow = true
+        yield textDelta('บาท ')
+      },
+    })
+    const events = []
+    function onMilestone(key, value) {
+      events.push({ key, value })
+      if (key === 'firstDeltaAt' && eligibleAt === null) eligibleAt = value + 300
+    }
+    await collect(askClaudeConditionalStream(makeSession(), null, onMilestone))
+
+    const stats = findMilestone(events, 'chunkReasonStats')?.value
+    assert.equal(stats.reason, 'NATURAL_BOUNDARY')
+    assert.equal(stats.numericProtectionBlocked, true, 'delta ที่ supersede candidate เดิมถูก observe หลัง eligibleAt จริง — ต้อง promote')
+  } finally {
+    performance.now = originalNow
+  }
+})
+
+// ---------------------------------------------------------------------------
+// Track N Case 7 (near-tie) — deterministic stabilization (2026-08-24 test-only fix). The original version
+// scheduled a real delta arrival at ~800ms real wall-clock time to race against the armed HARD_MAX timer,
+// relying on whichever the OS scheduler happened to resolve first — this measured CPU-load nondeterminism,
+// not the locked design's actual invariant (exactly-once regardless of which racer wins), and flaked once
+// under a loaded `node --test` full-suite run (592/593) while passing reliably in isolation. Replaced with
+// two separate, fully deterministic variants using mock.timers (the armed HARD_MAX setTimeout can then only
+// ever fire on an explicit tick() call — never by accident) plus a controlled performance.now() override
+// (the same technique already proven in the Review Fix 2 Case A/B tests) to force elapsedMs>=HARD_MAX_MS at
+// the exact decision point with no real sleep. Neither variant contains a real wall-clock race: one racer
+// is made structurally impossible to win, not merely unlikely to win.
+// ---------------------------------------------------------------------------
+
+test('Track N Case 7a (near-tie, deterministic): HARD_MAX timer wins — a genuinely-due timer fire produces exactly one cut, and a delta arriving afterward must never duplicate it', { timeout: 5000 }, async () => {
+  mock.timers.enable({ apis: ['setTimeout'] })
+  const { performance } = require('perf_hooks')
+  const originalNow = performance.now.bind(performance)
+  let forceElapsed = false
+  let anchor = null
+  performance.now = (...args) => (forceElapsed ? anchor + 900 : originalNow(...args)) // once armed below, forces every elapsedMs computation to read as genuinely past HARD_MAX_MS(800) — no real sleep needed
+
+  let releaseSecondDelta
+  const secondDeltaGate = new Promise(resolve => { releaseSecondDelta = resolve })
+
+  try {
+    state.streamImpl = (events, signal) => ({
+      async *[Symbol.asyncIterator]() {
+        yield textDelta('ตอนนี้สมาชิกใหม่ฝาก 100 บาท รับ 2,000 ') // arms the HARD_MAX timer (real elapsedMs~0 at arm time, remainingMs~800)
+        await secondDeltaGate // held open until the timer-wins path below has been fully exercised and asserted
+        yield textDelta('ก') // arrives late, after firstSafeAt is already set — must never produce a second cut
+      },
+    })
+    const { events, onMilestone } = makeMilestoneRecorder()
+    const collectPromise = collect(askClaudeConditionalStream(makeSession(), null, onMilestone))
+    await flushMicrotasks()
+
+    anchor = findMilestone(events, 'firstDeltaAt')?.value
+    forceElapsed = true
+
+    mock.timers.tick(800) // fires the armed callback deterministically — no real sleep, no scheduler dependency
+    await flushMicrotasks()
+
+    assert.equal(events.filter(e => e.key === 'firstSafeAt').length, 1, 'timer fire ต้อง cut สำเร็จครั้งเดียว (elapsedMs ถูกบังคับให้ >= HARD_MAX จริง ไม่ใช่ early/spurious wake)')
+    const stats = findMilestone(events, 'chunkReasonStats')?.value
+    assert.equal(events.filter(e => e.key === 'chunkReasonStats').length, 1)
+    assert.equal(stats.firstSafeTrigger, 'HARD_MAX_TIMER')
+    assert.equal(stats.reason, 'NATURAL_BOUNDARY_HARD_MAX')
+
+    forceElapsed = false
+    performance.now = originalNow
+    mock.timers.reset()
+    releaseSecondDelta()
+
+    const chunks = await collectPromise
+    assert.equal(events.filter(e => e.key === 'firstSafeAt').length, 1, 'delta ที่มาทีหลัง (หลัง firstSafeAt ถูกตั้งแล้ว) ต้องไม่ทำให้เกิด cut ซ้ำ')
+    assert.equal(events.filter(e => e.key === 'chunkReasonStats').length, 1, 'ต้องไม่มี chunkReasonStats ซ้ำ')
+    assert.ok(chunks.length >= 1, 'turn ต้องจบได้จริง ไม่ค้าง')
+  } finally {
+    performance.now = originalNow
+    mock.timers.reset()
+  }
+})
+
+test('Track N Case 7b (near-tie, deterministic): real delta wins — the armed HARD_MAX timer is guaranteed to never fire (mocked, never ticked), so the delta path alone must produce exactly one cut with the SAME outcome shape as the timer-wins variant', { timeout: 5000 }, async () => {
+  mock.timers.enable({ apis: ['setTimeout'] }) // the armed HARD_MAX setTimeout can only ever fire via an explicit tick() — this test never calls tick(), so it is structurally impossible for the timer to win this race, not just unlikely to
+  const { performance } = require('perf_hooks')
+  const originalNow = performance.now.bind(performance)
+  let forceElapsed = false
+  let anchor = null
+  performance.now = (...args) => (forceElapsed ? anchor + 900 : originalNow(...args))
+
+  let releaseSecondDelta
+  const secondDeltaGate = new Promise(resolve => { releaseSecondDelta = resolve })
+
+  try {
+    state.streamImpl = (events, signal) => ({
+      async *[Symbol.asyncIterator]() {
+        yield textDelta('ตอนนี้สมาชิกใหม่ฝาก 100 บาท รับ 2,000 ') // arms the HARD_MAX timer — never ticked in this test, so it can never fire
+        await secondDeltaGate
+        yield textDelta('ก') // this delta alone must produce the cut, at a forced elapsedMs>=HARD_MAX (same value the timer-wins variant forces, for an identical outcome shape)
+      },
+    })
+    const { events, onMilestone } = makeMilestoneRecorder()
+    const collectPromise = collect(askClaudeConditionalStream(makeSession(), null, onMilestone))
+    await flushMicrotasks()
+
+    anchor = findMilestone(events, 'firstDeltaAt')?.value
+    forceElapsed = true
+    releaseSecondDelta()
+
+    const chunks = await collectPromise
+
+    assert.equal(events.filter(e => e.key === 'firstSafeAt').length, 1, 'delta ต้อง cut สำเร็จครั้งเดียว โดย timer ไม่มีทาง fire ได้เลย (mocked, ไม่เคย tick)')
+    const stats = findMilestone(events, 'chunkReasonStats')?.value
+    assert.equal(events.filter(e => e.key === 'chunkReasonStats').length, 1)
+    assert.equal(stats.firstSafeTrigger, 'DELTA')
+    assert.equal(stats.reason, 'NATURAL_BOUNDARY_HARD_MAX', 'ผลลัพธ์ cut ต้องเหมือนกับ variant ที่ timer ชนะ (elapsedMs>=HARD_MAX ทั้งคู่) แม้ trigger ต่างกัน')
+    assert.ok(chunks.length >= 1, 'turn ต้องจบได้จริง ไม่ค้าง')
+  } finally {
+    performance.now = originalNow
+    mock.timers.reset()
+  }
+})
+
+test('Track N Review Fix 1 (early/spurious-wake self-healing regression): forcing the FIRST HARD_MAX timer fire to happen while real elapsedMs is still far below HARD_MAX_MS → the cut attempt must fail AND a second setTimeout must be scheduled (re-arm), never silently give up and fall back to depending on a future Claude delta alone', { timeout: 5000 }, async () => {
+  // Caveat (documented, not hidden): this Node version's mock.timers does not support mocking
+  // performance.now() (only setTimeout/Date) — verified directly via mock.timers.enable({apis:['performance']})
+  // throwing "not supported". So we cannot deterministically reproduce the EXACT production scenario (a
+  // setTimeout delay's fractional-ms getting truncated, firing ~1ms early relative to its own target) with
+  // sub-millisecond precision. What we CAN do deterministically: use mock.timers.tick() to fire the armed
+  // setTimeout callback with NO real wall-clock time having elapsed (tick() doesn't sleep) — real
+  // performance.now() inside the callback then reflects only test-overhead microseconds, so elapsedMs is
+  // guaranteed far below HARD_MAX_MS. This exercises the EXACT SAME code path
+  // (winner.kind==='hardMaxRecheck' → attemptFirstSafeCut fails → armHardMaxRecheckIfNeeded re-arms) as the
+  // real sub-ms-truncation case, just with a much larger (but structurally identical) "earliness".
+  mock.timers.enable({ apis: ['setTimeout'] })
+  const mockedSetTimeout = global.setTimeout
+  const setTimeoutCalls = []
+  global.setTimeout = (fn, delay, ...args) => {
+    setTimeoutCalls.push(delay)
+    return mockedSetTimeout(fn, delay, ...args)
+  }
+
+  let releaseStream
+  const streamGate = new Promise(resolve => { releaseStream = resolve })
+  try {
+    state.streamImpl = (events, signal) => ({
+      async *[Symbol.asyncIterator]() {
+        yield textDelta('ตอนนี้สมาชิกใหม่ฝาก 100 บาท รับ 2,000 ') // arms the numeric HARD_MAX timer (first setTimeout call, ~800ms)
+        // ห้าม generator จบเองทันที — ถ้าไม่ gate ไว้ pendingNext ตัวที่สองจะ resolve เป็น done:true เกือบจะ
+        // ทันที (ไม่ต้องรอ timer เลย) แล้วชนะ Promise.race ก่อน mock.timers.tick(800) จะถูกเรียกด้วยซ้ำ — driver
+        // loop จะ break ออกไปก่อน แล้ว timer ที่ arm ไว้จะไปยิงใส่ promise กำพร้าที่ไม่มีใครฟังอยู่ (พิสูจน์ได้จาก
+        // การรันจริงที่ setTimeoutCalls เหลือแค่ตัวเดียว [~799.99] แทนที่จะเห็นตัวที่สองจาก re-arm)
+        await streamGate
+      },
+    })
+    const { events, onMilestone } = makeMilestoneRecorder()
+    const collectPromise = collect(askClaudeConditionalStream(makeSession(), null, onMilestone))
+    await flushMicrotasks()
+
+    assert.equal(setTimeoutCalls.filter(d => d > 500).length, 1, 'ต้อง arm timer ครั้งแรกจริง (~800ms)')
+
+    mock.timers.tick(800) // fires the callback with near-zero REAL elapsed time — forces a genuine early-wake cut-attempt failure
+    await flushMicrotasks()
+
+    assert.equal(findMilestone(events, 'chunkReasonStats'), undefined, 'ครั้งแรกที่ timer ตื่น ต้องยัง cut ไม่สำเร็จ (elapsedMs จริงยังต่ำกว่า HARD_MAX มาก) — ถ้า cut สำเร็จตอนนี้แปลว่า test setup ผิด ไม่ใช่กำลังทดสอบ early-wake จริง')
+    assert.ok(setTimeoutCalls.filter(d => d > 500).length >= 2, `ต้องเห็น setTimeout ตัวที่สอง (re-arm) จริง หลังครั้งแรก fail — ได้จริง ${JSON.stringify(setTimeoutCalls)}`)
+
+    // ปิดฉาก: คืน setTimeout จริง แล้วปล่อย stream gate ให้ generator จบตามธรรมชาติ (done:true) — hardMaxRecheckPromise
+    // ตัวที่ re-arm ไว้ระหว่าง mock จะกลายเป็น dead promise ที่ไม่มีวัน resolve หลัง mock.timers.reset() ก็ตาม
+    // Promise.race แค่รอตัวที่ resolve จริง (pendingNext) เท่านั้น
+    global.setTimeout = mockedSetTimeout
+    mock.timers.reset()
+    releaseStream()
+
+    const chunks = await collectPromise
+    assert.ok(chunks.length >= 1, 'turn ต้องจบได้จริง ไม่ค้างตลอดไป — SINGLE_SHOT ของ buffer เดิม (ไม่เคย cut ระหว่าง deciding phase เลย)')
+  } finally {
+    if (global.setTimeout !== mockedSetTimeout) global.setTimeout = mockedSetTimeout
+    mock.timers.reset()
+  }
+})
+
+test('Track N isValidChunkReasonStats validator (consumer contract, verified against real payload shape): firstSafeTrigger ต้องเป็นหนึ่งใน DELTA|HARD_MAX_TIMER เท่านั้น', { timeout: 5000 }, async () => {
+  // ยืนยันผ่าน real producer ว่า payload ที่ claude.js ยิงออกมาจริงมี firstSafeTrigger ที่ผ่าน validator เสมอ
+  // (การทดสอบ validator ตัวเองอย่างละเอียดกว่านี้อยู่ใน audioStreamIntegration.test.js's wiring section)
+  state.events = [textDelta('ขอบคุณค่ะ!')]
+  const { events, onMilestone } = makeMilestoneRecorder()
+  await collect(askClaudeConditionalStream(makeSession(), null, onMilestone))
+  const stats = findMilestone(events, 'chunkReasonStats')?.value
+  assert.ok(['DELTA', 'HARD_MAX_TIMER'].includes(stats.firstSafeTrigger))
 })

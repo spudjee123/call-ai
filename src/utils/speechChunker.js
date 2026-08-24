@@ -172,4 +172,4 @@ function getNumericProtectionRemainingMs(buffer, elapsedMs) {
   return HARD_MAX_MS - elapsedMs
 }
 
-module.exports = { findChunkBoundary, getNumericProtectionRemainingMs, evaluateNumericProtectionDiagnostic, CHUNK_REASON }
+module.exports = { findChunkBoundary, getNumericProtectionRemainingMs, evaluateNumericProtectionDiagnostic, CHUNK_REASON, SOFT_TIMEOUT_MS }

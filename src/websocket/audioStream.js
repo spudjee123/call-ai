@@ -248,7 +248,9 @@ async function applyChunkedEndCallGuard({ endCallRequested, fullText, totalSent,
 // at their turnMetrics null default, never a partial mix of real + garbage values. Checks reason against
 // CHUNK_REASON (imported from speechChunker.js, the single source of truth) rather than a hardcoded string
 // list, so this can never silently drift from the real enum.
+// Track N (design R6 LOCKED 2026-08-22) — extended with the 7th field, firstSafeTrigger, same atomic rule.
 const VALID_CHUNK_REASONS = new Set(Object.values(CHUNK_REASON))
+const VALID_FIRST_SAFE_TRIGGERS = new Set(['DELTA', 'HARD_MAX_TIMER'])
 function isValidChunkReasonStats(value) {
   if (!value || typeof value !== 'object') return false
   if (!VALID_CHUNK_REASONS.has(value.reason)) return false
@@ -257,6 +259,7 @@ function isValidChunkReasonStats(value) {
   if (!Number.isFinite(value.firstCandidateElapsedMs) || value.firstCandidateElapsedMs < 0) return false
   if (typeof value.numericProtectionBlocked !== 'boolean') return false
   if (!Number.isFinite(value.preSafeDeltaGapMs) || value.preSafeDeltaGapMs < 0) return false
+  if (!VALID_FIRST_SAFE_TRIGGERS.has(value.firstSafeTrigger)) return false
   return true
 }
 
@@ -1402,8 +1405,9 @@ function registerWebSocket(fastify) {
                             turnMetrics.l2bChunkFirstCandidateElapsedMs = value.firstCandidateElapsedMs
                             turnMetrics.l2bChunkNumericProtectionBlocked = value.numericProtectionBlocked
                             turnMetrics.l2bChunkPreSafeDeltaGapMs = value.preSafeDeltaGapMs
+                            turnMetrics.l2bChunkFirstSafeTrigger = value.firstSafeTrigger
                           }
-                          // invalid payload → all 6 fields stay at their null default, atomic (never partial)
+                          // invalid payload → all 7 fields stay at their null default, atomic (never partial)
                         } catch (_) { /* diagnostic only — leave fields at their null default */ }
                       }
                       // Design review round 4 — Claude finishing (fullAt) must disarm the 6000ms watchdog.

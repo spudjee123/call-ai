@@ -250,3 +250,43 @@ test('Track M regression: .chunk/.remainder เดิมไม่เปลี่
   assert.equal(r.chunk, 'ยินดีค่ะ')
   assert.equal(r.remainder, ' พี่สนใจกิจกรรมนี้ไหมคะ')
 })
+
+// ---------------------------------------------------------------------------
+// Track N (design R6 LOCKED 2026-08-22) — episode-conditioned coupling invariant, proven against
+// append-only successor buffers built from NUMERIC_TAIL_BUFFER (already confirmed >= FALLBACK_MIN_LENGTH,
+// numeric-tailed, arms the numeric-protection timer). This is scoped to an ALREADY-ARMED numeric episode —
+// NOT a claim about arbitrary buffers (a short/no-boundary buffer can have both findChunkBoundary()===null
+// AND getNumericProtectionRemainingMs()===null simultaneously; that's not a counterexample here, since
+// Track N's reset-on-null in claude.js only ever fires on a lineage that was already confirmed armable).
+// This proves: within that episode, "cut fails AND remainingMs===null" never happens past SOFT_TIMEOUT_MS —
+// every way the episode can end (non-numeric append, soft-boundary append, HARD_MAX expiry) produces a
+// successful cut on the exact same tick remainingMs goes null.
+// ---------------------------------------------------------------------------
+
+test('Track N coupling: episode unchanged at elapsed=350 → still protected on both sides (findChunkBoundary=null, remainingMs non-null)', () => {
+  assert.equal(findChunkBoundary(NUMERIC_TAIL_BUFFER, 350), null)
+  assert.notEqual(getNumericProtectionRemainingMs(NUMERIC_TAIL_BUFFER, 350), null)
+})
+
+test('Track N coupling: episode loses numeric tail via append-only successor (+ non-numeric word) at elapsed=350 → cuts via NATURAL_BOUNDARY exactly when protection ends', () => {
+  const successor = NUMERIC_TAIL_BUFFER + 'บาท '
+  const r = findChunkBoundary(successor, 350)
+  assert.ok(r, 'must cut — candidate no longer numeric-tailed, past SOFT_TIMEOUT_MS')
+  assert.equal(r.reason, CHUNK_REASON.NATURAL_BOUNDARY)
+  assert.equal(getNumericProtectionRemainingMs(successor, 350), null)
+})
+
+test('Track N coupling: episode superseded by append-only soft boundary at elapsed=350 → cuts via SOFT_BOUNDARY exactly when protection ends', () => {
+  const successor = NUMERIC_TAIL_BUFFER + 'ครบแล้วค่ะ'
+  const r = findChunkBoundary(successor, 350)
+  assert.ok(r)
+  assert.equal(r.reason, CHUNK_REASON.SOFT_BOUNDARY)
+  assert.equal(getNumericProtectionRemainingMs(successor, 350), null)
+})
+
+test('Track N coupling: episode unchanged at elapsed=HARD_MAX_MS(800) → cuts via NATURAL_BOUNDARY_HARD_MAX exactly when protection expires', () => {
+  const r = findChunkBoundary(NUMERIC_TAIL_BUFFER, 800)
+  assert.ok(r)
+  assert.equal(r.reason, CHUNK_REASON.NATURAL_BOUNDARY_HARD_MAX)
+  assert.equal(getNumericProtectionRemainingMs(NUMERIC_TAIL_BUFFER, 800), null)
+})
