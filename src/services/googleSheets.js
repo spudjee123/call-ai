@@ -333,8 +333,8 @@ const sheetsService = {
     return getRows(SHEETS.TEMPLATES)
   },
 
-  async addSmsTemplate({ id, name, template_text, sender }) {
-    await appendRowByFields(SHEETS.TEMPLATES, { id, name, template_text, sender: sender || '' })
+  async addSmsTemplate({ id, name, template_text, sender, credit_type }) {
+    await appendRowByFields(SHEETS.TEMPLATES, { id, name, template_text, sender: sender || '', credit_type: credit_type || '' })
   },
 
   async updateSmsTemplate(id, updates) {

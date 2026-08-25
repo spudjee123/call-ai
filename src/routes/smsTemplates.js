@@ -8,13 +8,13 @@ module.exports = async function smsTemplateRoutes(fastify) {
   })
 
   fastify.post('/api/sms-templates', async (req, reply) => {
-    const { id, name, template_text, sender } = req.body || {}
+    const { id, name, template_text, sender, credit_type } = req.body || {}
     if (!id || !name || !template_text) return reply.code(400).send({ error: 'id, name and template_text required' })
 
     const existing = await sheetsService.getSmsTemplateById(id)
     if (existing) return reply.code(409).send({ error: 'Template id already exists' })
 
-    await sheetsService.addSmsTemplate({ id, name, template_text, sender })
+    await sheetsService.addSmsTemplate({ id, name, template_text, sender, credit_type })
     return reply.send({ message: 'Template created' })
   })
 
@@ -49,7 +49,7 @@ module.exports = async function smsTemplateRoutes(fastify) {
     const body = template.template_text.replace(/\{name\}/g, name || 'ทดสอบ')
 
     try {
-      const result = await sendSms(phone, body, senderName)
+      const result = await sendSms(phone, body, senderName, template.credit_type)
       // sendSms() ไม่ throw ตอนเบอร์ถูก reject (แค่ log บนเซิร์ฟเวอร์) — ปล่อยผ่านตรงนี้จะทำให้ปุ่มทดสอบขึ้น "ส่งแล้ว" ทั้งที่จริงไม่ถึงเบอร์
       if (result?.bad_phone_number_list?.length) {
         return reply.code(502).send({ error: `ThaiBulkSMS ปฏิเสธเบอร์นี้: ${JSON.stringify(result.bad_phone_number_list)}` })

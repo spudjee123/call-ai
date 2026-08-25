@@ -8,7 +8,8 @@ const DEFAULT_SENDER = process.env.THAIBULKSMS_SENDER
 // ThaiBulkSMS รับเบอร์ได้หลายรูปแบบ (0812345678, 66812345678, +66812345678)
 // เบอร์ที่ normalizePhone() แปลงเป็น +66... ไว้แล้วในระบบเรา ใช้ส่งตรงๆ ได้เลย ไม่ต้องแปลงซ้ำ
 // sender ระบุได้ต่อครั้ง (แต่ละ campaign เลือกชื่อผู้ส่งของตัวเองได้) — ไม่ระบุจะ fallback ไปใช้ค่า default ใน .env
-async function sendSms(to, body, sender) {
+// creditType: "standard" หรือ "corporate" — เลือกว่าจะตัดเครดิตจาก pool ไหน ไม่ระบุ = ปล่อยให้ ThaiBulkSMS เลือก default เอง (ปัจจุบันคือ standard)
+async function sendSms(to, body, sender, creditType) {
   try {
     // /sms ต้องการ body แบบ application/x-www-form-urlencoded (ตามเอกสาร ThaiBulkSMS) ไม่ใช่ JSON —
     // ส่ง plain object เข้า axios.post ตรงๆ จะกลาย เป็น Content-Type: application/json ผิดรูปแบบเงียบๆ
@@ -17,6 +18,7 @@ async function sendSms(to, body, sender) {
     params.append('message', body)
     const senderValue = sender || DEFAULT_SENDER
     if (senderValue) params.append('sender', senderValue)
+    if (creditType) params.append('force', creditType)
 
     const response = await axios.post(
       API_URL,

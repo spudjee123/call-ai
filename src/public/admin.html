@@ -1620,12 +1620,22 @@ function smsTemplateEditPanelHtml(t, isNew){
         ${isNew ? `<div class="field"><label>Template ID (รันอัตโนมัติ แก้ไขเองได้)</label><input type="text" id="st_id" placeholder="เช่น tmpl03" value="${esc(t.suggestedId || '')}"></div>` : `<input type="hidden" id="st_id" value="${esc(t.id)}">`}
         <div class="field"><label>ชื่อ Template</label><input type="text" id="st_name" value="${esc(t.name||'')}" placeholder="เช่น ขอบคุณลูกค้าสนใจ"></div>
       </div>
-      <div class="field" style="margin-bottom:16px; max-width:260px">
-        <label>Sendername</label>
-        <select id="st_sender">
-          <option value="">เลือก Sendername</option>
-          ${senderNamesCache.map(s => `<option value="${escAttr(s.id)}" ${t.sender===s.id?'selected':''}>${esc(s.name)}</option>`).join('')}
-        </select>
+      <div class="grid-2" style="margin-bottom:16px">
+        <div class="field">
+          <label>Sendername</label>
+          <select id="st_sender">
+            <option value="">เลือก Sendername</option>
+            ${senderNamesCache.map(s => `<option value="${escAttr(s.id)}" ${t.sender===s.id?'selected':''}>${esc(s.name)}</option>`).join('')}
+          </select>
+        </div>
+        <div class="field">
+          <label>ประเภทเครดิต</label>
+          <select id="st_credit_type">
+            <option value="" ${!t.credit_type?'selected':''}>ไม่ระบุ (default)</option>
+            <option value="standard" ${t.credit_type==='standard'?'selected':''}>Standard</option>
+            <option value="corporate" ${t.credit_type==='corporate'?'selected':''}>Corporate</option>
+          </select>
+        </div>
       </div>
       <div class="field" style="margin-bottom:6px">
         <label>ข้อความ SMS (ใช้ {name} แทนชื่อลูกค้าได้)</label>
@@ -1686,9 +1696,10 @@ async function createSmsTemplate(){
   const name = document.getElementById('st_name').value.trim()
   const template_text = document.getElementById('st_text').value.trim()
   const sender = document.getElementById('st_sender').value
+  const credit_type = document.getElementById('st_credit_type').value
   if (!name || !template_text) { msgEl.textContent = 'กรอกชื่อและข้อความก่อน'; return }
   try {
-    const res = await apiFetch('/api/sms-templates', { method: 'POST', body: { id, name, template_text, sender } })
+    const res = await apiFetch('/api/sms-templates', { method: 'POST', body: { id, name, template_text, sender, credit_type } })
     const data = await res.json()
     if (!res.ok) { msgEl.textContent = data.error || 'สร้างไม่สำเร็จ'; return }
     toast('สร้าง template แล้ว')
@@ -1702,9 +1713,10 @@ async function saveSmsTemplate(){
   const name = document.getElementById('st_name').value.trim()
   const template_text = document.getElementById('st_text').value.trim()
   const sender = document.getElementById('st_sender').value
+  const credit_type = document.getElementById('st_credit_type').value
   if (!name || !template_text) { msgEl.textContent = 'กรอกชื่อและข้อความก่อน'; return }
   try {
-    const res = await apiFetch(`/api/sms-templates/${encodeURIComponent(id)}`, { method: 'PATCH', body: { name, template_text, sender } })
+    const res = await apiFetch(`/api/sms-templates/${encodeURIComponent(id)}`, { method: 'PATCH', body: { name, template_text, sender, credit_type } })
     const data = await res.json()
     if (!res.ok) { msgEl.textContent = data.error || 'บันทึกไม่สำเร็จ'; return }
     toast('บันทึกแล้ว')

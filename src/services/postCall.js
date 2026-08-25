@@ -116,7 +116,7 @@ async function handleSmsFollowup(session, outcome) {
   // เก็บ message_id ผูกกับแถวผลการโทร (ผ่าน call_sid) ไว้ให้ /webhook/sms-dr มา match กลับได้ทีหลังว่าส่งถึงจริงไหม
   // ไม่ throw ต่อถ้า sendSms พังหรือ update Sheet พัง — SMS ส่งไม่ได้ไม่ควรทำให้ postCallHandler ทั้งก้อน error
   try {
-    const result = await sendSms(phone, body, senderName)
+    const result = await sendSms(phone, body, senderName, template.credit_type)
     const messageId = result?.phone_number_list?.[0]?.message_id || ''
     const status = result?.bad_phone_number_list?.length ? 'failed' : 'sent'
     console.log(`[SMS] Sent to ${phone} (${outcome}, template=${templateId}, message_id=${messageId})`)
