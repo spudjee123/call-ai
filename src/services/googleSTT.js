@@ -70,6 +70,16 @@ function normalizeAlternatives(alternatives) {
 // because it changes actual stream/resource lifetime, unlike this diagnostic-only observation window.
 const SHADOW_TIMEOUT_MS = 2000
 
+// STT EOS Lifecycle Recovery (design LOCKED 2026-08-25) — deliberately NOT a reuse of SHADOW_TIMEOUT_MS:
+// that 2s window is a diagnostic-only observation that never blocks the customer from being heard again.
+// This grace window is the opposite — every ms here is a window where a genuinely-dead recognizer leaves
+// the customer's new speech silently discarded. Production evidence shows healthy EOS→final gaps of only
+// ~3-4ms (verified: 06:56:05.333878→06:56:05.338143 ≈4.27ms, 06:51:36.761417→06:51:36.764743 ≈3.33ms) —
+// 250ms gives roughly 60-75x margin over that while bounding worst-case customer-side silence to ~0.25s
+// instead of the multi-second dead air the current no-recovery gap allows. Not claimed to be a fully
+// optimized value — safety-first initial production value, revisit only with more EOS-event evidence.
+const EOS_RECOVERY_GRACE_MS = 250
+
 // L1a (latency optimization, rollout-scoped STT endpoint experiment): interimFinalizeMs รับจากภายนอกได้แล้ว
 // default 900ms เดิมทุกประการถ้า caller ไม่ส่งอะไรมา — googleSTT.js เป็น STT ตัวเดียวที่ legacy และ chunked
 // path ใช้ร่วมกัน เปลี่ยนค่า default ตรงๆ จะกระทบ legacy production ทุกสายทันทีโดยไม่ผูกกับ chunked rollout เลย
@@ -85,6 +95,21 @@ function transcribeStream(onTranscript, onInterim, { interimFinalizeMs = 900, ma
   let currentStream = null
   let nextStream = null
   let errorRetryCount = 0
+
+  // STT EOS Lifecycle Recovery (design LOCKED 2026-08-25) — production incident confirmed: a
+  // singleUtterance:true stream can reach END_OF_SINGLE_UTTERANCE (data.results[0] absent,
+  // data.speechEventType set) and stop producing recognition results server-side, while currentStream
+  // remains a locally-writable object (write() only checks destroyed/!currentStream, never whether the
+  // remote recognizer is still actually decoding) — so audio keeps "flowing" in our own logs with no
+  // transcript ever arriving again. Historical stuck case observed 2026-08-25T06:28:52Z, well before the
+  // All-Campaigns wildcard deploy (2026-08-25T07:28Z) — not a wildcard-caused regression. Two healthy
+  // production examples show GOOGLE_FINAL arriving ~3-4ms after EOS on the same stream, which is why this
+  // must be a bounded grace-timer recovery, never an immediate rotate-on-EOS (would risk dropping a final
+  // that's still in flight — see the existing rotateForNextUtterance() comment on this exact hazard).
+  // { stream, streamId, timeoutHandle } | null — identity-bound so a stale timer from an already-
+  // superseded stream can never affect whatever stream is actually current by the time it fires (same
+  // reference-identity pattern already used by activeShadow/settleShadow below).
+  let eosRecovery = null
 
   // A2.1 Shadow — at most ONE pending shadow observation per call (O(1) memory, design-approved). NOT reset
   // by resetUtteranceState() — that function scopes to the CURRENT utterance's live state, but activeShadow
@@ -184,6 +209,63 @@ function transcribeStream(onTranscript, onInterim, { interimFinalizeMs = 900, ma
     }
   }
 
+  // STT EOS Lifecycle Recovery (design LOCKED 2026-08-25) — identity-scoped clear ONLY: rejects unless
+  // `eosRecovery.stream === stream`. Deliberately not a global/unconditional clear (Review correction) —
+  // a stale 'error'/'end' event arriving late for an already-superseded stream A must never clear a
+  // recovery that has since been armed for a different stream B.
+  function clearEosRecoveryFor(stream) {
+    if (!eosRecovery) return false
+    if (eosRecovery.stream !== stream) return false
+    clearTimeout(eosRecovery.timeoutHandle)
+    eosRecovery = null
+    return true
+  }
+
+  // Call-teardown only — every stream is being torn down together here, so an unconditional clear is
+  // correct (unlike clearEosRecoveryFor, which every per-stream event handler below must use instead).
+  function clearEosRecoveryAll() {
+    if (!eosRecovery) return
+    clearTimeout(eosRecovery.timeoutHandle)
+    eosRecovery = null
+  }
+
+  // STT EOS Lifecycle Recovery — idempotent (Review correction): a duplicate END_OF_SINGLE_UTTERANCE on
+  // the SAME stream must never restart the grace countdown, or a recognizer that keeps re-sending EOS
+  // could push recovery back indefinitely while never actually recovering. The deadline always means
+  // "time since the FIRST EOS seen for this stream." If a recovery is pending for a DIFFERENT (already-
+  // superseded) stream when this arms, that's a state that should never occur in practice (every normal
+  // completion path clears its own stream's recovery via clearEosRecoveryFor before a new one could ever
+  // arm) — clearEosRecoveryAll() here is defensive, not load-bearing.
+  function armEosRecovery(stream, streamId) {
+    if (eosRecovery && eosRecovery.stream === stream) return // duplicate EOS on the same stream — ignore, do not extend the deadline
+    clearEosRecoveryAll()
+
+    const recovery = { stream, streamId, timeoutHandle: null }
+    recovery.timeoutHandle = setTimeout(() => {
+      if (eosRecovery !== recovery) return // superseded/cleared already
+      if (destroyed) return
+      if (currentStream !== stream) return // this stream is no longer the one we're listening on — some other path already recovered it
+
+      console.warn(`[STT] END_OF_SINGLE_UTTERANCE stuck — recovering streamId=${streamId}`)
+
+      const stale = currentStream
+      eosRecovery = null
+      currentStream = null
+      resetUtteranceState()
+
+      if (nextStream) {
+        activatePrewarm()
+        console.log('[STT] EOS recovery: switched to pre-warmed stream')
+      } else {
+        createStream(false)
+        console.log('[STT] EOS recovery: created fresh stream')
+      }
+
+      try { stale?.end() } catch (_) {}
+    }, EOS_RECOVERY_GRACE_MS)
+    eosRecovery = recovery
+  }
+
   function activatePrewarm() {
     resetUtteranceState()
     currentStream = nextStream
@@ -205,6 +287,11 @@ function transcribeStream(onTranscript, onInterim, { interimFinalizeMs = 900, ma
   function rotateForNextUtterance() {
     if (destroyed) return
     const draining = currentStream
+    // STT EOS Lifecycle Recovery (design LOCKED 2026-08-25) — a real completion (TIMER_FINAL or
+    // GOOGLE_FINAL, both of which call this function as their last step) always supersedes a pending EOS
+    // recovery for the same stream, since normal lifecycle handling has already taken over. Covers both
+    // call sites automatically — no separate clear needed at either TIMER_FINAL or GOOGLE_FINAL delivery.
+    clearEosRecoveryFor(draining)
     if (nextStream) {
       activatePrewarm()
       console.log('[STT] Rotated to pre-warmed stream — listening continues through AI playback')
@@ -240,6 +327,10 @@ function transcribeStream(onTranscript, onInterim, { interimFinalizeMs = 900, ma
     })
     .on('error', (err) => {
       if (destroyed) return
+      // STT EOS Lifecycle Recovery — clear unconditionally here (identity-scoped, no-op if this stream
+      // never had a pending recovery) before anything else, so a genuinely-dead recognizer that errors out
+      // on its own doesn't sit waiting for the grace timer to expire when we already know it's gone.
+      clearEosRecoveryFor(stream)
       // A2.1 Shadow — must settle BEFORE the stale-stream guard below, since a shadowed stream is by
       // definition neither currentStream nor nextStream (it was already rotated away when the shadow
       // started) and would otherwise be silently discarded by that guard with no ERROR outcome ever
@@ -303,6 +394,27 @@ function transcribeStream(onTranscript, onInterim, { interimFinalizeMs = 900, ma
       const result = data.results[0]
       if (!result) {
         if (data.speechEventType) console.log(`[STT] Event: ${data.speechEventType}`)
+        // STT EOS Lifecycle Recovery (design LOCKED 2026-08-25; Review Fix 1, 2026-08-25 — ownership
+        // conflict with pending TIMER_FINAL) — arm the bounded grace-timer watchdog ONLY when there is no
+        // pending interim already owned by interimTimer/TIMER_FINAL. Review Fix 1 found: the EOS
+        // recovery's fire callback calls resetUtteranceState(), which clears interimTimer AND wipes
+        // interimText — if EOS arrived while a real interim was already captured and still waiting on its
+        // own 900ms TIMER_FINAL deadline, and grace(250ms) expires first (interim arrived <650ms before
+        // EOS), the watchdog would silently discard text Google had already recognized, with neither
+        // TIMER_FINAL nor GOOGLE_FINAL ever getting a chance to deliver it. That never happens in the
+        // production incident this Track fixes (EOS with no pending interim at all — nothing for
+        // TIMER_FINAL to deliver either way). Ownership rule: pending interim → TIMER_FINAL/GOOGLE_FINAL
+        // owns completion; no pending interim → EOS watchdog owns recovery. Deliberately does NOT rotate
+        // immediately even in the watchdog-owns case (see rotateForNextUtterance()'s own comment on why) —
+        // healthy production cases show the real final arriving only ~3-4ms after this event on the same
+        // stream, so arming only starts a bounded wait, never an immediate lifecycle change by itself.
+        if (data.speechEventType === 'END_OF_SINGLE_UTTERANCE') {
+          if (!interimText || !interimTimer) {
+            armEosRecovery(stream, thisStreamId)
+          } else {
+            console.log(`[STT] END_OF_SINGLE_UTTERANCE with pending interim — TIMER_FINAL owns recovery streamId=${thisStreamId}`)
+          }
+        }
         return
       }
       const text = result.alternatives?.[0]?.transcript || ''
@@ -443,6 +555,10 @@ function transcribeStream(onTranscript, onInterim, { interimFinalizeMs = 900, ma
     })
     .on('end', () => {
       if (destroyed) return
+      // STT EOS Lifecycle Recovery — identity-scoped, no-op if this stream never had a pending recovery.
+      // Handles the case where a genuinely-dead recognizer's gRPC stream closes on its own before the
+      // grace timer would otherwise have fired.
+      clearEosRecoveryFor(stream)
       // A2.1 Shadow — a shadowed stream's 'end' previously fell through to the silent no-op case (it's
       // neither currentStream nor nextStream). Must settle here before either branch below.
       const endShadow = activeShadow
@@ -510,6 +626,10 @@ function transcribeStream(onTranscript, onInterim, { interimFinalizeMs = 900, ma
       // also removes any race where a teardown-triggered stream event could steal the outcome as STREAM_END
       // instead of CALL_ENDED.
       if (activeShadow) settleShadow(activeShadow, 'CALL_ENDED', {})
+      // STT EOS Lifecycle Recovery — unconditional clear is correct here only (every other call site must
+      // use clearEosRecoveryFor instead): the whole call is tearing down, so any pending recovery for any
+      // stream must never fire and try to createStream()/activatePrewarm() after destroyed=true.
+      clearEosRecoveryAll()
       destroyed = true
       clearTimeout(interimTimer)
       interimTimer = null
