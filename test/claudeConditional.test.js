@@ -438,6 +438,9 @@ test('Track L inputStats: turn ปกติ — ค่าตรงกับ hist
     inputStats.systemPromptCharCount + inputStats.priorHistoryCharCount + inputStats.currentUserCharCount,
     'approx ต้องเป็นผลรวมของ 3 ตัวเป๊ะ'
   )
+  // Track O0 (design LOCKED 2026-08-24 — Master Latency Design R3.2) — campaign-supplied portion measured
+  // separately from the final templated systemPromptCharCount
+  assert.equal(inputStats.campaignPromptCharCount, 'สคริปต์ทดสอบ'.length, 'ต้องมาจาก campaign.script ตรงๆ (default ของ makeMultiMessageSession)')
 })
 
 test('Track L inputStats: MAX_HISTORY truncation semantic — 21 ข้อความ, message[0] ยาวผิดปกติ ต้องไม่ถูกนับเลย ไม่ใช่แค่ count=20', async () => {
@@ -545,6 +548,88 @@ test('Track L throw-protection: onMilestone throw บน inputStats และ re
   const chunks = await collect(askClaudeConditionalStream(makeSession(), null, throwingMilestone))
   assert.deepEqual(chunks, ['คำตอบปกติ'], 'chunk ที่ได้ต้องไม่กระทบแม้ callback จะ throw ทั้งสองจุด')
   assert.ok(inputStatsThrew && responseCharCountThrew, 'ต้องยืนยันว่า callback throw จริงทั้งสองจุด ไม่ใช่ไม่เคยถูกเรียก')
+})
+
+// ---------------------------------------------------------------------------
+// Track O0 (diagnostic only, design LOCKED 2026-08-24 — Master Latency Design R3.2) — cache_creation/
+// cache_read token visibility from the Claude stream's message_start event. Access path verified directly
+// against the installed @anthropic-ai/sdk@0.97.1 type definitions before implementation (hard precondition
+// per the LOCKED design): RawMessageStartEvent = { type: 'message_start', message: Message } where
+// Message.usage: Usage, and Usage.{cache_creation_input_tokens, cache_read_input_tokens}: number|null.
+// ---------------------------------------------------------------------------
+
+function messageStart(usage) {
+  return { type: 'message_start', message: { usage } }
+}
+
+test('Track O0 cacheUsage: message_start มี usage ครบ → milestone ยิงค่าตรงจริง', async () => {
+  state.streamImpl = (events, signal) => ({
+    async *[Symbol.asyncIterator]() {
+      yield messageStart({ cache_creation_input_tokens: 1234, cache_read_input_tokens: 5678, input_tokens: 10, output_tokens: 1 })
+      yield textDelta('คำตอบทดสอบ')
+    },
+  })
+  const { events, onMilestone } = makeMilestoneRecorder()
+  await collect(askClaudeConditionalStream(makeSession(), null, onMilestone))
+
+  const cacheUsage = events.find(e => e.key === 'cacheUsage')?.value
+  assert.ok(cacheUsage, 'ต้องมี cacheUsage milestone จริง')
+  assert.equal(cacheUsage.cacheCreationInputTokens, 1234)
+  assert.equal(cacheUsage.cacheReadInputTokens, 5678)
+})
+
+test('Track O0 cacheUsage: cache_creation/cache_read เป็น null จริงจาก API (cache miss ทั้งคู่) → ต้องรายงาน null ตรงๆ ไม่ fabricate เป็น 0', async () => {
+  state.streamImpl = (events, signal) => ({
+    async *[Symbol.asyncIterator]() {
+      yield messageStart({ cache_creation_input_tokens: null, cache_read_input_tokens: null, input_tokens: 10, output_tokens: 1 })
+      yield textDelta('คำตอบทดสอบ')
+    },
+  })
+  const { events, onMilestone } = makeMilestoneRecorder()
+  await collect(askClaudeConditionalStream(makeSession(), null, onMilestone))
+
+  const cacheUsage = events.find(e => e.key === 'cacheUsage')?.value
+  assert.ok(cacheUsage)
+  assert.equal(cacheUsage.cacheCreationInputTokens, null)
+  assert.equal(cacheUsage.cacheReadInputTokens, null)
+})
+
+test('Track O0 cacheUsage: ไม่มี message_start event เลย (stream แปลกไป) → ไม่มี cacheUsage milestone ยิงเลย ไม่ crash', async () => {
+  state.events = [textDelta('คำตอบทดสอบ')] // fake stream เดิม ไม่มี message_start
+  const { events, onMilestone } = makeMilestoneRecorder()
+  const chunks = await collect(askClaudeConditionalStream(makeSession(), null, onMilestone))
+  assert.equal(events.find(e => e.key === 'cacheUsage'), undefined, 'ไม่มี message_start → ต้องไม่มี milestone นี้เลย ไม่ใช่ยิงด้วยค่า null ปลอมๆ')
+  assert.deepEqual(chunks, ['คำตอบทดสอบ'], 'chunk ปกติต้องไม่กระทบ')
+})
+
+test('Track O0 cacheUsage: message_start.message.usage หาย/malformed → ไม่ throw ทะลุออกไป, stream จบปกติ', async () => {
+  state.streamImpl = (events, signal) => ({
+    async *[Symbol.asyncIterator]() {
+      yield { type: 'message_start', message: {} } // ไม่มี usage เลย
+      yield textDelta('คำตอบทดสอบ')
+    },
+  })
+  const { events, onMilestone } = makeMilestoneRecorder()
+  const chunks = await collect(askClaudeConditionalStream(makeSession(), null, onMilestone))
+  const cacheUsage = events.find(e => e.key === 'cacheUsage')?.value
+  assert.ok(cacheUsage, 'milestone ยังยิงได้ (usage=undefined) แค่ field ข้างในเป็น null')
+  assert.equal(cacheUsage.cacheCreationInputTokens, null)
+  assert.equal(cacheUsage.cacheReadInputTokens, null)
+  assert.deepEqual(chunks, ['คำตอบทดสอบ'], 'stream ต้องจบปกติ ไม่ throw')
+})
+
+test('Track O0 cacheUsage throw-protection: onMilestone throw บน cacheUsage → stream ยังจบปกติ ไม่กระทบ chunk', async () => {
+  state.streamImpl = (events, signal) => ({
+    async *[Symbol.asyncIterator]() {
+      yield messageStart({ cache_creation_input_tokens: 100, cache_read_input_tokens: 0, input_tokens: 10, output_tokens: 1 })
+      yield textDelta('คำตอบทดสอบ')
+    },
+  })
+  let threw = false
+  const throwingMilestone = (key, value) => { if (key === 'cacheUsage') { threw = true; throw new Error('boom cacheUsage') } }
+  const chunks = await collect(askClaudeConditionalStream(makeSession(), null, throwingMilestone))
+  assert.deepEqual(chunks, ['คำตอบทดสอบ'])
+  assert.ok(threw, 'ต้องยืนยันว่า callback throw จริง ไม่ใช่ไม่เคยถูกเรียก')
 })
 
 // ---------------------------------------------------------------------------

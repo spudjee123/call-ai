@@ -488,6 +488,12 @@ async function* askClaudeConditionalStream(session, signal = null, onMilestone =
         ? null
         : systemPrompt.length + priorHistoryCharCount + currentUserCharCount
 
+    // Track O0 (diagnostic only, design LOCKED 2026-08-24 — Master Latency Design R3.2) — the campaign-
+    // supplied portion of buildSystemPrompt()'s input, measured separately from systemPrompt.length (the
+    // final templated total, which also includes fixed instruction text and the interpolated customer
+    // name — R3.1 review correctly rejected treating any single figure here as "the fixed template").
+    const campaignPromptCharCount = charLen(campaign.script || campaign.system_prompt)
+
     try {
       onMilestone?.('inputStats', {
         systemPromptCharCount: systemPrompt.length,
@@ -495,6 +501,7 @@ async function* askClaudeConditionalStream(session, signal = null, onMilestone =
         requestMessageCount: history.length,
         currentUserCharCount,
         approxInputTextCharCount,
+        campaignPromptCharCount,
       })
     } catch (_) { /* diagnostic only — must never affect the real request below */ }
   } catch (e) {
@@ -740,6 +747,23 @@ async function* askClaudeConditionalStream(session, signal = null, onMilestone =
         pendingNext = iterator.next()
 
         if (signal?.aborted) { clearHardMaxRecheckTimer(); sendDone(); return }
+
+        // Track O0 (diagnostic only, design LOCKED 2026-08-24 — Master Latency Design R3.2) — message_start
+        // fires exactly once per turn, before any content_block_* event, and carries the request's cache-
+        // accounting usage. Access path verified directly against the installed @anthropic-ai/sdk@0.97.1
+        // type definitions (RawMessageStartEvent.message.usage.{cache_creation_input_tokens,
+        // cache_read_input_tokens}, both number|null) per the LOCKED design's hard precondition — not
+        // assumed from memory/docs. Diagnostic only: never used to affect the real stream/cut decisions.
+        if (event.type === 'message_start') {
+          try {
+            const usage = event.message?.usage
+            onMilestone?.('cacheUsage', {
+              cacheCreationInputTokens: usage?.cache_creation_input_tokens ?? null,
+              cacheReadInputTokens: usage?.cache_read_input_tokens ?? null,
+            })
+          } catch (_) { /* diagnostic only — must never affect the real stream below */ }
+        }
+
         if (event.type !== 'content_block_delta' || event.delta?.type !== 'text_delta') continue
 
         // Track N Review Fix 2 — captured here, before rawText/buffer are mutated or any other bookkeeping

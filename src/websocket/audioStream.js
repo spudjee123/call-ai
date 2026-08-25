@@ -263,6 +263,22 @@ function isValidChunkReasonStats(value) {
   return true
 }
 
+// Track O0 Review Fix 1 (2026-08-25) — original wiring checked only `typeof value === 'object'` then wrote
+// each field independently via `?? null`, which only catches null/undefined and lets any other type (string,
+// NaN, negative) flow straight into turnMetrics, contradicting the "malformed payload → both fields stay at
+// their null default" contract the comment claimed. Same atomic-validate-before-any-write pattern as
+// isValidChunkReasonStats above — a non-negative finite integer or null is valid, anything else rejects the
+// whole payload (both fields stay at their prior/default value, never a partial mix).
+function isValidCacheToken(v) {
+  return v === null || (Number.isInteger(v) && v >= 0)
+}
+function isValidCacheUsage(value) {
+  if (!value || typeof value !== 'object') return false
+  if (!isValidCacheToken(value.cacheCreationInputTokens)) return false
+  if (!isValidCacheToken(value.cacheReadInputTokens)) return false
+  return true
+}
+
 function registerWebSocket(fastify) {
   fastify.get('/stream', { websocket: true }, (connection, req) => {
     const socket = (typeof connection.send === 'function') ? connection
@@ -1387,7 +1403,22 @@ function registerWebSocket(fastify) {
                             turnMetrics.l2bRequestMessageCount = value.requestMessageCount ?? null
                             turnMetrics.l2bCurrentUserCharCount = value.currentUserCharCount ?? null
                             turnMetrics.l2bApproxInputTextCharCount = value.approxInputTextCharCount ?? null
+                            turnMetrics.l2bCampaignPromptCharCount = value.campaignPromptCharCount ?? null
                           }
+                        } catch (_) { /* diagnostic only — leave fields at their null default */ }
+                      }
+                      // Track O0 (diagnostic only, design LOCKED 2026-08-24 — Master Latency Design R3.2;
+                      // Review Fix 1, 2026-08-25 — type-validated + atomic) — same pattern as
+                      // chunkReasonStats: validate the whole payload BEFORE writing either field, so a
+                      // wrong-typed value (string/NaN/negative) rejects the pair atomically instead of one
+                      // field silently taking on a garbage value while the other stays correct.
+                      else if (key === 'cacheUsage') {
+                        try {
+                          if (isValidCacheUsage(value)) {
+                            turnMetrics.l2bCacheCreationTokens = value.cacheCreationInputTokens
+                            turnMetrics.l2bCacheReadTokens = value.cacheReadInputTokens
+                          }
+                          // invalid payload → both fields stay at their null default, atomic (never partial)
                         } catch (_) { /* diagnostic only — leave fields at their null default */ }
                       }
                       else if (key === 'responseCharCount') {

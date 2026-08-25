@@ -93,6 +93,19 @@ function createTurnMetrics({
     l2bRequestMessageCount: null,
     l2bCurrentUserCharCount: null,
     l2bApproxInputTextCharCount: null,
+    // Track O0 (diagnostic only, design LOCKED 2026-08-24 — Master Latency Design R3.2) — the campaign-
+    // supplied portion of the system prompt (campaign.script || campaign.system_prompt), measured
+    // separately from l2bSystemPromptCharCount (the final templated total). Master Design R3.1 review
+    // found buildSystemPrompt()'s fixed template also interpolates customerName, so no field here claims
+    // to isolate a pure fixed-vs-dynamic split — this field exists specifically to correlate the one
+    // genuinely large, campaign-variable component against Claude TTFT.
+    l2bCampaignPromptCharCount: null,
+    // Track O0 — cache_creation_input_tokens / cache_read_input_tokens from the Claude stream's
+    // message_start event (verified against the installed @anthropic-ai/sdk@0.97.1 type definitions
+    // before implementation, per the LOCKED design's hard precondition). null means "not measured"
+    // (missing/malformed message_start, or the API didn't report a value) — never fabricated as 0.
+    l2bCacheCreationTokens: null,
+    l2bCacheReadTokens: null,
     l2bResponseCharCount: null, // from Claude's own finalText.length, captured before audioStream.js can substitute/append anything (recovery phrase, END_CALL follow-up)
     // Track M (diagnostic only, design R3 LOCKED 2026-08-22) — explains WHY chunkDelay (t4-t3, first-safe-chunk
     // latency) has the value it does, for the L2b fresh-Claude-request path only. Scoped to the FIRST safe

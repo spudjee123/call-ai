@@ -2570,6 +2570,111 @@ test('Track L wiring: onMilestone("inputStats", {...}) และ ("responseCharC
   harness.disconnect(socket)
 })
 
+test('Track O0 wiring (design LOCKED 2026-08-24 — Master Latency Design R3.2): inputStats.campaignPromptCharCount และ cacheUsage ต้อง map เข้า turnMetrics.l2b* ตรงเป๊ะ', async () => {
+  const callSid = 'CA_L2B_TRACKO0_WIRING'
+  harness.getState().legacyEarlyTtsConfig = { percent: 100, campaignId: L2B_CAMPAIGN_ID }
+  const { socket, state } = await connectPastGreeting(callSid, { rolloutPercent: 0, sessionOverrides: { campaign: l2bCampaign() } })
+  state.claudeConditionalImpl = (sess, signal, onMilestone) => (async function* () {
+    onMilestone?.('requestAt', Date.now())
+    onMilestone?.('inputStats', {
+      systemPromptCharCount: 321,
+      priorHistoryCharCount: 45,
+      requestMessageCount: 7,
+      currentUserCharCount: 12,
+      approxInputTextCharCount: 378,
+      campaignPromptCharCount: 200,
+    })
+    onMilestone?.('cacheUsage', { cacheCreationInputTokens: 1500, cacheReadInputTokens: 0 })
+    onMilestone?.('mode', 'SINGLE_SHOT')
+    yield 'คำตอบทดสอบ'
+    onMilestone?.('fullAt', Date.now())
+    onMilestone?.('finalText', 'คำตอบทดสอบ')
+    onMilestone?.('endCallRequested', false)
+  })()
+
+  const metrics = await captureMetrics(() => harness.sendFinalTranscript('ทดสอบ'))
+
+  assert.equal(metrics.l2bCampaignPromptCharCount, 200)
+  assert.equal(metrics.l2bCacheCreationTokens, 1500)
+  assert.equal(metrics.l2bCacheReadTokens, 0, 'ค่า 0 ที่ถูกต้องจาก API ต้องผ่านมาเป็น 0 จริง ไม่ใช่ถูก ?? ตีเป็น null')
+  harness.disconnect(socket)
+})
+
+test('Track O0 wiring: ไม่มี cacheUsage milestone ยิงเลย (เช่น message_start ไม่เคยมา) → l2bCacheCreationTokens/l2bCacheReadTokens เหลือ default null', async () => {
+  const callSid = 'CA_L2B_TRACKO0_NO_CACHEUSAGE'
+  harness.getState().legacyEarlyTtsConfig = { percent: 100, campaignId: L2B_CAMPAIGN_ID }
+  const { socket, state } = await connectPastGreeting(callSid, { rolloutPercent: 0, sessionOverrides: { campaign: l2bCampaign() } })
+  state.claudeConditionalImpl = (sess, signal, onMilestone) => (async function* () {
+    onMilestone?.('requestAt', Date.now())
+    onMilestone?.('mode', 'SINGLE_SHOT')
+    yield 'คำตอบทดสอบ'
+    onMilestone?.('fullAt', Date.now())
+    onMilestone?.('finalText', 'คำตอบทดสอบ')
+    onMilestone?.('endCallRequested', false)
+  })()
+
+  const metrics = await captureMetrics(() => harness.sendFinalTranscript('ทดสอบ'))
+
+  assert.equal(metrics.l2bCacheCreationTokens, null)
+  assert.equal(metrics.l2bCacheReadTokens, null)
+  assert.equal(metrics.l2bCampaignPromptCharCount, null)
+  assert.equal(metrics.legacyEarlyTtsOutcome, 'COMPLETED', 'ไม่มี cacheUsage/campaignPromptCharCount ต้องไม่กระทบ turn จริงเลย')
+  harness.disconnect(socket)
+})
+
+// Track O0 Review Fix 1 (2026-08-25) — reviewer found the original sink only checked `typeof value ===
+// 'object'` then wrote each field independently via `?? null`, letting wrong-typed values (string/NaN/
+// negative) flow straight into turnMetrics and breaking atomicity (one field could take a garbage value
+// while the other stayed correct). isValidCacheUsage() now validates the whole payload before either field
+// is written. Proves the 3 things the review required: 0 survives, a valid pair writes, a malformed pair
+// writes nothing atomically.
+test('Track O0 Review Fix 1: cacheUsage เป็น 0 จริงทั้งคู่ → ต้องรอด ไม่ถูกตีเป็น null (0 is valid, not "falsy → reject")', async () => {
+  const callSid = 'CA_L2B_TRACKO0_ZERO_ZERO'
+  harness.getState().legacyEarlyTtsConfig = { percent: 100, campaignId: L2B_CAMPAIGN_ID }
+  const { socket, state } = await connectPastGreeting(callSid, { rolloutPercent: 0, sessionOverrides: { campaign: l2bCampaign() } })
+  state.claudeConditionalImpl = (sess, signal, onMilestone) => (async function* () {
+    onMilestone?.('requestAt', Date.now())
+    onMilestone?.('cacheUsage', { cacheCreationInputTokens: 0, cacheReadInputTokens: 0 })
+    onMilestone?.('mode', 'SINGLE_SHOT')
+    yield 'คำตอบทดสอบ'
+    onMilestone?.('fullAt', Date.now())
+    onMilestone?.('finalText', 'คำตอบทดสอบ')
+    onMilestone?.('endCallRequested', false)
+  })()
+  const metrics = await captureMetrics(() => harness.sendFinalTranscript('ทดสอบ'))
+  assert.equal(metrics.l2bCacheCreationTokens, 0)
+  assert.equal(metrics.l2bCacheReadTokens, 0)
+  harness.disconnect(socket)
+})
+
+for (const [label, badPayload] of [
+  ['creation เป็น string ("10")', { cacheCreationInputTokens: '10', cacheReadInputTokens: 0 }],
+  ['read เป็น string ("bad")', { cacheCreationInputTokens: 10, cacheReadInputTokens: 'bad' }],
+  ['creation ติดลบ (-1)', { cacheCreationInputTokens: -1, cacheReadInputTokens: 0 }],
+  ['creation เป็น NaN', { cacheCreationInputTokens: NaN, cacheReadInputTokens: 0 }],
+  ['read เป็น float ไม่เต็มจำนวน (1.5)', { cacheCreationInputTokens: 10, cacheReadInputTokens: 1.5 }],
+]) {
+  test(`Track O0 Review Fix 1: cacheUsage malformed (${label}) → ทั้งคู่ต้องเหลือ default null, atomic (ไม่ใช่ partial write)`, async () => {
+    const callSid = `CA_L2B_TRACKO0_BAD_${label.replace(/\W+/g, '_')}`
+    harness.getState().legacyEarlyTtsConfig = { percent: 100, campaignId: L2B_CAMPAIGN_ID }
+    const { socket, state } = await connectPastGreeting(callSid, { rolloutPercent: 0, sessionOverrides: { campaign: l2bCampaign() } })
+    state.claudeConditionalImpl = (sess, signal, onMilestone) => (async function* () {
+      onMilestone?.('requestAt', Date.now())
+      onMilestone?.('cacheUsage', badPayload)
+      onMilestone?.('mode', 'SINGLE_SHOT')
+      yield 'คำตอบทดสอบ'
+      onMilestone?.('fullAt', Date.now())
+      onMilestone?.('finalText', 'คำตอบทดสอบ')
+      onMilestone?.('endCallRequested', false)
+    })()
+    const metrics = await captureMetrics(() => harness.sendFinalTranscript('ทดสอบ'))
+    assert.equal(metrics.l2bCacheCreationTokens, null, `ต้อง null แม้ field อีกตัว (${JSON.stringify(badPayload)}) จะดู valid ก็ตาม — atomic`)
+    assert.equal(metrics.l2bCacheReadTokens, null, `ต้อง null แม้ field อีกตัว (${JSON.stringify(badPayload)}) จะดู valid ก็ตาม — atomic`)
+    assert.equal(metrics.legacyEarlyTtsOutcome, 'COMPLETED', 'malformed cacheUsage ต้องไม่กระทบ turn จริงเลย')
+    harness.disconnect(socket)
+  })
+}
+
 test('Track L wiring: inputStats(null) จาก producer (เช่น computation ฝั่ง claude.js throw) → ทุก l2b* field เป็น null ไม่กระทบ [Metrics] log ส่วนอื่น', async () => {
   const callSid = 'CA_L2B_TRACKL_NULL_INPUTSTATS'
   harness.getState().legacyEarlyTtsConfig = { percent: 100, campaignId: L2B_CAMPAIGN_ID }
@@ -2591,6 +2696,7 @@ test('Track L wiring: inputStats(null) จาก producer (เช่น computat
   assert.equal(metrics.l2bRequestMessageCount, null)
   assert.equal(metrics.l2bCurrentUserCharCount, null)
   assert.equal(metrics.l2bApproxInputTextCharCount, null)
+  assert.equal(metrics.l2bCampaignPromptCharCount, null, 'inputStats(null) ต้องทำให้ campaignPromptCharCount เป็น null ด้วยเช่นกัน (Track O0)')
   assert.equal(metrics.l2bResponseCharCount, null, 'ไม่มี responseCharCount milestone ยิงเลยในเทสนี้ ต้องเหลือ default null')
   assert.equal(metrics.legacyEarlyTtsOutcome, 'COMPLETED', 'inputStats(null) ต้องไม่กระทบ path การันตี turn อื่นๆ เลย')
   harness.disconnect(socket)
