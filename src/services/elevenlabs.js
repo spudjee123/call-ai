@@ -3,7 +3,10 @@ const { pcm16BufferToMulaw } = require('../utils/audioConverter')
 
 const API_KEY = process.env.ELEVENLABS_API_KEY
 const BASE_URL = 'https://api.elevenlabs.io/v1'
-const DEFAULT_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || 'GolXPCpsnS5QBmdAYjj4'
+// Production incident (2026-08-25) — 'GolXPCpsnS5QBmdAYjj4' started returning ElevenLabs 404
+// voice_not_found (voice no longer exists in the account) — every call whose campaign didn't set its own
+// voice_id fell back to this and got no audio at all. Replaced with a verified-working voice id.
+const DEFAULT_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || 'kdmDKE6EkgrWrrykO9Qt'
 
 // ขอ 16kHz PCM จาก ElevenLabs แทน ulaw_8000 โดยตรง
 // เพราะ ElevenLabs model สร้างเสียงคุณภาพสูงกว่าที่ 16kHz
