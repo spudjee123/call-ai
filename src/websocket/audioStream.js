@@ -279,6 +279,20 @@ function isValidCacheUsage(value) {
   return true
 }
 
+// All-Campaigns L2b + STT-A2 (2026-08-25) — shared campaign-match predicate for legacy_early_tts_campaign_id
+// and stt_a2_campaign_id ONLY (legacy_observed_* and stt_a2_shadow_* keep their original inline exact-match
+// checks unchanged — explicitly out of scope). `configCampaignId == null` (missing/empty Sheet cell) never
+// matches anything — the existing fail-closed rule that "no campaign_id" must never mean "all campaigns" is
+// preserved exactly as before. `'*'` is treated as an explicit, ordinary non-empty campaignId value by the
+// classifier in rolloutConfig.js (no special-casing needed there — confirmed by inspection: percent>0 only
+// requires a non-empty campaignId, and '*' is non-empty) — the wildcard semantics live entirely here, at the
+// point where a config's campaignId is compared against the session's actual campaign id.
+function isCampaignMatched(configCampaignId, sessionCampaignId) {
+  if (configCampaignId == null) return false
+  if (configCampaignId === '*') return sessionCampaignId != null
+  return sessionCampaignId === configCampaignId
+}
+
 function registerWebSocket(fastify) {
   fastify.get('/stream', { websocket: true }, (connection, req) => {
     const socket = (typeof connection.send === 'function') ? connection
@@ -856,7 +870,7 @@ function registerWebSocket(fastify) {
         //   chunked=false, observed=false, campaign match + bucket ผ่าน → legacyEarlyTts=true
         const earlyTtsConfig = rolloutConfig.getCurrentLegacyEarlyTtsConfig()
         legacyEarlyTtsBucket = getLegacyEarlyTtsBucket(callSid)
-        legacyEarlyTtsCampaignMatched = earlyTtsConfig.campaignId != null && session.campaign?.id === earlyTtsConfig.campaignId
+        legacyEarlyTtsCampaignMatched = isCampaignMatched(earlyTtsConfig.campaignId, session.campaign?.id)
         legacyEarlyTtsPercentAtStart = earlyTtsConfig.percent
         legacyEarlyTts = !rollout.useChunkedStreaming && !legacyObserved && legacyEarlyTtsCampaignMatched && legacyEarlyTtsBucket < earlyTtsConfig.percent
 
@@ -866,7 +880,7 @@ function registerWebSocket(fastify) {
         // none of them. Own bucket namespace ("stt-a2:"), own Sheet keys, own fail-closed atomic snapshot.
         const sttA2Config = rolloutConfig.getCurrentSttA2Config()
         sttA2Bucket = getSttA2Bucket(callSid)
-        sttA2CampaignMatched = sttA2Config.campaignId != null && session.campaign?.id === sttA2Config.campaignId
+        sttA2CampaignMatched = isCampaignMatched(sttA2Config.campaignId, session.campaign?.id)
         sttA2PercentAtStart = sttA2Config.percent
         sttA2 = sttA2CampaignMatched && sttA2Bucket < sttA2Config.percent
 

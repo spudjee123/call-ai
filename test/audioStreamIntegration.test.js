@@ -2532,6 +2532,71 @@ test('L2b precedence (required criterion 4): chunked=false, legacyObserved=false
   harness.disconnect(socket)
 })
 
+// ===== All-Campaigns L2b + STT-A2 (2026-08-25) — legacy_early_tts_campaign_id wildcard ('*') support =====
+// legacy_observed_* and stt_a2_shadow_* are explicitly OUT OF SCOPE — they keep their original exact-match-
+// only behavior, proven unchanged by every existing L2a/shadow test above continuing to pass unmodified.
+
+test('All-Campaigns L2b: exact campaign mismatch → legacyEarlyTts=false (unchanged baseline behavior)', async () => {
+  const callSid = 'CA_L2B_WILDCARD_MISMATCH'
+  harness.getState().legacyEarlyTtsConfig = { percent: 100, campaignId: L2B_CAMPAIGN_ID }
+  const { socket, state } = await connectPastGreeting(callSid, { rolloutPercent: 0, sessionOverrides: { campaign: l2aCampaign() } }) // different campaign id
+  const metrics = await captureMetrics(() => harness.sendFinalTranscript('ทดสอบ'))
+  assert.equal(metrics.legacyEarlyTtsCampaignMatched, false)
+  assert.equal(metrics.legacyEarlyTts, false)
+  harness.disconnect(socket)
+})
+
+test('All-Campaigns L2b: campaignId="*" + session มี campaign id ใดๆ → match=true', async () => {
+  const callSid = 'CA_L2B_WILDCARD_MATCH'
+  harness.getState().legacyEarlyTtsConfig = { percent: 100, campaignId: '*' }
+  const { socket, state } = await connectPastGreeting(callSid, { rolloutPercent: 0, sessionOverrides: { campaign: l2aCampaign() } }) // ตั้งใจใช้ campaign คนละตัวกับ L2B_CAMPAIGN_ID เพื่อพิสูจน์ว่า wildcard จริงๆ ไม่ผูกกับ id เดิม
+  const metrics = await captureMetrics(() => harness.sendFinalTranscript('ทดสอบ'))
+  assert.equal(metrics.legacyEarlyTtsCampaignMatched, true)
+  assert.equal(metrics.legacyEarlyTts, true)
+  harness.disconnect(socket)
+})
+
+test('All-Campaigns L2b: campaignId="*" แต่ session ไม่มี campaign id เลย → match=false', async () => {
+  const callSid = 'CA_L2B_WILDCARD_NO_SESSION_CAMPAIGN'
+  harness.getState().legacyEarlyTtsConfig = { percent: 100, campaignId: '*' }
+  const { socket, state } = await connectPastGreeting(callSid, { rolloutPercent: 0, sessionOverrides: { campaign: l2bCampaign({ id: undefined }) } })
+  const metrics = await captureMetrics(() => harness.sendFinalTranscript('ทดสอบ'))
+  assert.equal(metrics.legacyEarlyTtsCampaignMatched, false, 'wildcard ต้องไม่ match ถ้า session ไม่มี campaign id ให้ match ด้วยเลย')
+  assert.equal(metrics.legacyEarlyTts, false)
+  harness.disconnect(socket)
+})
+
+test('All-Campaigns L2b: campaignId=null (missing/empty Sheet cell) → match=false เสมอ แม้ percent>0 (fail-closed เดิมไม่เปลี่ยน)', async () => {
+  const callSid = 'CA_L2B_WILDCARD_NULL_CONFIG'
+  harness.getState().legacyEarlyTtsConfig = { percent: 100, campaignId: null }
+  const { socket, state } = await connectPastGreeting(callSid, { rolloutPercent: 0, sessionOverrides: { campaign: l2bCampaign() } })
+  const metrics = await captureMetrics(() => harness.sendFinalTranscript('ทดสอบ'))
+  assert.equal(metrics.legacyEarlyTtsCampaignMatched, false, '"ไม่มี campaign_id" ต้องไม่แปลว่า "ทุก campaign" — ต้องไม่ match อะไรทั้งนั้น')
+  assert.equal(metrics.legacyEarlyTts, false)
+  harness.disconnect(socket)
+})
+
+test('All-Campaigns L2b: percent=0 + campaignId="*" → OFF เสมอ (wildcard ไม่ได้ยกเว้น percent gate)', async () => {
+  const callSid = 'CA_L2B_WILDCARD_PERCENT_ZERO'
+  harness.getState().legacyEarlyTtsConfig = { percent: 0, campaignId: '*' }
+  const { socket, state } = await connectPastGreeting(callSid, { rolloutPercent: 0, sessionOverrides: { campaign: l2bCampaign() } })
+  const metrics = await captureMetrics(() => harness.sendFinalTranscript('ทดสอบ'))
+  assert.equal(metrics.legacyEarlyTtsCampaignMatched, true, 'campaign match เองยัง true ได้ปกติ — percent ต่างหากที่เป็นตัวปิด')
+  assert.equal(metrics.legacyEarlyTts, false, 'percent=0 ต้อง OFF แม้ campaign match แล้วก็ตาม')
+  harness.disconnect(socket)
+})
+
+test('All-Campaigns L2b: percent=100 + campaignId="*" + bucket ใดๆ ก็ผ่านเกณฑ์ → ON', async () => {
+  const callSid = 'CA_L2B_WILDCARD_PERCENT_FULL'
+  harness.getState().legacyEarlyTtsConfig = { percent: 100, campaignId: '*' }
+  const { socket, state } = await connectPastGreeting(callSid, { rolloutPercent: 0, sessionOverrides: { campaign: l2bCampaign({ id: 'ANY_RANDOM_CAMPAIGN_ID' }) } })
+  const metrics = await captureMetrics(() => harness.sendFinalTranscript('ทดสอบ'))
+  assert.equal(metrics.legacyEarlyTtsCampaignMatched, true)
+  assert.equal(metrics.legacyEarlyTts, true)
+  assert.equal(metrics.legacyEarlyTtsOutcome, 'COMPLETED')
+  harness.disconnect(socket)
+})
+
 // ===== Track L — Claude request/response size diagnostics wiring (design locked 2026-08-22, R3) =====
 // Track L's actual computation (inputStats/responseCharCount) is proven against real claude.js in
 // test/claudeConditional.test.js — this section proves only the consumer-side wiring: onEarlyTtsMilestone

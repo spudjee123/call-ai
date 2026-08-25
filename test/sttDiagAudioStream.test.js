@@ -532,3 +532,92 @@ test('[STT_SHADOW_DIAG] emit failure: field ที่ JSON.stringify ไม่�
 
   harness.disconnect(socket)
 })
+
+// ===== All-Campaigns L2b + STT-A2 (2026-08-25) — stt_a2_campaign_id wildcard ('*') support =====
+// stt_a2_shadow_* is explicitly OUT OF SCOPE — the A2.1 shadow tests above keep passing unmodified, proving
+// its own exact-match-only campaignMatched logic was never touched. maxAlternatives===3 means A2 is ON,
+// null means OFF (same observable signal the existing A2.1 shadow tests above already rely on).
+
+test('All-Campaigns STT-A2: exact campaign mismatch → A2 OFF (unchanged baseline behavior)', async () => {
+  const callSid = 'CA_A2_WILDCARD_MISMATCH'
+  const state = harness.getState()
+  state.rolloutPercent = 0
+  state.sttA2Config = { percent: 100, campaignId: A21_SHADOW_CAMPAIGN_ID }
+  const session = makeSession({ campaign: { voice_id: 'voice1', script: 'ระบบทดสอบ', id: 'SOME_OTHER_CAMPAIGN' }, greetingChunks: [Buffer.from('pregenerated-greeting')] })
+  callSessions.set(callSid, session)
+  const socket = harness.connect({ callSid })
+  harness.sendStart(socket)
+  await delay(10)
+  assert.equal(state.lastSttOptions?.maxAlternatives, null, 'campaign ไม่ตรง → A2 ต้อง OFF')
+  harness.disconnect(socket)
+})
+
+test('All-Campaigns STT-A2: campaignId="*" + session มี campaign id ใดๆ → A2 ON', async () => {
+  const callSid = 'CA_A2_WILDCARD_MATCH'
+  const state = harness.getState()
+  state.rolloutPercent = 0
+  state.sttA2Config = { percent: 100, campaignId: '*' }
+  const session = makeSession({ campaign: { voice_id: 'voice1', script: 'ระบบทดสอบ', id: 'ANY_CAMPAIGN_WHATSOEVER' }, greetingChunks: [Buffer.from('pregenerated-greeting')] })
+  callSessions.set(callSid, session)
+  const socket = harness.connect({ callSid })
+  harness.sendStart(socket)
+  await delay(10)
+  assert.equal(state.lastSttOptions?.maxAlternatives, 3, 'wildcard + campaign id ใดๆ → A2 ต้อง ON')
+  harness.disconnect(socket)
+})
+
+test('All-Campaigns STT-A2: campaignId="*" แต่ session ไม่มี campaign id เลย → A2 OFF', async () => {
+  const callSid = 'CA_A2_WILDCARD_NO_SESSION_CAMPAIGN'
+  const state = harness.getState()
+  state.rolloutPercent = 0
+  state.sttA2Config = { percent: 100, campaignId: '*' }
+  const session = makeSession({ campaign: { voice_id: 'voice1', script: 'ระบบทดสอบ' }, greetingChunks: [Buffer.from('pregenerated-greeting')] }) // ไม่มี id
+  callSessions.set(callSid, session)
+  const socket = harness.connect({ callSid })
+  harness.sendStart(socket)
+  await delay(10)
+  assert.equal(state.lastSttOptions?.maxAlternatives, null, 'wildcard ต้องไม่ match ถ้า session ไม่มี campaign id ให้ match ด้วยเลย')
+  harness.disconnect(socket)
+})
+
+test('All-Campaigns STT-A2: campaignId=null (missing/empty Sheet cell) → OFF เสมอ แม้ percent>0 (fail-closed เดิมไม่เปลี่ยน)', async () => {
+  const callSid = 'CA_A2_WILDCARD_NULL_CONFIG'
+  const state = harness.getState()
+  state.rolloutPercent = 0
+  state.sttA2Config = { percent: 100, campaignId: null }
+  const session = makeSession({ campaign: a21ShadowCampaign(), greetingChunks: [Buffer.from('pregenerated-greeting')] })
+  callSessions.set(callSid, session)
+  const socket = harness.connect({ callSid })
+  harness.sendStart(socket)
+  await delay(10)
+  assert.equal(state.lastSttOptions?.maxAlternatives, null, '"ไม่มี campaign_id" ต้องไม่แปลว่า "ทุก campaign"')
+  harness.disconnect(socket)
+})
+
+test('All-Campaigns STT-A2: percent=0 + campaignId="*" → OFF เสมอ (wildcard ไม่ได้ยกเว้น percent gate)', async () => {
+  const callSid = 'CA_A2_WILDCARD_PERCENT_ZERO'
+  const state = harness.getState()
+  state.rolloutPercent = 0
+  state.sttA2Config = { percent: 0, campaignId: '*' }
+  const session = makeSession({ campaign: a21ShadowCampaign(), greetingChunks: [Buffer.from('pregenerated-greeting')] })
+  callSessions.set(callSid, session)
+  const socket = harness.connect({ callSid })
+  harness.sendStart(socket)
+  await delay(10)
+  assert.equal(state.lastSttOptions?.maxAlternatives, null, 'percent=0 ต้อง OFF แม้ wildcard match แล้วก็ตาม')
+  harness.disconnect(socket)
+})
+
+test('All-Campaigns STT-A2: percent=100 + campaignId="*" + bucket ใดๆ ก็ผ่านเกณฑ์ → ON', async () => {
+  const callSid = 'CA_A2_WILDCARD_PERCENT_FULL'
+  const state = harness.getState()
+  state.rolloutPercent = 0
+  state.sttA2Config = { percent: 100, campaignId: '*' }
+  const session = makeSession({ campaign: { voice_id: 'voice1', script: 'ระบบทดสอบ', id: 'YET_ANOTHER_RANDOM_ID' }, greetingChunks: [Buffer.from('pregenerated-greeting')] })
+  callSessions.set(callSid, session)
+  const socket = harness.connect({ callSid })
+  harness.sendStart(socket)
+  await delay(10)
+  assert.equal(state.lastSttOptions?.maxAlternatives, 3)
+  harness.disconnect(socket)
+})
