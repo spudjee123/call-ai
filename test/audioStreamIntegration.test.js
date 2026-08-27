@@ -3137,21 +3137,38 @@ test('L2b: endCallRequested + shouldBlockEndCall=false → hangup เกิด�
   harness.disconnect(socket)
 })
 
-test('L2b (required): prewarm HIT → บายพาส askClaudeConditionalStream ทั้งหมด ไม่มี legacyEarlyTts telemetry ใดๆ ถูก fabricate', async () => {
-  const callSid = 'CA_L2B_PREWARM_HIT'
+test('L2b Legacy Prewarm Bypass (design locked): interim ไม่ start legacy prewarm เลย, final เรียก askClaudeConditionalStream เสมอ', async () => {
+  const callSid = 'CA_L2B_PREWARM_BYPASS'
   harness.getState().legacyEarlyTtsConfig = { percent: 100, campaignId: L2B_CAMPAIGN_ID }
   const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0, sessionOverrides: { campaign: l2bCampaign() } })
+  let prewarmCalls = 0
   let conditionalCalls = 0
-  state.claudeConditionalImpl = () => { conditionalCalls++; return (async function* () { yield 'ไม่ควรถูกเรียก' })() }
-  state.claudeStreamImpl = async function* () { yield 'คำตอบจาก prewarm' }
+  // legacy askClaudeStream() คือตัวที่ legacy prewarm เรียก — ถ้ายัง start prewarm อยู่จะเห็น count นี้ขยับ
+  state.claudeStreamImpl = async function* () { prewarmCalls++; yield 'ไม่ควรถูกเรียกเลยสำหรับ L2b' }
+  state.claudeConditionalImpl = (sess, signal, onMilestone) => {
+    conditionalCalls++
+    return (async function* () {
+      onMilestone?.('requestAt', Date.now())
+      onMilestone?.('mode', 'SINGLE_SHOT')
+      onMilestone?.('firstDeltaAt', Date.now())
+      onMilestone?.('firstSafeAt', Date.now())
+      onMilestone?.('fullAt', Date.now())
+      onMilestone?.('finalText', 'คำตอบจาก L2b จริง')
+      onMilestone?.('endCallRequested', false)
+      yield 'คำตอบจาก L2b จริง'
+    })()
+  }
 
   harness.sendInterim('อยากทราบโปรโมชั่นสมาชิกใหม่')
   await delay(30)
   const metrics = await captureMetrics(() => harness.sendFinalTranscript('อยากทราบโปรโมชั่นสมาชิกใหม่ครับ'))
 
-  assert.equal(conditionalCalls, 0, 'prewarm HIT ต้องบายพาส L2b ทั้งหมด ไม่เรียก askClaudeConditionalStream เลย')
-  assert.equal(metrics.legacyEarlyTtsOutcome, null)
-  assert.equal(metrics.legacyEarlyTtsRequestAt, null)
+  assert.equal(prewarmCalls, 0, 'L2b interim ต้องไม่ start legacy prewarm เลยตาม design ที่ล็อกไว้')
+  assert.equal(conditionalCalls, 1, 'L2b final ต้องเรียก askClaudeConditionalStream เสมอ (fresh call) exactly once')
+  assert.ok(metrics.legacyEarlyTtsRequestAt != null, 'telemetry ต้องมาจากการทำงานจริงของ askClaudeConditionalStream ไม่ใช่ null/fabricated')
+  assert.equal(metrics.legacyEarlyTtsOutcome, 'COMPLETED')
+  const lastAssistant = session.messages.filter(m => m.role === 'assistant').at(-1)
+  assert.equal(lastAssistant?.content, 'คำตอบจาก L2b จริง')
   harness.disconnect(socket)
 })
 

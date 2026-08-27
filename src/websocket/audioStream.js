@@ -2037,7 +2037,14 @@ function registerWebSocket(fastify) {
           const session = callSessions.get(callSid)
           if (!session) return
           if (rollout?.useChunkedStreaming) { startChunkedSpeculation(session, interimText); return }
-          startPrewarm(session, interimText)
+          // L2b Legacy Prewarm Bypass (design locked) — legacyEarlyTts calls never adopt legacy's
+          // blocking/full-response prewarm result (see the `if (!aiText)` guard further down), and
+          // production PREWARM_DIAG showed 0% HIT / 92.5% GRACE_TIMEOUT for this cohort — starting it here
+          // only pays PREWARM_GRACE_MS on the final path for no measured benefit. Skipping the start keeps
+          // prewarmPromise null for the whole call (its only other writer is clearPrewarm()), so the
+          // existing `if (myPrewarm && isPrewarmUsable(...))` grace block on the final path short-circuits
+          // to false by itself — no second guard needed there.
+          if (!legacyEarlyTts) startPrewarm(session, interimText)
         }, { interimFinalizeMs, maxAlternatives: sttA2 ? 3 : null, enableShadow: sttA2Shadow, onShadowDiagnostic: emitSttShadowDiag })
 
         // AI ทักทายก่อนเลย — ใช้ pre-generated audio ถ้ามี (ลด latency)
