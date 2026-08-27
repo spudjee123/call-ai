@@ -161,6 +161,50 @@ function classifyAck(rawText) {
   return null
 }
 
+// Lightweight Post-Mark Echo Guard (design locked) — replaces the old "short = suspicious"
+// heuristic (whitespace word-count + char length), which is invalid for Thai: Thai doesn't
+// space-delimit words, so a real, complete short answer like "สะดวกค่ะ" was indistinguishable
+// from a meaningless echo fragment by that measure alone and got dropped as a false positive
+// (verified against real production log: utteranceId=1, "สะดวกค่ะ" dropped as POST_MARK_ECHO).
+// New default: ECHO EVIDENCE REQUIRED TO DROP, not SHORT = SUSPICIOUS. Deterministic, synchronous,
+// bounded string comparison only — no network/LLM/async, must never add latency to the decision path.
+const ECHO_TAIL_CHARS = 100
+
+function normalizeForEchoCompare(text) {
+  return (text || '')
+    .replace(/[.!?,]+/g, '')
+    .replace(/\s+/g, '')
+    .toLowerCase()
+}
+
+// Review Blocker 2 fix — a bare "any suffix >= 2 chars" match is not strong evidence: Thai sentences
+// overwhelmingly end in one of a small closed set of clause-final politeness particles (ค่ะ/ครับ/คะ/...),
+// so a customer's genuine short answer sharing just that trailing particle with the AI's own sentence
+// (e.g. AI "...แจ้งได้ค่ะ" / customer "ได้ค่ะ") is common, expected, and NOT echo — only real reproduction
+// of the AI's actual CONTENT (beyond the closing particle) counts as strong evidence. Longest-particle-first
+// so "นะคะ" is matched whole rather than leaving a dangling "นะ" after stripping "คะ" alone.
+const TRAILING_PARTICLES = ['นะคะ', 'นะครับ', 'ค่ะ', 'ครับ', 'ค่า', 'คะ', 'จ้ะ', 'จ้า', 'จ๊ะ']
+const MIN_ECHO_CONTENT_CHARS = 5 // ระยะห่างจริงระหว่างเคส ACCEPT ("สนใจ"=4 หลังตัด particle) กับเคส DROP ("คุยไหม"=6) ที่ยืนยันจากตัวอย่างจริง
+
+function stripTrailingParticle(text) {
+  for (const p of TRAILING_PARTICLES) {
+    if (text.endsWith(p) && text.length > p.length) return text.slice(0, -p.length)
+  }
+  return text
+}
+
+// หลักฐาน echo ที่หนักแน่นคือ "เนื้อหา" ของ transcript (ไม่นับ particle ลงท้ายทั่วไป) เป็นหางเนื้อหา
+// ของสิ่งที่ AI เพิ่งพูดจริง (exact suffix match หลัง normalize+ตัด particle) และยาวพอจะไม่ใช่คำร่วมโดย
+// บังเอิญ — ถ้าไม่ตรงตามนี้ไม่ถือเป็น echo แม้จะสั้นหรือใช้คำร่วมกับสิ่งที่ AI เพิ่งพูดก็ตาม (เช่น ลูกค้า
+// ตอบ "สะดวกค่ะ"/"สนใจค่ะ"/"ได้ค่ะ" ต่อคำถามที่ลงท้ายด้วยคำเดียวกันต้องไม่ถูกทิ้ง)
+function isLikelyPostMarkEcho(transcript, recentAiSpokenText) {
+  const t = stripTrailingParticle(normalizeForEchoCompare(transcript))
+  if (t.length < MIN_ECHO_CONTENT_CHARS) return false // เนื้อหาสั้นเกินจะเป็นหลักฐานได้ — ไม่ทิ้งโดยไม่มีหลักฐาน
+  const aiTail = stripTrailingParticle(normalizeForEchoCompare(recentAiSpokenText).slice(-ECHO_TAIL_CHARS))
+  if (!aiTail) return false // ไม่มี AI text ให้เทียบ (เช่น เทิร์นแรกสุดของสาย) — ACCEPT เสมอ ไม่ fallback ไป heuristic เดิม
+  return aiTail.endsWith(t)
+}
+
 // Owned-mark encoding (design round 5-6) — mark เดิมเป็นแค่ชื่อ (เช่น "ai_done") ไม่มี owner identity เลย ทำให้
 // mark ที่มาช้า (จาก pipeline เก่าที่ถูก barge-in ไปแล้ว หรือ turn อื่นที่เพิ่งจบ) มา unlock isSpeaking/consume
 // pendingShortAck ของ pipeline ปัจจุบันผิดตัวได้ (race จริงที่ยืนยันจาก code review) — ฝัง owner id (activePipelineId
@@ -314,6 +358,15 @@ function registerWebSocket(fastify) {
     let silencePromptCount = 0
     let durationTimer = null
     let lastMarkTime = 0
+    // Lightweight Post-Mark Echo Guard fix (Review Blocker 1) — session.messages is NOT a reliable source of
+    // "what was actually just played," because silence prompts (`silence_done`) speak fixed text that is never
+    // pushed into conversation history. Track the text tied to the OWNED pipeline about to speak at each of
+    // the 3 owned-mark sites (ai_done/greeting_done/silence_done) instead, and only promote it into the value
+    // POST_MARK_ECHO actually compares against once the existing owner-verification check (below, at the
+    // `msg.event === 'mark'` handler) confirms the mark that came back really belongs to that same pipeline —
+    // a stale/mismatched mark can never move this reference (same invariant `isSpeaking`/`lastMarkTime` already rely on).
+    let pendingSpokenText = null   // { pipelineId, text } — set right before sending an owned mark
+    let lastMarkedSpokenText = null // promoted from pendingSpokenText only on verified-owner mark — what POST_MARK_ECHO compares against
     let pendingEndCall = false
     let pendingTranscript = null  // C6c follow-up: barge-in ที่มาถึงตอนเทิร์นเดิมยังไม่ปล่อย sttProcessing — ช่องเดียว, latest-wins (ดูหมายเหตุที่ processTranscript())
     let bargeInPendingFinal = false  // C6c follow-up (STT listening): true หลัง interim trigger bargeIn() ไปแล้ว — บอก onTranscript ว่า final ตัวถัดไปคือประโยคที่พูดแทรกจริง (ดูหมายเหตุที่ onTranscript ด้านล่าง)
@@ -736,6 +789,7 @@ function registerWebSocket(fastify) {
 
       const hasAudio = totalSent > 0 && isSpeaking && socket.readyState === socket.OPEN
       if (hasAudio) {
+        pendingSpokenText = { pipelineId, text: promptText }
         socket.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: ownedMarkName('silence_done', pipelineId) } }))
       } else {
         isSpeaking = false
@@ -1795,6 +1849,7 @@ function registerWebSocket(fastify) {
 
           const hasAudio = !signal?.aborted && isSpeaking && socket.readyState === socket.OPEN && totalSent > 0
           if (hasAudio) {
+            pendingSpokenText = { pipelineId, text: fullText }
             socket.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: ownedMarkName('ai_done', pipelineId) } }))
           } else if (totalSent === 0) {
             isSpeaking = false
@@ -1906,13 +1961,14 @@ function registerWebSocket(fastify) {
             emitSttDiag(sttMeta, 'DROPPED', 'BARGE_IN_COOLDOWN', transcript)
             return
           }
-          // Post-mark echo filter: short fragment ภายใน 500ms ของ mark = delayed PSTN echo
+          // Post-mark echo filter: fragment ภายใน 500ms ของ mark ที่เป็นหางของสิ่ง AI เพิ่งพูดจริง =
+          // delayed PSTN echo (Lightweight Post-Mark Echo Guard, design locked — เดิมใช้ whitespace
+          // word-count/length ซึ่งผิดกับภาษาไทย ดู isLikelyPostMarkEcho() ด้านบนสำหรับ root cause เต็ม)
           // Design B: คำรับคำสั้นที่รู้จัก (ครับ/ค่ะ/โอเค/ok ฯลฯ ทั้ง 2 tier) ได้รับการยกเว้นจาก filter นี้ — mark
           // ยืนยันแล้วว่า playback คิวเดิมเล่นจบจริง ความเสี่ยง echo ต่ำกว่าตอน isSpeaking=true มาก ไม่ต้องแยก tier
           const msSinceMark = Date.now() - lastMarkTime
           if (msSinceMark < 500 && !classifyAck(transcript)) {
-            const wc = transcript.trim().split(/\s+/).length
-            if (wc < 3 && transcript.length < 10) {
+            if (isLikelyPostMarkEcho(transcript, lastMarkedSpokenText)) {
               console.log(`[STT] Echo suppressed (${msSinceMark}ms after mark): "${transcript}"`)
               emitSttDiag(sttMeta, 'DROPPED', 'POST_MARK_ECHO', transcript)
               return
@@ -2069,6 +2125,7 @@ function registerWebSocket(fastify) {
               greetingAbortController = null
               if (!isSpeaking) return  // barge-in happened during greeting
               if (socket.readyState === socket.OPEN) {
+                pendingSpokenText = { pipelineId, text: session.greetingText }
                 socket.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: ownedMarkName('greeting_done', pipelineId) } }))
               }
               const playbackMs = sent * 20 + 1500
@@ -2080,6 +2137,7 @@ function registerWebSocket(fastify) {
               const greeting = await askClaude(session)
               console.log(`[Greeting] "${greeting.substring(0, 100)}"`)
               session.messages.push({ role: 'assistant', content: greeting })
+              pendingSpokenText = { pipelineId, text: greeting }
               await speakAndWait(greeting, session, 'greeting_done', pipelineId)
             }
           } catch (err) {
@@ -2119,6 +2177,13 @@ function registerWebSocket(fastify) {
 
         isSpeaking = false
         lastMarkTime = Date.now()
+        // Lightweight Post-Mark Echo Guard fix (Review Blocker 1) — promote only now that ownerId is verified
+        // above to actually equal activePipelineId; pendingSpokenText was set with that same pipelineId at
+        // speech-start time, so a stale/superseded mark (already rejected by the owner check above) can never
+        // reach here and clobber the reference with the wrong pipeline's text.
+        if (pendingSpokenText && pendingSpokenText.pipelineId === ownerId) {
+          lastMarkedSpokenText = pendingSpokenText.text
+        }
         if (pendingEndCall) {
           setTimeout(() => { if (socket.readyState === socket.OPEN) socket.close() }, 1000)
           return

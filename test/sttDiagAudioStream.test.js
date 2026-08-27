@@ -193,23 +193,200 @@ test('DROPPED/SHORT_FRAGMENT_ECHO: fragment สั้นที่ไม่ใช
   }
 })
 
-test('DROPPED/POST_MARK_ECHO: fragment สั้นภายใน 500ms หลัง mark echo กลับมา (ไม่ใช่ ack ที่รู้จัก) ต้อง emit DROPPED', async () => {
+test('DROPPED/POST_MARK_ECHO: fragment ที่เป็นหางของสิ่ง AI เพิ่งพูดจริงภายใน 500ms หลัง mark ต้อง emit DROPPED (Lightweight Post-Mark Echo Guard)', async () => {
   const callSid = nextCallSid()
-  const { socket } = await connectPastGreeting(callSid)
+  const { socket, state } = await connectPastGreeting(callSid)
   try {
+    state.claudeStreamImpl = async function* () { yield 'ตอนนี้คุณลูกค้าสะดวกคุยไหมคะ' }
     await harness.sendFinalTranscript('ขอสอบถามโปรโมชั่นหน่อยค่ะ') // เทิร์นปกติจบเร็ว (ttsImpl default ไม่ gate)
     const markSent = socket.sent.filter(e => e.event === 'mark').at(-1)
     assert.ok(markSent, 'ต้องมี mark ถูกส่งหลังเทิร์นจบ')
-    socket.emit('message', JSON.stringify({ event: 'mark', mark: markSent.mark })) // จำลอง Twilio echo mark กลับมา (ตั้ง lastMarkTime)
+    socket.emit('message', JSON.stringify({ event: 'mark', mark: markSent.mark })) // จำลอง Twilio echo mark กลับมา (ตั้ง lastMarkTime + lastMarkedSpokenText)
     await delay(5)
 
     const { diagLines } = await captureSttDiag(async () => {
-      await harness.sendFinalTranscript('เอ่อ', FAKE_META) // สั้น ไม่ใช่ ack, ภายใน 500ms หลัง mark
+      await harness.sendFinalTranscript('คุยไหมคะ', FAKE_META) // หางประโยคที่ AI เพิ่งพูดจริง ภายใน 500ms หลัง mark
     })
 
     assert.equal(diagLines.length, 1)
     assert.equal(diagLines[0].disposition, 'DROPPED')
     assert.equal(diagLines[0].reason, 'POST_MARK_ECHO')
+  } finally {
+    harness.disconnect(socket)
+  }
+})
+
+test('DELIVERED: คำอุทานสั้น ("เอ่อ") ภายใน 500ms หลัง mark ต้องไม่ถูกทิ้งเป็น POST_MARK_ECHO เพียงเพราะสั้น (ไม่ใช่ evidence ของ echo)', async () => {
+  const callSid = nextCallSid()
+  const { socket, state } = await connectPastGreeting(callSid)
+  try {
+    state.claudeStreamImpl = async function* () { yield 'ตอนนี้คุณลูกค้าสะดวกคุยไหมคะ' }
+    await harness.sendFinalTranscript('ขอสอบถามโปรโมชั่นหน่อยค่ะ')
+    const markSent = socket.sent.filter(e => e.event === 'mark').at(-1)
+    assert.ok(markSent, 'ต้องมี mark ถูกส่งหลังเทิร์นจบ')
+    socket.emit('message', JSON.stringify({ event: 'mark', mark: markSent.mark }))
+    await delay(5)
+
+    const { diagLines } = await captureSttDiag(async () => {
+      await harness.sendFinalTranscript('เอ่อ', FAKE_META) // คำอุทาน ไม่ใช่หางของสิ่ง AI เพิ่งพูด — ไม่มีหลักฐาน echo
+    })
+
+    assert.equal(diagLines.length, 1)
+    assert.equal(diagLines[0].disposition, 'DELIVERED')
+    assert.equal(diagLines[0].reason, null)
+  } finally {
+    harness.disconnect(socket)
+  }
+})
+
+// ===== Post-Mark Echo Guard Coverage Fix (Formal Review round 2) — ai_done ถูกคลุมแล้วข้างบน
+// สี่ตัวนี้เติมส่วนที่ขาด: silence_done (x2), greeting_done (pre-gen + fallback), และ stale-owner-mark invariant =====
+
+test('DROPPED/POST_MARK_ECHO: silence_done — echo ของข้อความ silence prompt จริง (ไม่ใช่ conversation history) ต้องถูกทิ้ง', { timeout: 15000 }, async () => {
+  const callSid = nextCallSid()
+  const { socket } = await connectPastGreeting(callSid)
+  try {
+    await delay(8100) // silence timer จริง = 8000ms คงที่ ไม่มี override สำหรับเทส
+    const silenceMark = socket.sent.filter(e => e.event === 'mark').at(-1)
+    assert.ok(silenceMark, 'ต้องมี silence_done mark ถูกส่งหลัง silence timeout')
+    assert.match(silenceMark.mark.name, /^silence_done:/, 'ต้องเป็น silence_done mark ไม่ใช่ ai_done')
+    socket.emit('message', JSON.stringify({ event: 'mark', mark: silenceMark.mark }))
+    await delay(10)
+
+    const { diagLines } = await captureSttDiag(async () => {
+      await harness.sendFinalTranscript('ได้ยินอยู่ไหมคะ', FAKE_META) // ข้อความ silence prompt จริงเป๊ะ (จาก audioStream.js)
+    })
+
+    assert.equal(diagLines.length, 1)
+    assert.equal(diagLines[0].disposition, 'DROPPED')
+    assert.equal(diagLines[0].reason, 'POST_MARK_ECHO')
+  } finally {
+    harness.disconnect(socket)
+  }
+})
+
+test('DELIVERED: silence_done — คำตอบลูกค้าที่สมบูรณ์จริงต้องไม่ถูกทิ้งเป็น echo', { timeout: 15000 }, async () => {
+  const callSid = nextCallSid()
+  const { socket } = await connectPastGreeting(callSid)
+  try {
+    await delay(8100)
+    const silenceMark = socket.sent.filter(e => e.event === 'mark').at(-1)
+    assert.ok(silenceMark)
+    assert.match(silenceMark.mark.name, /^silence_done:/)
+    socket.emit('message', JSON.stringify({ event: 'mark', mark: silenceMark.mark }))
+    await delay(10)
+
+    const { diagLines } = await captureSttDiag(async () => {
+      await harness.sendFinalTranscript('ได้ยินค่ะ', FAKE_META) // ไม่ตรงหางของ "ได้ยินอยู่ไหมคะ" (ได้ยิน อยู่หัวประโยค ไม่ใช่ท้าย)
+    })
+
+    assert.equal(diagLines.length, 1)
+    assert.equal(diagLines[0].disposition, 'DELIVERED')
+    assert.equal(diagLines[0].reason, null)
+  } finally {
+    harness.disconnect(socket)
+  }
+})
+
+test('DROPPED/POST_MARK_ECHO: greeting_done (pre-generated) ใช้ greeting text จริง ไม่ใช่ conversation-history fallback', async () => {
+  const callSid = nextCallSid()
+  const state = harness.getState()
+  const greetingText = 'สวัสดีค่ะ ยินดีต้อนรับสมาชิกใหม่เข้าสู่โปรโมชั่นพิเศษค่ะ'
+  const session = makeSession({ greetingChunks: [Buffer.from('pregenerated-greeting')], greetingText })
+  callSessions.set(callSid, session)
+  const socket = harness.connect({ callSid })
+  harness.sendStart(socket)
+  await delay(2000) // 300ms (greeting timer) + 1520ms (unlock ของ greeting เอง) + margin — เหมือน connectPastGreeting
+  try {
+    const greetingMark = socket.sent.filter(e => e.event === 'mark').at(-1)
+    assert.ok(greetingMark, 'ต้องมี greeting_done mark')
+    assert.match(greetingMark.mark.name, /^greeting_done:/)
+    socket.emit('message', JSON.stringify({ event: 'mark', mark: greetingMark.mark }))
+    await delay(10)
+
+    const { diagLines: echoLines } = await captureSttDiag(async () => {
+      await harness.sendFinalTranscript('โปรโมชั่นพิเศษค่ะ', FAKE_META) // หางของ greeting จริง
+    })
+    assert.equal(echoLines.length, 1)
+    assert.equal(echoLines[0].disposition, 'DROPPED')
+    assert.equal(echoLines[0].reason, 'POST_MARK_ECHO')
+
+    // คำตอบสั้นที่สมบูรณ์และไม่ใช่หางของ greeting ต้องไม่ถูกทิ้งเพียงเพราะสั้น
+    socket.emit('message', JSON.stringify({ event: 'mark', mark: greetingMark.mark })) // จำลอง mark เดิมคงอยู่ (window ใหม่)
+    await delay(10)
+    state.claudeStreamImpl = async function* () { yield 'ตอบรับทราบค่ะ' }
+    const { diagLines: legitLines } = await captureSttDiag(async () => {
+      await harness.sendFinalTranscript('สนใจค่ะ', FAKE_META)
+    })
+    assert.equal(legitLines.length, 1)
+    assert.equal(legitLines[0].disposition, 'DELIVERED')
+  } finally {
+    harness.disconnect(socket)
+  }
+})
+
+test('DROPPED/POST_MARK_ECHO: greeting_done (fallback generate) ใช้ greeting text จริงจาก askClaude ไม่ใช่ conversation-history fallback', async () => {
+  const callSid = nextCallSid()
+  const state = harness.getState()
+  const greetingText = 'สวัสดีค่ะ ยินดีต้อนรับสมาชิกใหม่เข้าสู่โปรโมชั่นพิเศษค่ะ'
+  state.askClaudeImpl = async () => greetingText
+  const session = makeSession() // ไม่มี greetingChunks — บังคับเข้า fallback branch (askClaude + speakAndWait)
+  callSessions.set(callSid, session)
+  const socket = harness.connect({ callSid })
+  harness.sendStart(socket)
+  await delay(2000)
+  try {
+    const greetingMark = socket.sent.filter(e => e.event === 'mark').at(-1)
+    assert.ok(greetingMark, 'ต้องมี greeting_done mark (fallback path)')
+    assert.match(greetingMark.mark.name, /^greeting_done:/)
+    socket.emit('message', JSON.stringify({ event: 'mark', mark: greetingMark.mark }))
+    await delay(10)
+
+    const { diagLines } = await captureSttDiag(async () => {
+      await harness.sendFinalTranscript('โปรโมชั่นพิเศษค่ะ', FAKE_META)
+    })
+    assert.equal(diagLines.length, 1)
+    assert.equal(diagLines[0].disposition, 'DROPPED')
+    assert.equal(diagLines[0].reason, 'POST_MARK_ECHO')
+  } finally {
+    harness.disconnect(socket)
+  }
+})
+
+test('Stale owner mark: mark ของ pipeline เก่าที่มาถึงช้าต้องไม่ promote/overwrite echo reference ของ pipeline ปัจจุบัน', async () => {
+  const callSid = nextCallSid()
+  const { socket, state } = await connectPastGreeting(callSid)
+  try {
+    // Turn 1 (pipeline เก่า) — ส่ง mark จริง แต่ "ยังไม่ echo กลับ" (จำลองมาช้า) — isSpeaking ยังเป็น true อยู่
+    state.claudeStreamImpl = async function* () { yield 'นี่คือประโยคทดสอบเก่ามากเลยครับ' }
+    await harness.sendFinalTranscript('เทิร์นแรกครับ')
+    const oldMark = socket.sent.filter(e => e.event === 'mark').at(-1)
+    assert.ok(oldMark, 'ต้องมี mark ของ pipeline เก่า (ยังไม่ echo)')
+
+    // Turn 2 (pipeline ใหม่) — เกิดผ่าน barge-in จริง เพราะ isSpeaking ยังเป็น true จาก turn 1 (mark เก่ายังไม่ echo)
+    state.claudeStreamImpl = async function* () { yield 'นี่คือประโยคทดสอบใหม่มากเลยครับ' }
+    await harness.sendFinalTranscript('พูดแทรกครับ')
+    const newMark = socket.sent.filter(e => e.event === 'mark').at(-1)
+    assert.ok(newMark, 'ต้องมี mark ของ pipeline ใหม่')
+    assert.notEqual(newMark.mark.name, oldMark.mark.name, 'ต้องเป็นคนละ pipeline กัน')
+
+    // echo mark ใหม่ก่อน (ตามลำดับเวลาจริง)
+    socket.emit('message', JSON.stringify({ event: 'mark', mark: newMark.mark }))
+    // แล้ว mark เก่ามาถึงทีหลัง (late/stale) — ต้องถูก owner-check เดิม ignore ทั้งหมด ไม่แตะ reference
+    socket.emit('message', JSON.stringify({ event: 'mark', mark: oldMark.mark }))
+    // รอให้พ้น bargeInCooldown 400ms ของ turn 2 เอง (คนละกลไกจาก POST_MARK_ECHO ที่จะทดสอบ) แต่ยังอยู่ใน
+    // หน้าต่าง 500ms หลัง mark ใหม่ echo (เว้นระยะปลอดภัยทั้งสองด้าน)
+    await delay(420)
+
+    // พิสูจน์ว่า reference ยังเป็นของ pipeline ใหม่ ไม่ถูก stale mark ทับกลับไปเป็นของเก่า:
+    // ส่งหางของประโยค "เก่า" — ถ้า reference ถูกทับกลับไปเป็นเก่าจริง (bug) อันนี้จะโดน DROP ผิด
+    const { diagLines: oldTailLines } = await captureSttDiag(async () => {
+      await harness.sendFinalTranscript('เก่ามากเลยครับ', FAKE_META)
+    })
+    assert.equal(oldTailLines.length, 1)
+    assert.equal(oldTailLines[0].disposition, 'DELIVERED', 'หางของประโยคเก่าต้องไม่ถูกใช้เป็น echo reference อีกต่อไป')
+
+    // เช็คต่ออีกด้าน (ต้อง reconnect เพื่อ reset lastMarkTime window ใหม่ ไม่ปนกับ assert ก่อนหน้า)
   } finally {
     harness.disconnect(socket)
   }

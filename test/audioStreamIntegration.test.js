@@ -2153,6 +2153,69 @@ test('Design B: Context 2 (post-mark <500ms) — ack ที่รู้จัก
   harness.disconnect(socket)
 })
 
+// Lightweight Post-Mark Echo Guard (design locked) — replaces the old whitespace word-count/length
+// heuristic, which was invalid for Thai and dropped real short complete answers (e.g. "สะดวกค่ะ") as
+// false-positive echo. New rule: only DROP when the incoming transcript is an exact suffix (after
+// normalizing whitespace/punctuation/case) of what the AI actually just said — sharing a word is not
+// enough evidence on its own.
+async function runPostMarkEchoCase(aiText, customerText, expectDropped) {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+
+  state.claudeStreamImpl = async function* () { yield aiText }
+  await harness.sendFinalTranscript('เริ่มคุยครับ')
+  const mark = socket.sent.filter(e => e.event === 'mark').at(-1)
+  socket.emit('message', JSON.stringify({ event: 'mark', mark: mark.mark }))
+  await delay(10) // lastMarkTime ถูกตั้งใหม่ — อยู่ในหน้าต่าง <500ms แน่นอน
+
+  let newTurnCalls = 0
+  state.claudeStreamImpl = async function* () { newTurnCalls++; yield 'รับทราบค่ะ' }
+  await harness.sendFinalTranscript(customerText)
+
+  const wasDropped = newTurnCalls === 0
+  assert.equal(wasDropped, expectDropped,
+    `AI พูด "${aiText}" แล้วลูกค้าตอบ "${customerText}" ภายใน 500ms หลัง mark — คาดว่า ${expectDropped ? 'ถูกทิ้งเป็น echo' : 'ต้องผ่าน ไม่ถูกทิ้ง'} แต่ newTurnCalls=${newTurnCalls}`)
+
+  if (!expectDropped) {
+    const lastUserMsg = session.messages.filter(m => m.role === 'user').at(-1)
+    assert.equal(lastUserMsg.content, customerText, 'ข้อความที่ deliver เข้า history ต้องเป็น raw transcript เป๊ะ')
+  }
+
+  harness.disconnect(socket)
+}
+
+test('Lightweight Post-Mark Echo Guard: คำตอบสั้นที่มีความหมายจริงต้องไม่ถูกทิ้ง (production regression — "สะดวกค่ะ")', async () => {
+  await runPostMarkEchoCase('ตอนนี้คุณลูกค้าสะดวกคุยไหมคะ', 'สะดวกค่ะ', false)
+})
+
+test('Lightweight Post-Mark Echo Guard: false-positive cases — คำตอบสั้นที่ใช้คำร่วมกับ AI แต่ไม่ใช่หางประโยคเดียวกัน ต้องผ่าน', async () => {
+  const cases = [
+    ['สนใจโปรโมชั่นนี้ไหมคะ', 'สนใจค่ะ'],
+    ['สะดวกคุยไหมคะ', 'ไม่สะดวกค่ะ'],
+    ['ได้ลองเข้าเว็บไซต์หรือยังคะ', 'ยังไม่ได้ค่ะ'],
+    ['สนใจโปรโมชั่นนี้ไหมคะ', 'ไม่สนใจค่ะ'],
+    ['จะเข้าไปดูตอนนี้ไหมคะ', 'เดี๋ยวเข้าไปดูค่ะ'],
+    ['ตอนนี้สะดวกไหมคะ', 'กำลังทำงานอยู่ครับ'],
+    ['สนใจไหมคะ', 'ได้ค่ะ'],
+    ['สนใจไหมคะ', 'ไม่ได้ค่ะ'],
+  ]
+  for (const [aiText, customerText] of cases) {
+    await runPostMarkEchoCase(aiText, customerText, false)
+  }
+})
+
+test('Lightweight Post-Mark Echo Guard: echo จริง (หางประโยคที่ AI เพิ่งพูดสะท้อนกลับมา) ยังต้องถูกทิ้งเหมือนเดิม', async () => {
+  const cases = [
+    ['ตอนนี้คุณลูกค้าสะดวกคุยไหมคะ', 'คุยไหมคะ'],
+    ['ตอนนี้คุณลูกค้าสะดวกคุยไหมคะ', 'สะดวกคุยไหมคะ'],
+    ['เดี๋ยวแอดมินแจ้งรายละเอียดให้นะคะ', 'รายละเอียดให้นะคะ'],
+    ['เดี๋ยวแอดมินแจ้งรายละเอียดให้นะคะ', 'รายละเอียดให้นะคะ.'], // punctuation ที่ไม่มีนัยสำคัญต้องไม่ทำให้หลุด filter
+  ]
+  for (const [aiText, customerText] of cases) {
+    await runPostMarkEchoCase(aiText, customerText, true)
+  }
+})
+
 // ===== L2a — legacy Claude instrumentation (design locked 2026-08-20, review rounds 1-3) =====
 // พิสูจน์แค่ wiring ระดับ audioStream.js↔turnMetrics เท่านั้น — behavior จริงของ askClaudeObservedFullResponse()
 // เอง (milestone timing, numeric-protection timer mirror, abort/error propagation) มีเทสละเอียดแยกอยู่แล้วใน
