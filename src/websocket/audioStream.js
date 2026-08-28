@@ -6,6 +6,7 @@ const healthMonitor = require('../utils/healthMonitor')
 const { createCallState, bumpGeneration, isCurrentGeneration, endCall } = require('../utils/generationGuard')
 const { decideRollout, getLegacyObservedBucket, getLegacyEarlyTtsBucket, getSttA2Bucket, getSttA2ShadowBucket } = require('../utils/rolloutBucket')
 const { createTurnMetrics, markOnce, computeDerivedMetrics } = require('../utils/turnMetrics')
+const { createAudioContinuity, recordFrameSent, finalizeAudioContinuity, truncateForLog } = require('../utils/audioContinuity')
 const { createTurnState, markTtsPending, markAudioCommitted, markDone, claimFallback } = require('../utils/turnState')
 const { runChunkedTurn, speakFixedText, createChunkedProducer, adoptChunkedProducer } = require('./chunkedTurn')
 const { runAttemptWithWatchdog, bridgeAbort } = require('../utils/attemptWithWatchdog')
@@ -394,6 +395,13 @@ function registerWebSocket(fastify) {
     // interim (same normalized text, or a forward extension of it) within BARGE_CONFIRM_WINDOW_MS does. Reset
     // whenever the pipeline changes, the window expires, or the interim isn't a coherent continuation.
     let bargeCandidate = null
+    // Phase A — Audio Continuity Telemetry (design locked, diagnostic only). recentBargeTimestamps: rolling
+    // performance.now() history pruned to the last 10s, read by bargeIn() to derive recentBargeCount5s/10s.
+    // pendingAudioContinuityBargeInfo: bridge from bargeIn() (outside processTranscript's closure) into the
+    // interrupted pipeline's own [AudioContinuity] tail log — same bridging pattern as bargeCandidate/
+    // pendingSpokenText above (a plain connection-scoped variable, matched by pipelineId at read time).
+    let recentBargeTimestamps = []
+    let pendingAudioContinuityBargeInfo = null
     let pendingEndCall = false
     let pendingTranscript = null  // C6c follow-up: barge-in ที่มาถึงตอนเทิร์นเดิมยังไม่ปล่อย sttProcessing — ช่องเดียว, latest-wins (ดูหมายเหตุที่ processTranscript())
     let bargeInPendingFinal = false  // C6c follow-up (STT listening): true หลัง interim trigger bargeIn() ไปแล้ว — บอก onTranscript ว่า final ตัวถัดไปคือประโยคที่พูดแทรกจริง (ดูหมายเหตุที่ onTranscript ด้านล่าง)
@@ -852,7 +860,11 @@ function registerWebSocket(fastify) {
     }
 
     // หยุด AI พูดทันที เมื่อลูกค้าพูดแทรก
-    function bargeIn() {
+    // continuityInfo (Phase A, optional, diagnostic only): { bargeTrigger, candidateFirstAt, candidateFirstText,
+    // candidateConfirmAt, candidateConfirmText } — caller-supplied context about WHY this barge fired, merged
+    // into pendingAudioContinuityBargeInfo below alongside clearSentAt/recentBargeCount so the interrupted
+    // pipeline's own [AudioContinuity] tail log can read it back. Never affects control flow.
+    function bargeIn(continuityInfo) {
       if (!isSpeaking) return
       console.log('[Barge-in] Customer interrupted — stopping AI audio')
       bumpGeneration(callState) // C2: invalidate ก่อนทุกอย่าง — ยัง observational, ไม่ได้ใช้ gate การ abort จริงที่อยู่ถัดไป
@@ -867,6 +879,24 @@ function registerWebSocket(fastify) {
       if (ttsAbortController) { ttsAbortController.abort(); ttsAbortController = null }
       if (socket.readyState === socket.OPEN) {
         socket.send(JSON.stringify({ event: 'clear', streamSid }))
+        // Phase A — snapshot BEFORE isSpeaking flips false, using activePipelineId (bargeIn() never bumps it
+        // itself — see note below) so this always tags the pipeline actually being interrupted.
+        const now = performance.now()
+        recentBargeTimestamps = recentBargeTimestamps.filter(t => now - t <= 10000)
+        const recentBargeCount10s = recentBargeTimestamps.length
+        const recentBargeCount5s = recentBargeTimestamps.filter(t => now - t <= 5000).length
+        recentBargeTimestamps.push(now)
+        pendingAudioContinuityBargeInfo = {
+          pipelineId: activePipelineId,
+          clearSentAt: now,
+          recentBargeCount5s,
+          recentBargeCount10s,
+          candidateFirstAt: continuityInfo?.candidateFirstAt ?? null,
+          candidateFirstText: continuityInfo?.candidateFirstText ?? null,
+          candidateConfirmAt: continuityInfo?.candidateConfirmAt ?? null,
+          candidateConfirmText: continuityInfo?.candidateConfirmText ?? null,
+          bargeTrigger: continuityInfo?.bargeTrigger ?? null,
+        }
       }
       isSpeaking = false
       // C6c follow-up: ไม่ set sttProcessing = false ที่นี่อีกต่อไป — ถ้าเทิร์นเดิมยัง await Claude/TTS อยู่จริง
@@ -1046,6 +1076,11 @@ function registerWebSocket(fastify) {
             legacyEarlyTtsCampaignMatched,
           })
           markOnce(turnMetrics, 't1')
+
+          // Phase A — Audio Continuity Telemetry (Implementation Gate #1, design locked). Own object, own
+          // [AudioContinuity] log line — never merged into turnMetrics/[Metrics] (kept as a separate namespace
+          // per design). Scoped to this legacy/CONTROL processTranscript() turn only, see audioContinuity.js.
+          const audioContinuity = createAudioContinuity({ callSid, generationId, pipelineId })
 
           ttsAbortController = new AbortController()
           const signal = ttsAbortController.signal
@@ -1675,6 +1710,7 @@ function registerWebSocket(fastify) {
                       if (totalSent === 0) console.log('[TTS] First audio chunk sent')
                       if (totalSent === 0) noteActiveSpokenChunk(pipelineId, followUp)
                       socket.send(JSON.stringify({ event: 'media', streamSid, media: { payload: followUpChunk.toString('base64') } }))
+                      recordFrameSent(audioContinuity, followUpChunk)
                       markOnce(turnMetrics, 't7')
                       markAudioCommitted(turnState)
                       totalSent++
@@ -1816,6 +1852,7 @@ function registerWebSocket(fastify) {
                     if (totalSent === 0) console.log('[TTS] First audio chunk sent')
                     if (totalSent === 0) noteActiveSpokenChunk(pipelineId, cleanText)
                     socket.send(JSON.stringify({ event: 'media', streamSid, media: { payload: chunk.toString('base64') } }))
+                    recordFrameSent(audioContinuity, chunk)
                     markOnce(turnMetrics, 't7')
                     markAudioCommitted(turnState) // อยู่หลัง signal.aborted/readyState check (legacy staleness ของลูปนี้) และหลัง socket.send() จริงเท่านั้น
                     totalSent++
@@ -1844,6 +1881,7 @@ function registerWebSocket(fastify) {
                   if (totalSent === 0) console.log('[TTS] First audio chunk sent')
                   if (totalSent === 0) noteActiveSpokenChunk(pipelineId, followUp)
                   socket.send(JSON.stringify({ event: 'media', streamSid, media: { payload: chunk.toString('base64') } }))
+                  recordFrameSent(audioContinuity, chunk)
                   markOnce(turnMetrics, 't7')
                   markAudioCommitted(turnState) // อยู่หลัง signal.aborted/readyState check (legacy staleness ของลูปนี้) และหลัง socket.send() จริงเท่านั้น
                   totalSent++
@@ -1901,6 +1939,15 @@ function registerWebSocket(fastify) {
 
           markDone(turnState) // ทุก pre-terminal phase ไปจบที่ DONE ได้ตรงๆ (turnState.js ไม่ guard transition นี้) — ครอบคลุมทุกทางจบของ legacy turn
           console.log('[Metrics]', JSON.stringify({ ...turnMetrics, ...computeDerivedMetrics(turnMetrics) }))
+
+          // Phase A — merge bargeIn()'s bridge into this pipeline's own audioContinuity if THIS pipeline is the
+          // one that was interrupted (pipelineId match — see bargeIn()/pendingAudioContinuityBargeInfo comment
+          // above), then emit exactly once, same point [Metrics] just logged at, every turn (barged or not).
+          if (pendingAudioContinuityBargeInfo && pendingAudioContinuityBargeInfo.pipelineId === pipelineId) {
+            Object.assign(audioContinuity, pendingAudioContinuityBargeInfo)
+            pendingAudioContinuityBargeInfo = null
+          }
+          console.log('[AudioContinuity]', JSON.stringify(finalizeAudioContinuity(audioContinuity)))
 
           const hasAudio = !signal?.aborted && isSpeaking && socket.readyState === socket.OPEN && totalSent > 0
           if (hasAudio) {
@@ -2084,7 +2131,11 @@ function registerWebSocket(fastify) {
               emitSttDiag(sttMeta, 'DROPPED', 'ACTIVE_PLAYBACK_ECHO', transcript)
               return
             }
-            bargeIn()
+            bargeIn({
+              bargeTrigger: ackTier === 'TIER1' ? 'FINAL_TIER1' : 'FINAL',
+              candidateConfirmAt: performance.now(),
+              candidateConfirmText: truncateForLog(transcript),
+            })
             bargeInCooldown = true
             setTimeout(() => { bargeInCooldown = false }, 400)
 
@@ -2178,7 +2229,7 @@ function registerWebSocket(fastify) {
             const normalized = normalizeForEchoCompare(interimText)
             const noCandidate = !bargeCandidate || bargeCandidate.pipelineId !== activePipelineId || (Date.now() - bargeCandidate.firstAt) > BARGE_CONFIRM_WINDOW_MS
             if (noCandidate) {
-              bargeCandidate = { pipelineId: activePipelineId, previousText: normalized, firstAt: Date.now() }
+              bargeCandidate = { pipelineId: activePipelineId, previousText: normalized, firstAt: Date.now(), firstAtPerf: performance.now() }
               return
             }
             if (bargeCandidate.previousText.startsWith(normalized) && normalized !== bargeCandidate.previousText) {
@@ -2191,12 +2242,21 @@ function registerWebSocket(fastify) {
             if (!coherent) {
               // Not a continuation of the same utterance (e.g. "คิดถึง" → "ระบบ") — reset to a fresh
               // candidate seeded by THIS interim, don't confirm on unrelated fragments.
-              bargeCandidate = { pipelineId: activePipelineId, previousText: normalized, firstAt: Date.now() }
+              bargeCandidate = { pipelineId: activePipelineId, previousText: normalized, firstAt: Date.now(), firstAtPerf: performance.now() }
               return
             }
             // Coherent second signal: exact repeat OR a forward extension of the candidate's previous text.
+            const continuityCandidateFirstAt = bargeCandidate.firstAtPerf
+            const continuityCandidateFirstText = truncateForLog(bargeCandidate.previousText)
+            const continuityCandidateConfirmText = truncateForLog(normalized)
             bargeCandidate = null
-            bargeIn()
+            bargeIn({
+              bargeTrigger: 'INTERIM_CONFIRM',
+              candidateFirstAt: continuityCandidateFirstAt,
+              candidateFirstText: continuityCandidateFirstText,
+              candidateConfirmAt: performance.now(),
+              candidateConfirmText: continuityCandidateConfirmText,
+            })
             bargeInPendingFinal = true // ตั้งเฉพาะตอน trigger จาก interim เท่านั้น — บอก onTranscript ว่า final ตัวถัดไปคือประโยคที่พูดแทรกจริง
             bargeInCooldown = true
             setTimeout(() => { bargeInCooldown = false }, 400)
