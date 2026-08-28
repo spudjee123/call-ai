@@ -83,8 +83,12 @@ async function summarizeCall(session) {
     .join('\n')
 
   const response = await client.messages.create({
-    model: 'claude-sonnet-4-6',
+    model: 'claude-sonnet-5',
     max_tokens: 500,
+    // Sonnet 5 เปลี่ยน default ตอนไม่ตั้ง thinking เลย — Sonnet 4.6 (เดิม) รันแบบไม่คิด แต่ Sonnet 5 รันแบบ
+    // adaptive thinking เปิดอัตโนมัติทันที ระบุ disabled ตรงๆ เพื่อคงพฤติกรรม/latency เดิมไว้ (ตัดสินใจ 2026-08-28:
+    // เน้นลด latency ของ post-call flow เพราะ callQueue.release() รอ summarizeCall() เสร็จก่อนถึงจะโทรเบอร์ถัดไปได้)
+    thinking: { type: 'disabled' },
     messages: [{
       role: 'user',
       content: `วิเคราะห์บทสนทนานี้และตอบในรูปแบบ JSON:
@@ -156,7 +160,7 @@ async function* askClaudeStream(session, isGreeting = false, signal = null) {
   )
 
   const response = await client.messages.create({
-    model: 'claude-sonnet-4-6',
+    model: 'claude-sonnet-5',
     max_tokens: 200,
     // Sonnet 4.6 default effort เป็น high ถ้าไม่ตั้งไว้ — งานนี้แค่ตอบ 1-2 ประโยคสั้นๆ
     // ลดเป็น low ตามคำแนะนำของ Anthropic สำหรับงานแชท/บทสนทนาสั้นๆ เพื่อลดเวลาคิดต่อ turn
@@ -240,7 +244,7 @@ async function* askClaudeStreamChunked(session, signal = null, onControl = null)
   )
 
   const stream = client.messages.stream({
-    model: 'claude-sonnet-4-6',
+    model: 'claude-sonnet-5',
     max_tokens: 200,
     thinking: { type: 'disabled' },
     output_config: { effort: 'low' },
@@ -335,7 +339,7 @@ async function* askClaudeObservedFullResponse(session, signal = null, onMileston
   onMilestone?.('requestAt', requestAt)
 
   const stream = client.messages.stream({
-    model: 'claude-sonnet-4-6',
+    model: 'claude-sonnet-5',
     max_tokens: 200,
     thinking: { type: 'disabled' },
     output_config: { effort: 'low' },
@@ -512,7 +516,7 @@ async function* askClaudeConditionalStream(session, signal = null, onMilestone =
   onMilestone?.('requestAt', requestAt)
 
   const stream = client.messages.stream({
-    model: 'claude-sonnet-4-6',
+    model: 'claude-sonnet-5',
     max_tokens: 200,
     thinking: { type: 'disabled' },
     output_config: { effort: 'low' },
