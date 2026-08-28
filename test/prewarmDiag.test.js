@@ -479,7 +479,7 @@ test('barge-in vs grace-abort race: settlement fires exactly once (BARGE_IN), se
     await delay(10) // ให้ processTranscript() เข้า grace-wait (isSpeaking=true แล้ว)
 
     const { diagLines } = await capturePrewarmDiag(async () => {
-      harness.sendInterim('ขัดจังหวะ') // isSpeaking=true ตอนนี้ → trigger bargeIn() โดยตรง
+      harness.sendInterimConfirmed('ขัดจังหวะ') // isSpeaking=true ตอนนี้, 2-signal confirmed → trigger bargeIn() โดยตรง
       await delay(200) // ให้ grace (150ms) + finalPromise ไปจบให้หมด
       await finalPromise
     })
@@ -551,7 +551,7 @@ test('ignored/no-op trigger: an interim that never reaches startPrewarm() (call 
     const oldTurnPromise = harness.sendFinalTranscript('ขอสอบถามก่อนค่ะ') // ไม่มี interim นำมาก่อนเทิร์นนี้ — เทิร์นนี้เองก็ไม่มี prewarm เช่นกัน
     await delay(30) // isSpeaking=true, sttProcessing=true (ค้างรอ gate)
 
-    harness.sendInterim('พูดแทรกสั้นๆนะครับ') // interim-triggered barge-in — isSpeaking→false, sttProcessing ยัง true (เทิร์นเดิมยังค้างรอ gate)
+    harness.sendInterimConfirmed('พูดแทรกสั้นๆนะครับ') // interim-triggered barge-in (2-signal confirmed) — isSpeaking→false, sttProcessing ยัง true (เทิร์นเดิมยังค้างรอ gate)
     await delay(420) // รอให้พ้น bargeInCooldown 400ms ก่อน ไม่งั้น interim ถัดไปจะโดนกันที่ cooldown แทนที่จะถึงจุด sttProcessing check ที่ต้องการทดสอบ
 
     const { diagLines: ignoredDiag } = await capturePrewarmDiag(async () => {

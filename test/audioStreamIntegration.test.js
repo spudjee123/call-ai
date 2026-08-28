@@ -555,6 +555,12 @@ test('16) DoD C: final transcript หลายอันมาระหว่า�
   let newTurnCalls = 0
   state.claudeStreamImpl = async function* () { newTurnCalls++; yield 'ตอบ' }
 
+  // Final Cooldown Preservation R1.1 — ส่งรัวติดกัน (ไม่ใส่ delay) เหมือนเดิม ('แทรกแรก' เองก็ trigger bargeIn()
+  // ตรงๆ ได้แล้วตอนนี้ ไม่ใช่ SHORT_FRAGMENT_ECHO เหมือนก่อน R1 — ข้อความไทยไม่มี space เลยเคยโดน wordCount<2 ดักไว้
+  // ตลอดมาก่อน) final ตัวที่ 2/3 มาซ้อนภายใน BARGE_IN_COOLDOWN (400ms, ค่าเองไม่เปลี่ยน) ของตัวแรก — ก่อน R1.1 จุดนี้
+  // จะโดนกันเป็น DROPPED/BARGE_IN_COOLDOWN ก่อนถึงคิวด้วยซ้ำ (คำพูดหาย) หลัง R1.1 คือ "ไม่ trigger physical
+  // interrupt ซ้ำ" (isSpeaking เป็น false อยู่แล้ว ไม่มีอะไรให้ barge ซ้ำจริง) แต่ transcript ยังไหลเข้า
+  // pendingTranscript latest-wins ตามปกติทุกประการ — จึงกลับมาเป็น genuine latest-wins ('แทรกสามล่าสุด' ชนะจริง)
   await harness.sendFinalTranscript('แทรกแรก')
   await harness.sendFinalTranscript('แทรกสอง')
   await harness.sendFinalTranscript('แทรกสามล่าสุด')
@@ -564,7 +570,7 @@ test('16) DoD C: final transcript หลายอันมาระหว่า�
 
   assert.equal(newTurnCalls, 1, 'ห้ามเกิดหลาย Claude turn จากการพูดแทรกหลายครั้งระหว่างรอเทิร์นเดิมปล่อย sttProcessing')
   const lastUserMsg = session.messages.filter(m => m.role === 'user').at(-1)
-  assert.equal(lastUserMsg.content, 'แทรกสามล่าสุด', 'ต้องใช้ transcript ล่าสุด (latest-wins) ไม่ใช่อันแรกที่แทรกเข้ามา')
+  assert.equal(lastUserMsg.content, 'แทรกสามล่าสุด', 'ต้องใช้ transcript ล่าสุด (latest-wins) จริง — R1.1 ต้องไม่ให้ BARGE_IN_COOLDOWN กลืน final ที่มาซ้อนกันทิ้งไปเงียบๆ')
 
   harness.disconnect(socket)
 })
@@ -635,11 +641,11 @@ test('18) DoD B+C+E+F (STT listening): interim ระหว่าง isSpeaking=
   const oldTurnPromise = harness.sendFinalTranscript('คำถามแรกครับ')
   await delay(30) // เทิร์นแรกเข้าสู่ isSpeaking=true, sttProcessing=true และเริ่ม await Claude ค้างอยู่แล้ว
 
-  // ลูกค้าเริ่มพูดแทรก — STT ส่ง interim มาก่อน final เสมอ (ยาวพอ ไม่ใช่ fragment สั้น)
-  harness.sendInterim('เดี๋ยวก่อนครับ ขอถามเรื่องถอนเงินก่อน')
+  // ลูกค้าเริ่มพูดแทรก — STT ส่ง interim มาก่อน final เสมอ (ยาวพอ ไม่ใช่ fragment สั้น, 2-signal confirmed ตาม R1)
+  harness.sendInterimConfirmed('เดี๋ยวก่อนครับ ขอถามเรื่องถอนเงินก่อน')
 
   const clearEvents = socket.sent.filter(e => e.event === 'clear')
-  assert.equal(clearEvents.length, 1, 'interim ต้อง trigger bargeIn ทันทีครั้งเดียว ไม่ต้องรอ final')
+  assert.equal(clearEvents.length, 1, 'interim ที่ confirm แล้วต้อง trigger bargeIn ทันทีครั้งเดียว ไม่ต้องรอ final')
 
   let newTurnCalls = 0
   state.claudeStreamImpl = async function* () { newTurnCalls++; yield 'ตอบเรื่องถอนเงิน' }
@@ -702,10 +708,10 @@ test('20) DoD D: interim trigger bargeIn ระหว่าง fallback ที�
   const sentBeforeBargeIn = socket.sent.filter(e => e.event === 'media').length
   assert.ok(sentBeforeBargeIn > 0, 'ต้องมีเสียง fallback คอมมิตไปแล้วก่อน barge-in')
 
-  harness.sendInterim('เดี๋ยวก่อนครับ ขอถามเรื่องถอนเงินก่อน') // trigger bargeIn ผ่าน interim แทนที่จะรอ final
+  harness.sendInterimConfirmed('เดี๋ยวก่อนครับ ขอถามเรื่องถอนเงินก่อน') // trigger bargeIn ผ่าน interim (2-signal confirmed) แทนที่จะรอ final
 
   const clearEvents = socket.sent.filter(e => e.event === 'clear')
-  assert.ok(clearEvents.length > 0, 'interim ต้อง trigger bargeIn ได้แม้ fallback เดิมยัง sttProcessing=true อยู่')
+  assert.ok(clearEvents.length > 0, 'interim ที่ confirm แล้วต้อง trigger bargeIn ได้แม้ fallback เดิมยัง sttProcessing=true อยู่')
 
   let newTurnCalls = 0
   state.claudeStreamChunkedImpl = async function* () { newTurnCalls++; yield 'ตอบคำถามใหม่หลัง barge-in' }
@@ -726,6 +732,334 @@ test('20) DoD D: interim trigger bargeIn ระหว่าง fallback ที�
   const lastUserMsg = session.messages.filter(m => m.role === 'user').at(-1)
   assert.equal(lastUserMsg.content, 'เดี๋ยวก่อนครับ ขอถามเรื่องถอนเงินก่อน')
 
+  harness.disconnect(socket)
+})
+
+// ===== Active-Playback Speech Guard R1 (design locked) — 2-signal interim barge-in confirmation + =====
+// ===== ACTIVE_PLAYBACK_ECHO evidence check, replacing the old whitespace wordCount/length heuristic =====
+
+test('R1-1) 2-signal interim confirmation: interim แรกไม่ trigger bargeIn เลย ต้องมี interim ที่สอง (coherent extension) ก่อนถึง trigger', async () => {
+  const callSid = nextCallSid()
+  const { socket, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+
+  let resumeOldTurn
+  const gate = new Promise(resolve => { resumeOldTurn = resolve })
+  state.claudeStreamImpl = async function* () { yield 'กำลังตอบคำถามแรก'; await gate }
+  const oldTurnPromise = harness.sendFinalTranscript('คำถามแรกครับ')
+  await delay(30) // isSpeaking=true
+
+  harness.sendInterim('16') // signal แรก — เปิด candidate เฉยๆ ไม่ trigger
+  assert.equal(socket.sent.filter(e => e.event === 'clear').length, 0, 'interim แรกต้องไม่ trigger bargeIn')
+
+  harness.sendInterim('169') // signal ที่สอง — coherent extension ('169'.startsWith('16')) → confirm
+  assert.equal(socket.sent.filter(e => e.event === 'clear').length, 1, 'interim ที่สองที่ coherent ต้อง confirm bargeIn ทันที')
+
+  resumeOldTurn()
+  await oldTurnPromise
+  harness.disconnect(socket)
+})
+
+test('R1-2) interim ที่ไม่ coherent กับ candidate เดิม (เปลี่ยนเรื่อง) ต้อง reset candidate ไม่ใช่ confirm bargeIn', async () => {
+  const callSid = nextCallSid()
+  const { socket, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+
+  let resumeOldTurn
+  const gate = new Promise(resolve => { resumeOldTurn = resolve })
+  state.claudeStreamImpl = async function* () { yield 'กำลังตอบคำถามแรก'; await gate }
+  const oldTurnPromise = harness.sendFinalTranscript('คำถามแรกครับ')
+  await delay(30)
+
+  harness.sendInterim('คิดถึง') // candidate #1
+  harness.sendInterim('ระบบ') // ไม่ใช่ extension ของ 'คิดถึง' เลย — ไม่ coherent, ต้อง reset ไม่ใช่ confirm
+  assert.equal(socket.sent.filter(e => e.event === 'clear').length, 0, 'interim ที่ไม่ coherent ต้องไม่ confirm bargeIn')
+
+  harness.sendInterim('ระบบปฏิบัติการ') // coherent กับ candidate ใหม่ ('ระบบ') ที่เพิ่ง reset ไป — ต้อง confirm ได้
+  assert.equal(socket.sent.filter(e => e.event === 'clear').length, 1, 'candidate ที่ reset แล้วต้องยัง confirm ได้จาก signal ที่สองของมันเอง')
+
+  resumeOldTurn()
+  await oldTurnPromise
+  harness.disconnect(socket)
+})
+
+test('R1-3) ACTIVE_PLAYBACK_ECHO ระหว่าง interim: หลักฐาน echo ของ audio ที่กำลังส่งอยู่จริง ต้องไม่สร้าง/advance candidate เลยไม่ว่าจะส่งกี่ครั้ง', async () => {
+  const callSid = nextCallSid()
+  const { socket, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+
+  // เทิร์นจบแบบปกติ (ไม่ gate) — ข้อความเต็มถูกส่งเข้า TTS จริงแล้ว (CONTROL/legacy path รอ Claude ตอบครบก่อนค่อยพูด
+  // ไม่ได้ stream ทีละ delta เหมือน L2b) activeSpokenRef จึงมีข้อมูลจริงตอนนี้ — isSpeaking ยังเป็น true เพราะไม่ได้ echo mark กลับ
+  state.claudeStreamImpl = async function* () { yield 'ตอนนี้คุณลูกค้าสะดวกคุยไหมคะ' }
+  await harness.sendFinalTranscript('ขอสอบถามโปรโมชั่นหน่อยค่ะ')
+
+  harness.sendInterim('คุยไหมคะ') // หางของสิ่ง AI กำลังพูดอยู่จริง — ACTIVE_PLAYBACK_ECHO ทันที ไม่นับเป็น candidate เลย
+  harness.sendInterim('คุยไหมคะ') // ส่งซ้ำอีกครั้ง — ถ้าเข้า candidate logic ปกติ exact-repeat จะ confirm ได้ แต่นี่ต้องถูกกันไว้ตั้งแต่ echo check ก่อนถึง candidate เลย
+  assert.equal(socket.sent.filter(e => e.event === 'clear').length, 0, 'echo ของ audio ที่กำลังเล่นอยู่ต้องไม่ trigger bargeIn ไม่ว่าจะซ้ำกี่ครั้ง')
+
+  harness.disconnect(socket)
+})
+
+test('R1-4) stale pipeline: candidate ที่เปิดค้างไว้บน pipeline เก่าต้องไม่ถูกสืบทอดไปยัง pipeline ใหม่ (bargeIn() ล้าง bargeCandidate เสมอ)', async () => {
+  const callSid = nextCallSid()
+  const { socket, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+
+  // เทิร์นแรกจบแบบปกติ (ไม่ gate) — sttProcessing=false แล้ว แต่ isSpeaking ยังเป็น true (ไม่ echo mark กลับ)
+  await harness.sendFinalTranscript('คำถามแรกครับ')
+
+  harness.sendInterim('ทดสอบ') // candidate #1 บน pipeline แรก (ยังพูดอยู่) — ยังไม่ confirm
+  assert.equal(socket.sent.filter(e => e.event === 'clear').length, 0)
+
+  // final ตรงๆ (ไม่ใช่ interim) มาขัดจังหวะ — sttProcessing=false อยู่แล้วตอนนี้ ไม่ถูก queue, bargeIn() ทำงานทันที
+  // แล้วเทิร์นใหม่ (pipeline สอง) เริ่ม process จริงในคำขอเดียวกันนี้เลย (ไม่ต้องรอ resume ใดๆ)
+  let secondTurnCalls = 0
+  let resumeSecondTurn
+  const secondGate = new Promise(resolve => { resumeSecondTurn = resolve })
+  state.claudeStreamImpl = async function* () { secondTurnCalls++; yield 'เทิร์นสองกำลังพูด'; await secondGate }
+  const secondTurnPromise = harness.sendFinalTranscript('ตัดจบเทิร์นแรกด้วย final ตรงๆ')
+  await delay(230) // ผ่าน 200ms defensive wait ของ final-triggered bargeIn ก่อนเข้า processTranscript() จริง
+
+  assert.equal(secondTurnCalls, 1, 'เทิร์นสองต้องเริ่ม process ได้ทันที (ไม่ถูก queue) เพราะ sttProcessing=false อยู่แล้วตอน final มาถึง')
+  const clearAfterSecondTurnStart = socket.sent.filter(e => e.event === 'clear').length
+  assert.equal(clearAfterSecondTurnStart, 1, 'clear ตัวนี้มาจาก bargeIn() ของ final ที่ตัดจบเทิร์นแรก ไม่เกี่ยวกับ candidate เดิม')
+
+  // ถ้า candidate เก่า ('ทดสอบ', pipeline แรก) รอดมาถึง pipeline สองได้ (bug) ส่ง 'ทดสอบ' อีกครั้งเดียวจะ
+  // "confirm" ทันทีเพราะ exact-repeat นับเป็น coherent signal ที่สอง — แต่ bargeIn() ต้องล้าง bargeCandidate ไปแล้ว
+  // ตอน barge เทิร์นแรก ดังนั้นนี่ต้องเป็นแค่ signal แรกของ candidate ใหม่บน pipeline สอง ไม่ confirm
+  harness.sendInterim('ทดสอบ')
+  assert.equal(socket.sent.filter(e => e.event === 'clear').length, clearAfterSecondTurnStart, 'candidate เก่าจาก pipeline แรกต้องไม่ถูกสืบทอดมา — ไม่มี clear event เพิ่มจาก interim ตัวนี้')
+
+  resumeSecondTurn()
+  await secondTurnPromise
+  harness.disconnect(socket)
+})
+
+// ===== Final Cooldown Preservation R1.1 (design locked) — BARGE_IN_COOLDOWN must suppress a repeat physical =====
+// ===== interrupt only, never the transcript itself. Echo evidence still wins over cooldown-preservation.   =====
+
+test('R1.1-1) second legitimate FINAL arriving inside BARGE_IN_COOLDOWN must be preserved, not silently dropped', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+
+  // gate ที่ TTS แทนที่จะ gate Claude — LEGACY_CLAUDE_TIMEOUT_MS_OVERRIDE=80ms (ตั้งไว้บนสุดของไฟล์นี้) จะจบเทิร์นที่
+  // gate ค้างที่ Claude ให้ภายใน 80ms เสมอไม่ว่าจะตั้งใจหรือไม่ (เจอมาแล้วตอนแก้เทส 16) แต่ watchdog ตัวนี้ไม่ครอบคลุม
+  // TTS-sending loop ของ CONTROL/legacy path เลย — gate ตรงนี้แทนทำให้ sttProcessing ค้าง true ได้นานเท่าที่ต้องการจริง
+  let resumeOldTurnTts
+  const ttsGate = new Promise(resolve => { resumeOldTurnTts = resolve })
+  state.claudeStreamImpl = async function* () { yield 'กำลังตอบอยู่' }
+  state.ttsImpl = async function* () { yield Buffer.from('audio'); await ttsGate }
+  const oldTurnPromise = harness.sendFinalTranscript('คำถามแรก')
+  await delay(30) // isSpeaking=true, sttProcessing=true (TTS กำลังค้างอยู่)
+
+  let newTurnCalls = 0
+  state.claudeStreamImpl = async function* () { newTurnCalls++; yield 'ตอบ' }
+  state.ttsImpl = async function* () { yield Buffer.from('audio') }
+
+  await harness.sendFinalTranscript('เดี๋ยว') // FINAL #1 — trigger bargeIn() จริง, ตั้ง cooldown, sttProcessing ยัง true → queue
+  await delay(180) // ยังอยู่ใน BARGE_IN_COOLDOWN (400ms) — เทิร์นเดิมยัง sttProcessing=true จริง (TTS ยังค้างอยู่)
+  await harness.sendFinalTranscript('เอาอันนี้') // FINAL #2 — ต้อง preserve ไม่ใช่โดน BARGE_IN_COOLDOWN กลืนหายไปเงียบๆ
+
+  resumeOldTurnTts()
+  await oldTurnPromise
+
+  assert.equal(newTurnCalls, 1, 'ไม่ควรเกิดหลาย Claude turn')
+  const lastUserMsg = session.messages.filter(m => m.role === 'user').at(-1)
+  assert.equal(lastUserMsg.content, 'เอาอันนี้', 'FINAL ตัวที่สองภายใน cooldown ต้องถูก preserve (latest-wins) ไม่ใช่หายไปเงียบๆ')
+  harness.disconnect(socket)
+})
+
+test('R1.1-2) FINAL arriving well after cooldown has expired behaves as an ordinary independent turn (no regression to normal flow)', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+
+  await harness.sendFinalTranscript('คำถามแรกครับ')
+  await delay(450) // เกิน BARGE_IN_COOLDOWN (400ms)
+
+  let secondTurnCalls = 0
+  state.claudeStreamImpl = async function* () { secondTurnCalls++; yield 'ตอบเทิร์นสอง' }
+  await harness.sendFinalTranscript('คำถามที่สองครับ')
+
+  assert.equal(secondTurnCalls, 1, 'เทิร์นที่สองต้อง process ปกติ ไม่มีอะไรผิดปกติจาก R1.1')
+  const lastUserMsg = session.messages.filter(m => m.role === 'user').at(-1)
+  assert.equal(lastUserMsg.content, 'คำถามที่สองครับ')
+  harness.disconnect(socket)
+})
+
+test('R1.1-3) echo evidence still wins over cooldown preservation — echo of just-interrupted audio still drops', async () => {
+  const callSid = nextCallSid()
+  // CONTROL/legacy path (askClaudeStream) รอ Claude ตอบครบก่อนค่อยพูด — gate ไว้แปลว่า TTS ไม่มีทางเริ่มเลย
+  // (activeSpokenRef จะไม่มีทาง populate) ต้องใช้ L2b (legacyEarlyTts) ที่พูดทีละ delta ขณะ generation ยังไม่จบแทน
+  // — pattern เดียวกับเทสอื่นในไฟล์นี้ที่ทดสอบ TIMEOUT_POSTCOMMIT (ยิง chunk แรกแล้วค้าง, watchdog override 80ms มาจบให้ทีหลัง)
+  harness.getState().legacyEarlyTtsConfig = { percent: 100, campaignId: L2B_CAMPAIGN_ID }
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0, sessionOverrides: { campaign: l2bCampaign() } })
+
+  state.claudeConditionalImpl = (sess, signal, onMilestone) => (async function* () {
+    onMilestone?.('requestAt', Date.now())
+    onMilestone?.('firstDeltaAt', Date.now())
+    onMilestone?.('firstSafeAt', Date.now())
+    onMilestone?.('mode', 'CHUNKED')
+    yield 'ยอดฝากของคุณคือหนึ่งพันบาท' // chunk แรก — ต้องถูกพูด/commit จริง (activeSpokenRef populated)
+    await new Promise(() => {}) // ค้างตลอดไป — watchdog override (80ms) จะมาจบให้เป็น TIMEOUT_POSTCOMMIT ทีหลัง
+  })()
+
+  const firstTurnPromise = harness.sendFinalTranscript('เช็คยอดหน่อยครับ')
+  await delay(30) // ให้ chunk แรกถูกพูดออกไปจริง (activeSpokenRef populated) ก่อนถึง watchdog 80ms
+
+  // barge-in ตรงๆ ด้วย final ที่ไม่ใช่ echo — sttProcessing ยังเป็น true (เทิร์นแรกยังไม่ timeout) → เข้าคิว ไม่ dispatch ทันที
+  // (ยังไม่มี pipeline ใหม่เริ่มพูดจริง — activeSpokenRef ของ pipeline แรกจึงยังอ้างอิงได้ถูกต้องตอน final ถัดไปมาถึง)
+  let secondTurnCalls = 0
+  state.claudeConditionalImpl = null
+  state.claudeStreamImpl = async function* () { secondTurnCalls++; yield 'ตอบต่อ' }
+  await harness.sendFinalTranscript('เดี๋ยวก่อนครับ')
+
+  // ภายใน cooldown ส่ง final ที่เป็นหางของสิ่ง pipeline แรกเพิ่งพูดอยู่ (ก่อนโดนตัด)
+  await harness.sendFinalTranscript('หนึ่งพันบาท') // หางของ 'ยอดฝากของคุณคือหนึ่งพันบาท' จริง — ต้อง DROP ไม่ใช่ preserve
+
+  await delay(100) // ปล่อยให้ watchdog ของเทิร์นแรก (80ms) จบไปตามจริง แล้ว drain คิวที่ queue ไว้
+  await firstTurnPromise
+
+  assert.equal(secondTurnCalls, 1, 'ต้องมีแค่เทิร์นเดียวจาก "เดี๋ยวก่อนครับ" ที่ถูก queue ไว้')
+  const lastUserMsg = session.messages.filter(m => m.role === 'user').at(-1)
+  assert.equal(lastUserMsg.content, 'เดี๋ยวก่อนครับ', 'echo ("หนึ่งพันบาท") ต้องไม่ไป replace คิว — ต้องถูก DROP ไม่ใช่ preserve')
+  harness.disconnect(socket)
+})
+
+test('R1.1-4) legitimate short Thai FINAL inside cooldown is not dropped by cooldown or by the retired short-text heuristic', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+
+  let resumeOldTurn
+  const gate = new Promise(resolve => { resumeOldTurn = resolve })
+  state.claudeStreamImpl = async function* () { yield 'กำลังตอบ'; await gate }
+  const oldTurnPromise = harness.sendFinalTranscript('คำถามแรก')
+  await delay(30)
+
+  let newTurnCalls = 0
+  state.claudeStreamImpl = async function* () { newTurnCalls++; yield 'ตอบ' }
+
+  await harness.sendFinalTranscript('เดี๋ยวก่อนนะครับขอคิดดูก่อน') // FINAL #1 — ยาวพอ ไม่ใช่ ack, trigger bargeIn() จริง
+  await harness.sendFinalTranscript('ไม่เอา') // FINAL #2 สั้น ภายใน cooldown — ต้องไม่หายทั้งจาก cooldown และจาก short-text heuristic (ถอดไปแล้วตั้งแต่ R1)
+
+  resumeOldTurn()
+  await oldTurnPromise
+
+  assert.equal(newTurnCalls, 1)
+  const lastUserMsg = session.messages.filter(m => m.role === 'user').at(-1)
+  assert.equal(lastUserMsg.content, 'ไม่เอา')
+  harness.disconnect(socket)
+})
+
+test('R1.1-5) duplicate FINAL emission during cooldown does not create a duplicate user turn', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+
+  let resumeOldTurn
+  const gate = new Promise(resolve => { resumeOldTurn = resolve })
+  state.claudeStreamImpl = async function* () { yield 'กำลังตอบ'; await gate }
+  const oldTurnPromise = harness.sendFinalTranscript('คำถามแรก')
+  await delay(30)
+
+  let newTurnCalls = 0
+  state.claudeStreamImpl = async function* () { newTurnCalls++; yield 'ตอบ' }
+
+  await harness.sendFinalTranscript('เอาอันนี้ครับผม') // FINAL #1
+  await harness.sendFinalTranscript('เอาอันนี้ครับผม') // duplicate emission เดิมเป๊ะ ภายใน cooldown
+
+  resumeOldTurn()
+  await oldTurnPromise
+
+  assert.equal(newTurnCalls, 1, 'duplicate final ต้องไม่สร้างเทิร์นซ้ำ')
+  // session.messages มี 'คำถามแรก' (จากเทิร์นเดิมที่เปิดฉากไว้ตอนต้นเทส) เป็น user message แรกอยู่แล้วด้วย — duplicate
+  // emission ต้องเพิ่มเข้ามาแค่ตัวเดียว ไม่ใช่สอง (ไม่งั้นจะเป็น 3 รายการ ไม่ใช่ 2)
+  const userMessages = session.messages.filter(m => m.role === 'user')
+  assert.equal(userMessages.length, 2, 'ต้องมี user message รวม 2 รายการ (คำถามแรก + เอาอันนี้ครับผม 1 ครั้ง) ไม่ใช่ 3 (duplicate submit ซ้ำ)')
+  assert.equal(userMessages.at(-1).content, 'เอาอันนี้ครับผม')
+  harness.disconnect(socket)
+})
+
+test('R1.1-6) cooldown echo-check reads activeSpokenRef of the CURRENTLY interrupted pipeline correctly (owner-bound, not stale)', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+
+  // gate ที่ TTS (ไม่ใช่ Claude) — CONTROL/legacy path รอ Claude ตอบครบก่อนพูด ถ้า gate Claude แทน TTS จะไม่มีทาง
+  // เริ่มเลย (activeSpokenRef จะไม่ populate) และ LEGACY_CLAUDE_TIMEOUT_MS_OVERRIDE=80ms จะจบเทิร์นที่ gate ที่ Claude
+  // ให้เร็วเกินไปด้วย (เจอมาแล้วตอนแก้เทส 16/R1.1-1) — gate TTS หลังส่ง chunk แรกไปแล้วแทน ทำให้ audio ก้อนแรกถูกส่งจริง
+  // (activeSpokenRef populated) แต่เทิร์นยังไม่จบ (sttProcessing ยัง true อยู่ ไม่ผูกกับ watchdog ฝั่ง Claude เลย)
+  let resumeFirstTurnTts
+  const firstTtsGate = new Promise(resolve => { resumeFirstTurnTts = resolve })
+  state.claudeStreamImpl = async function* () { yield 'ราคาสินค้าคือห้าร้อยบาท' }
+  state.ttsImpl = async function* () { yield Buffer.from('audio'); await firstTtsGate }
+  const firstTurnPromise = harness.sendFinalTranscript('ขอดูราคาหน่อยครับ')
+  await delay(30) // activeSpokenRef populated ด้วยข้อความของ pipeline นี้ (TTS ก้อนแรกส่งไปแล้วจริง), sttProcessing ยัง true
+
+  let secondTurnCalls = 0
+  state.claudeStreamImpl = async function* () { secondTurnCalls++; yield 'ตอบใหม่' }
+  state.ttsImpl = async function* () { yield Buffer.from('audio') }
+  await harness.sendFinalTranscript('เปลี่ยนเรื่องครับ') // ไม่ echo, trigger bargeIn() จริง → queue (เทิร์นแรกยัง sttProcessing=true)
+
+  // ภายใน cooldown ส่ง final ที่เป็นหางของ pipeline ที่เพิ่งถูกตัด (ไม่ใช่ pipeline อื่นที่ปนกัน) — activeSpokenRef ต้องยัง
+  // ผูกกับ pipeline นี้ถูกต้อง (activePipelineId ไม่เปลี่ยนจนกว่าจะมี pipeline ใหม่เริ่มพูดจริง — ตัวที่ trigger bargeIn ก็แค่เข้าคิว ยังไม่ dispatch)
+  await harness.sendFinalTranscript('ห้าร้อยบาท')
+
+  resumeFirstTurnTts()
+  await firstTurnPromise
+
+  assert.equal(secondTurnCalls, 1)
+  const lastUserMsg = session.messages.filter(m => m.role === 'user').at(-1)
+  assert.equal(lastUserMsg.content, 'เปลี่ยนเรื่องครับ', 'echo ของ pipeline ที่เพิ่งโดน barge ต้องยัง DROP ได้ถูกต้อง ไม่ replace คิวที่ preserve ไว้')
+  harness.disconnect(socket)
+})
+
+test('R1.1-7) FINAL following an interim-confirmed barge-in must not be lost, including a further FINAL after bargeInPendingFinal is consumed', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+
+  let resumeOldTurn
+  const gate = new Promise(resolve => { resumeOldTurn = resolve })
+  state.claudeStreamImpl = async function* () { yield 'กำลังตอบอยู่'; await gate }
+  const oldTurnPromise = harness.sendFinalTranscript('คำถามแรก')
+  await delay(30)
+
+  let newTurnCalls = 0
+  state.claudeStreamImpl = async function* () { newTurnCalls++; yield 'ตอบ' }
+
+  harness.sendInterimConfirmed('เดี๋ยวก่อนครับขอคิดดูก่อน') // 2-signal confirm → bargeIn() จริง, bargeInPendingFinal=true, cooldown=true
+
+  await harness.sendFinalTranscript('เดี๋ยวก่อนครับขอคิดดูก่อน') // final ตัวจริงของ interim นี้ — ใช้ bargeInPendingFinal bypass (มีอยู่แล้วก่อน R1.1) → consumed, queue
+  await harness.sendFinalTranscript('เอาอันนี้ดีกว่า') // final ถัดไปอีกตัว ภายใน cooldown เดียวกัน หลัง bargeInPendingFinal ถูก consume ไปแล้ว — R1.1 ต้อง preserve ตัวนี้ด้วย
+
+  resumeOldTurn()
+  await oldTurnPromise
+
+  assert.equal(newTurnCalls, 1)
+  const lastUserMsg = session.messages.filter(m => m.role === 'user').at(-1)
+  assert.equal(lastUserMsg.content, 'เอาอันนี้ดีกว่า', 'final ถัดไปหลัง bargeInPendingFinal ถูก consume ต้องยัง preserve ได้ ไม่ใช่โดน BARGE_IN_COOLDOWN กลืน')
+  harness.disconnect(socket)
+})
+
+test('R1.1-8) multiple short Thai FINALs in quick succession — no silent transcript loss, no redundant repeated barge interrupts', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+
+  let resumeOldTurn
+  const gate = new Promise(resolve => { resumeOldTurn = resolve })
+  state.claudeStreamImpl = async function* () { yield 'กำลังตอบอยู่'; await gate }
+  const oldTurnPromise = harness.sendFinalTranscript('คำถามแรก')
+  await delay(30)
+
+  let newTurnCalls = 0
+  state.claudeStreamImpl = async function* () { newTurnCalls++; yield 'ตอบ' }
+
+  await harness.sendFinalTranscript('เดี๋ยวนะครับ')
+  await harness.sendFinalTranscript('ไม่ใช่แบบนั้น')
+  await harness.sendFinalTranscript('เอาอันใหม่ดีกว่า')
+
+  const clearEventsBeforeResume = socket.sent.filter(e => e.event === 'clear').length
+
+  resumeOldTurn()
+  await oldTurnPromise
+
+  assert.equal(newTurnCalls, 1, 'ต้องมีเทิร์นใหม่แค่ครั้งเดียวจากคำพูดแทรกทั้งหมด')
+  assert.equal(clearEventsBeforeResume, 1, 'ต้องมีแค่ physical interrupt (clear event) เดียวจาก final ตัวแรก ตัวถัดไปไม่ต้อง interrupt ซ้ำ')
+  const lastUserMsg = session.messages.filter(m => m.role === 'user').at(-1)
+  assert.equal(lastUserMsg.content, 'เอาอันใหม่ดีกว่า', 'ต้องไม่มี transcript สูญหายเงียบๆ — ตัวล่าสุดต้องชนะ')
   harness.disconnect(socket)
 })
 
@@ -881,7 +1215,7 @@ test('28) Commit A: barge-in ระหว่าง grace wait → เทิร�
   const turnPromise = harness.sendFinalTranscript('สวัสดีครับขอสอบถามโปรโมชั่นสมาชิกใหม่') // เข้า grace wait (150ms) — เทิร์นนี้ isSpeaking=true แล้ว
 
   await delay(50) // อยู่ในช่วง grace wait แน่นอน (< 150ms)
-  harness.sendInterim('เดี๋ยวก่อนครับขอถามเรื่องอื่นก่อน') // ยาวพอไม่ใช่ echo — trigger bargeIn() เพราะ isSpeaking=true อยู่
+  harness.sendInterimConfirmed('เดี๋ยวก่อนครับขอถามเรื่องอื่นก่อน') // ยาวพอไม่ใช่ echo, 2-signal confirmed — trigger bargeIn() เพราะ isSpeaking=true อยู่ (R1)
 
   const clearEvents = socket.sent.filter(e => e.event === 'clear')
   assert.ok(clearEvents.length > 0, 'barge-in ต้อง trigger ทันทีแม้เทิร์นเดิมกำลังรอ prewarm grace อยู่')
@@ -1039,7 +1373,7 @@ test('34) Commit A2 (critical): barge-in ทำให้ askClaudeStream throw A
 
   let secondTurnCalls = 0
   state.claudeStreamImpl = async function* () { secondTurnCalls++; yield 'ตอบเรื่องที่พูดแทรก' }
-  harness.sendInterim('เดี๋ยวก่อนครับขอถามเรื่องอื่นก่อน') // ยาวพอ trigger bargeIn()
+  harness.sendInterimConfirmed('เดี๋ยวก่อนครับขอถามเรื่องอื่นก่อน') // ยาวพอ, 2-signal confirmed — trigger bargeIn()
 
   const clearEvents = socket.sent.filter(e => e.event === 'clear')
   assert.ok(clearEvents.length > 0, 'barge-in ต้องยิงจริง')
@@ -1076,7 +1410,7 @@ test('35) Commit A2: barge-in ระหว่างพูด recovery phrase เ
   let secondTurnCalls = 0
   state.claudeStreamImpl = async function* () { secondTurnCalls++; yield 'ตอบเรื่องใหม่' }
   state.ttsImpl = async function* () { yield Buffer.from('clean-new-turn-chunk') } // reset กัน stub เดิมที่ยังมี GHOST_recovery ค้างอยู่ปนกับเทิร์นใหม่
-  harness.sendInterim('เดี๋ยวก่อนครับขอถามเรื่องอื่นก่อน')
+  harness.sendInterimConfirmed('เดี๋ยวก่อนครับขอถามเรื่องอื่นก่อน') // ต้อง confirm ทันที (2 signals) ก่อน resumeRecoveryTts() ด้านล่าง ไม่งั้น generation guard ยังไม่ทัน
 
   resumeRecoveryTts() // ปล่อยให้ recovery phrase's TTS พยายามพูดต่อ (ต้องถูก generation guard กันไว้)
 
@@ -1378,7 +1712,7 @@ test('47) L1b: barge-in หลัง adoption ต้อง abort speculative Cla
   assert.ok(specSignal, 'speculation ต้องเริ่มจริง')
   assert.equal(specSignal.aborted, false, 'ยังไม่ถูก abort ก่อน barge-in')
 
-  harness.sendInterim('เดี๋ยวก่อนครับขอถามเรื่องอื่น') // barge-in ระหว่าง speculation ที่ adopt แล้วยังมีชีวิตอยู่
+  harness.sendInterimConfirmed('เดี๋ยวก่อนครับขอถามเรื่องอื่น') // barge-in (2-signal confirmed) ระหว่าง speculation ที่ adopt แล้วยังมีชีวิตอยู่
 
   await delay(20)
   assert.equal(specSignal.aborted, true, 'speculative Claude producer ต้องถูก abort จริงผ่าน bridge หลัง barge-in ไม่ใช่แค่หยุดส่งเสียงเฉยๆ')
@@ -1456,7 +1790,7 @@ test('50) L1b: barge-in ระหว่าง zero-progress grace wait → ABORT
   const turnPromise = harness.sendFinalTranscript('ขอสอบถามโปรโมชั่นหน่อยค่ะ') // ยังไม่มี progress เลย เข้า zero-progress grace (150ms)
 
   await delay(50) // อยู่ในช่วง grace wait แน่นอน (< 150ms)
-  harness.sendInterim('เดี๋ยวก่อนครับขอถามเรื่องอื่นก่อน') // trigger bargeIn() เพราะ isSpeaking=true อยู่แล้วตั้งแต่ต้นเทิร์น
+  harness.sendInterimConfirmed('เดี๋ยวก่อนครับขอถามเรื่องอื่นก่อน') // 2-signal confirmed — trigger bargeIn() เพราะ isSpeaking=true อยู่แล้วตั้งแต่ต้นเทิร์น
 
   const clearEvents = socket.sent.filter(e => e.event === 'clear')
   assert.ok(clearEvents.length > 0, 'barge-in ต้อง trigger ทันทีแม้เทิร์นเดิมกำลังรอ zero-progress grace อยู่')

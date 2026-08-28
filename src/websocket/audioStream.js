@@ -186,6 +186,12 @@ function normalizeForEchoCompare(text) {
 const TRAILING_PARTICLES = ['นะคะ', 'นะครับ', 'ค่ะ', 'ครับ', 'ค่า', 'คะ', 'จ้ะ', 'จ้า', 'จ๊ะ']
 const MIN_ECHO_CONTENT_CHARS = 5 // ระยะห่างจริงระหว่างเคส ACCEPT ("สนใจ"=4 หลังตัด particle) กับเคส DROP ("คุยไหม"=6) ที่ยืนยันจากตัวอย่างจริง
 
+// Active-Playback Speech Guard R1 (design locked) — 2-signal interim barge-in confirmation window. A
+// candidate interim expires (resets to a fresh candidate) if the next coherent interim doesn't arrive within
+// this many ms of the first one. Initial tuning value from observed production interim cadence (~100-400ms
+// between consecutive interims) with margin — NOT proven-optimal, needs production measurement to refine.
+const BARGE_CONFIRM_WINDOW_MS = 1000
+
 function stripTrailingParticle(text) {
   for (const p of TRAILING_PARTICLES) {
     if (text.endsWith(p) && text.length > p.length) return text.slice(0, -p.length)
@@ -197,6 +203,13 @@ function stripTrailingParticle(text) {
 // ของสิ่งที่ AI เพิ่งพูดจริง (exact suffix match หลัง normalize+ตัด particle) และยาวพอจะไม่ใช่คำร่วมโดย
 // บังเอิญ — ถ้าไม่ตรงตามนี้ไม่ถือเป็น echo แม้จะสั้นหรือใช้คำร่วมกับสิ่งที่ AI เพิ่งพูดก็ตาม (เช่น ลูกค้า
 // ตอบ "สะดวกค่ะ"/"สนใจค่ะ"/"ได้ค่ะ" ต่อคำถามที่ลงท้ายด้วยคำเดียวกันต้องไม่ถูกทิ้ง)
+//
+// Active-Playback Speech Guard R1 (design locked) — reused as-is (not duplicated) for the isSpeaking=true
+// case too: same "echo evidence required to drop" principle, just compared against a different reference
+// (activeSpokenRef — AI text whose audio has actually started being sent, while still speaking — instead of
+// lastMarkedSpokenText — AI text confirmed fully played, within 500ms after its mark). Two different
+// reference lifetimes, one shared comparison algorithm. `recentAiSpokenText` being null/empty (no reference
+// available yet) always returns false — ACCEPT by default, never fall back to a length/word-count heuristic.
 function isLikelyPostMarkEcho(transcript, recentAiSpokenText) {
   const t = stripTrailingParticle(normalizeForEchoCompare(transcript))
   if (t.length < MIN_ECHO_CONTENT_CHARS) return false // เนื้อหาสั้นเกินจะเป็นหลักฐานได้ — ไม่ทิ้งโดยไม่มีหลักฐาน
@@ -245,7 +258,7 @@ function shouldBlockEndCall(session, aiResponse) {
 // สำหรับเทิร์นเดียวกันนี้ แทนที่จะปล่อยให้ลูกค้าเงียบไปเฉยๆ ไม่ bump generation เพราะนี่คือการกู้ turn เดิม
 // ไม่ใช่ turn ใหม่ — เป็น adapter ระหว่าง legacy transport ([END_CALL] string marker) กับรูปแบบที่ chunked
 // branch ใช้อยู่แล้ว (endCallRequested boolean) ก่อน TTS เสมอ กัน marker หลุดเข้าไปให้ speakFixedText() พูดออกไปจริง
-async function runLegacyFallback({ session, signal, socket, streamSid, voiceId, turnMetrics, turnState, callState, generationId, onAudioSent }) {
+async function runLegacyFallback({ session, signal, socket, streamSid, voiceId, turnMetrics, turnState, callState, generationId, onAudioSent, onChunkAudioStart }) {
   let rawText = null
   for await (const chunk of askClaudeStream(session, false, signal)) {
     if (signal.aborted) break
@@ -260,13 +273,13 @@ async function runLegacyFallback({ session, signal, socket, streamSid, voiceId, 
     return { fullText: spokenText, endCallRequested: legacyEndCallRequested, totalSent: 0 }
   }
 
-  const result = await speakFixedText({ text: spokenText, signal, socket, streamSid, voiceId, turnMetrics, turnState, callState, generationId, startingSentCount: 0, onAudioSent })
+  const result = await speakFixedText({ text: spokenText, signal, socket, streamSid, voiceId, turnMetrics, turnState, callState, generationId, startingSentCount: 0, onAudioSent, onChunkAudioStart })
   return { fullText: spokenText, endCallRequested: legacyEndCallRequested, totalSent: result.sentCount }
 }
 
 // ใช้ policy เดียวกันไม่ว่า end_call intent จะมาจาก tool call ปกติของ chunked path หรือจาก [END_CALL] marker
 // ที่ normalize มาจาก legacy fallback แล้ว — ทั้งสองทางเข้าที่นี่ในรูป endCallRequested boolean เดียวกันเสมอ
-async function applyChunkedEndCallGuard({ endCallRequested, fullText, totalSent, currentSession, signal, socket, streamSid, voiceId, turnMetrics, turnState, callState, generationId }) {
+async function applyChunkedEndCallGuard({ endCallRequested, fullText, totalSent, currentSession, signal, socket, streamSid, voiceId, turnMetrics, turnState, callState, generationId, onChunkAudioStart }) {
   if (!endCallRequested || !shouldBlockEndCall(currentSession, fullText)) {
     return { fullText, endCallRequested, totalSent }
   }
@@ -274,7 +287,7 @@ async function applyChunkedEndCallGuard({ endCallRequested, fullText, totalSent,
   const followUp = 'มีอะไรสอบถามเพิ่มเติมไหมคะ'
   let newTotalSent = totalSent
   try {
-    const followUpResult = await speakFixedText({ text: followUp, signal, socket, streamSid, voiceId, turnMetrics, turnState, callState, generationId, startingSentCount: totalSent })
+    const followUpResult = await speakFixedText({ text: followUp, signal, socket, streamSid, voiceId, turnMetrics, turnState, callState, generationId, startingSentCount: totalSent, onChunkAudioStart })
     newTotalSent += followUpResult.sentCount
   } catch (err) {
     if (err.code !== 'ERR_CANCELED' && err.name !== 'CanceledError') {
@@ -367,6 +380,20 @@ function registerWebSocket(fastify) {
     // a stale/mismatched mark can never move this reference (same invariant `isSpeaking`/`lastMarkTime` already rely on).
     let pendingSpokenText = null   // { pipelineId, text } — set right before sending an owned mark
     let lastMarkedSpokenText = null // promoted from pendingSpokenText only on verified-owner mark — what POST_MARK_ECHO compares against
+    // Active-Playback Speech Guard R1 (design locked) — separate lifecycle from pendingSpokenText/
+    // lastMarkedSpokenText above (those two are POST-mark, i.e. after AI finished playing). activeSpokenRef
+    // covers the DURING-playback window (isSpeaking still true): { pipelineId, text }, appended only via
+    // noteActiveSpokenChunk() at the moment a chunk's audio has actually started being sent to Twilio (see
+    // onChunkAudioStart in chunkedTurn.js) — never from Claude-generated text alone, which may not have
+    // reached TTS yet (that would risk suppressing a customer who is legitimately asking about something the
+    // AI hasn't said out loud yet). Bounded to ECHO_TAIL_CHARS, reset per-pipeline (never merges across a
+    // barge-in boundary) — see noteActiveSpokenChunk() below.
+    let activeSpokenRef = null
+    // 2-signal interim barge-in confirmation (R1) — { pipelineId, previousText (normalized), firstAt } for the
+    // isSpeaking=true interim path. A single interim never barges in on its own anymore; a second COHERENT
+    // interim (same normalized text, or a forward extension of it) within BARGE_CONFIRM_WINDOW_MS does. Reset
+    // whenever the pipeline changes, the window expires, or the interim isn't a coherent continuation.
+    let bargeCandidate = null
     let pendingEndCall = false
     let pendingTranscript = null  // C6c follow-up: barge-in ที่มาถึงตอนเทิร์นเดิมยังไม่ปล่อย sttProcessing — ช่องเดียว, latest-wins (ดูหมายเหตุที่ processTranscript())
     let bargeInPendingFinal = false  // C6c follow-up (STT listening): true หลัง interim trigger bargeIn() ไปแล้ว — บอก onTranscript ว่า final ตัวถัดไปคือประโยคที่พูดแทรกจริง (ดูหมายเหตุที่ onTranscript ด้านล่าง)
@@ -774,6 +801,7 @@ function registerWebSocket(fastify) {
       try {
         for await (const chunk of synthesizeSpeechStream(promptText, currentSession.campaign.voice_id, signal)) {
           if (socket.readyState !== socket.OPEN || signal.aborted) break
+          if (totalSent === 0) noteActiveSpokenChunk(pipelineId, promptText)
           socket.send(JSON.stringify({ event: 'media', streamSid, media: { payload: chunk.toString('base64') } }))
           totalSent++
         }
@@ -810,6 +838,19 @@ function registerWebSocket(fastify) {
       if (!hasAudio) await tryDeliverPendingShortAck(pipelineId, currentSession)
     }
 
+    // Active-Playback Speech Guard R1 — append text to the OWNED pipeline's activeSpokenRef, only once its
+    // audio has actually started being sent (called from onChunkAudioStart / the inline TTS loops' own
+    // first-audio checkpoints, never from Claude text alone). pipelineId !== activePipelineId means this is a
+    // stale callback from an already-superseded pipeline (e.g. a barge-in happened, a new pipeline started,
+    // and this old chunk's audio callback is only now settling) — must never poison the CURRENT reference.
+    // Starts fresh (not merged) whenever the owning pipeline changes, and stays bounded to ECHO_TAIL_CHARS —
+    // same bounding concept as lastMarkedSpokenText/POST_MARK_ECHO, no unbounded speech history.
+    function noteActiveSpokenChunk(pipelineId, text) {
+      if (!text || pipelineId !== activePipelineId) return
+      const prevText = (activeSpokenRef && activeSpokenRef.pipelineId === pipelineId) ? activeSpokenRef.text : ''
+      activeSpokenRef = { pipelineId, text: (prevText + text).slice(-ECHO_TAIL_CHARS) }
+    }
+
     // หยุด AI พูดทันที เมื่อลูกค้าพูดแทรก
     function bargeIn() {
       if (!isSpeaking) return
@@ -817,6 +858,7 @@ function registerWebSocket(fastify) {
       bumpGeneration(callState) // C2: invalidate ก่อนทุกอย่าง — ยัง observational, ไม่ได้ใช้ gate การ abort จริงที่อยู่ถัดไป
       clearSilenceTimer()
       silencePromptCount = 0
+      bargeCandidate = null // R1 — this pipeline's turn is over one way or another; a fresh candidate must always start from the NEXT pipeline's own interims, never inherit this one's progress
       if (prewarmDiag) settlePrewarmDiag(prewarmDiag, 'BARGE_IN') // Track P: settle before transport cleanup below
       clearPrewarm()
       abortChunkedSpeculation() // L1b — เหมือน clearPrewarm() ข้างบนทุกประการ แค่คนละ mechanism (chunked speculative producer)
@@ -846,6 +888,7 @@ function registerWebSocket(fastify) {
       try {
         for await (const chunk of synthesizeSpeechStream(text, session.campaign.voice_id, signal)) {
           if (socket.readyState !== socket.OPEN || signal.aborted) break
+          if (sent === 0) noteActiveSpokenChunk(pipelineId, text)
           socket.send(JSON.stringify({ event: 'media', streamSid, media: { payload: chunk.toString('base64') } }))
           sent++
         }
@@ -1113,6 +1156,7 @@ function registerWebSocket(fastify) {
                       producer: mySpecHandle.producer, signal, socket, streamSid,
                       voiceId: currentSession.campaign.voice_id, turnMetrics, turnState, callState, generationId,
                       onControl: (control) => { if (control?.type === 'end_call') endCallRequested = true },
+                      onChunkAudioStart: (text) => noteActiveSpokenChunk(pipelineId, text),
                     })
                     attempt = { outcome: 'success', result }
                   } else {
@@ -1133,6 +1177,7 @@ function registerWebSocket(fastify) {
                           onControl: (control) => { if (control?.type === 'end_call') endCallRequested = true },
                           onFirstTtsRequest: () => armWatchdog(TTS_FIRST_AUDIO_TIMEOUT_MS, 'TTS_FIRST_AUDIO_TIMEOUT'),
                           onFirstTtsAudio: () => armWatchdog(),
+                          onChunkAudioStart: (text) => noteActiveSpokenChunk(pipelineId, text),
                         })
                       },
                     })
@@ -1182,6 +1227,7 @@ function registerWebSocket(fastify) {
                       onFirstChunk: () => armWatchdog(),
                       onFirstTtsRequest: () => armWatchdog(TTS_FIRST_AUDIO_TIMEOUT_MS, 'TTS_FIRST_AUDIO_TIMEOUT'),
                       onFirstTtsAudio: () => armWatchdog(),
+                      onChunkAudioStart: (text) => noteActiveSpokenChunk(pipelineId, text),
                     }),
                   })
                 } else {
@@ -1198,6 +1244,7 @@ function registerWebSocket(fastify) {
                 const guarded = await applyChunkedEndCallGuard({
                   endCallRequested, fullText, totalSent, currentSession, signal, socket, streamSid,
                   voiceId: currentSession.campaign.voice_id, turnMetrics, turnState, callState, generationId,
+                  onChunkAudioStart: (text) => noteActiveSpokenChunk(pipelineId, text),
                 })
                 fullText = guarded.fullText
                 endCallRequested = guarded.endCallRequested
@@ -1251,6 +1298,7 @@ function registerWebSocket(fastify) {
                         fallbackProgress.totalSent++
                         armWatchdog(FALLBACK_IDLE_TIMEOUT_MS, 'FALLBACK_PARTIAL_TIMEOUT')
                       },
+                      onChunkAudioStart: (text) => noteActiveSpokenChunk(pipelineId, text),
                     }),
                   })
 
@@ -1264,6 +1312,7 @@ function registerWebSocket(fastify) {
                         endCallRequested: fb.endCallRequested, fullText: fb.fullText, totalSent: fb.totalSent,
                         currentSession, signal, socket, streamSid, voiceId: currentSession.campaign.voice_id,
                         turnMetrics, turnState, callState, generationId,
+                        onChunkAudioStart: (text) => noteActiveSpokenChunk(pipelineId, text),
                       })
                       fullText = guarded.fullText
                       endCallRequested = guarded.endCallRequested
@@ -1538,6 +1587,7 @@ function registerWebSocket(fastify) {
                         voiceId: currentSession.campaign.voice_id,
                         turnMetrics, turnState, callState, generationId,
                         startingSentCount: totalSent,
+                        onChunkAudioStart: (t) => noteActiveSpokenChunk(pipelineId, t),
                       })
                       inFlightTtsPromise = ttsPromise
                       const result = await ttsPromise
@@ -1597,6 +1647,7 @@ function registerWebSocket(fastify) {
                     text: LEGACY_RECOVERY_PHRASE, signal, socket, streamSid,
                     voiceId: currentSession.campaign.voice_id, turnMetrics, turnState, callState, generationId,
                     startingSentCount: totalSent,
+                    onChunkAudioStart: (t) => noteActiveSpokenChunk(pipelineId, t),
                   })
                   totalSent += recoveryResult.sentCount
                   if (recoveryResult.sentCount > 0) {
@@ -1622,6 +1673,7 @@ function registerWebSocket(fastify) {
                       if (socket.readyState !== socket.OPEN || signal.aborted) break
                       markOnce(turnMetrics, 't6')
                       if (totalSent === 0) console.log('[TTS] First audio chunk sent')
+                      if (totalSent === 0) noteActiveSpokenChunk(pipelineId, followUp)
                       socket.send(JSON.stringify({ event: 'media', streamSid, media: { payload: followUpChunk.toString('base64') } }))
                       markOnce(turnMetrics, 't7')
                       markAudioCommitted(turnState)
@@ -1731,6 +1783,7 @@ function registerWebSocket(fastify) {
                   text: LEGACY_RECOVERY_PHRASE, signal, socket, streamSid,
                   voiceId: currentSession.campaign.voice_id, turnMetrics, turnState, callState, generationId,
                   startingSentCount: totalSent,
+                  onChunkAudioStart: (t) => noteActiveSpokenChunk(pipelineId, t),
                 })
                 totalSent += recoveryResult.sentCount
                 if (recoveryResult.sentCount > 0) {
@@ -1761,6 +1814,7 @@ function registerWebSocket(fastify) {
                     // จุดวัด "ความเงียบจริง" ที่ลูกค้ารู้สึก — ต่างจาก [AI full] ที่รวมเวลาพูดทั้งประโยคเข้าไปด้วย
                     // (ประโยคยาวก็ใช้เวลาส่งครบนานกว่าเป็นธรรมชาติ ไม่ได้แปลว่าดีเลย์มากขึ้น) ต้องวัดจาก [STT] ถึง log นี้เท่านั้น
                     if (totalSent === 0) console.log('[TTS] First audio chunk sent')
+                    if (totalSent === 0) noteActiveSpokenChunk(pipelineId, cleanText)
                     socket.send(JSON.stringify({ event: 'media', streamSid, media: { payload: chunk.toString('base64') } }))
                     markOnce(turnMetrics, 't7')
                     markAudioCommitted(turnState) // อยู่หลัง signal.aborted/readyState check (legacy staleness ของลูปนี้) และหลัง socket.send() จริงเท่านั้น
@@ -1788,6 +1842,7 @@ function registerWebSocket(fastify) {
                   // เผื่อ cleanText ว่างเปล่า (คำตอบ AI มีแค่ [END_CALL] ล้วนๆ) — ลูปหลักด้านบนไม่ได้ส่งอะไรเลย
                   // ทำให้นี่กลายเป็นก้อนเสียงแรกจริงของเทิร์นนี้ ต้อง log จุดนี้ด้วยกันพลาดข้อมูล
                   if (totalSent === 0) console.log('[TTS] First audio chunk sent')
+                  if (totalSent === 0) noteActiveSpokenChunk(pipelineId, followUp)
                   socket.send(JSON.stringify({ event: 'media', streamSid, media: { payload: chunk.toString('base64') } }))
                   markOnce(turnMetrics, 't7')
                   markAudioCommitted(turnState) // อยู่หลัง signal.aborted/readyState check (legacy staleness ของลูปนี้) และหลัง socket.send() จริงเท่านั้น
@@ -1893,8 +1948,14 @@ function registerWebSocket(fastify) {
         // ตัดสินที่ branch เดิมเป๊ะแล้วส่งเข้ามาเป็นค่าสำเร็จรูปเท่านั้น กัน diagnostic drift จาก filter logic จริง
         // "diagnostic failure must never affect call flow" — ห่อ try/catch ทั้งก้อน ไม่มีทางโยน error ออกไปกระทบสายจริง
         //
-        // Enum: disposition = DELIVERED | DROPPED | DEFERRED, reason = null | BARGE_IN_COOLDOWN | POST_MARK_ECHO |
-        // SHORT_FRAGMENT_ECHO | TIER2_ACK | PENDING_TRANSCRIPT | BUSY
+        // Enum: disposition = DELIVERED | DROPPED | DEFERRED, reason = null | POST_MARK_ECHO |
+        // ACTIVE_PLAYBACK_ECHO | TIER2_ACK | PENDING_TRANSCRIPT | BUSY
+        // (SHORT_FRAGMENT_ECHO retired by Active-Playback Speech Guard R1 — replaced by ACTIVE_PLAYBACK_ECHO,
+        // which requires echo evidence instead of a whitespace-invalid-for-Thai length heuristic)
+        // (BARGE_IN_COOLDOWN retired by Final Cooldown Preservation R1.1 — a FINAL arriving during cooldown
+        // now flows through to DELIVERED/PENDING_TRANSCRIPT like any other, never silently DROPPED; cooldown
+        // still suppresses a repeat physical bargeIn() call when isSpeaking is already false, see the
+        // BARGE_COOLDOWN_INTERRUPT_SUPPRESSED console.log for that specific case's observability)
         //
         // STT-A2 (design revision 2026-08-21) — `alternatives` key present only when sttMeta.alternatives is
         // truthy (A2 ON for this utterance). Diagnostic-only: `text`/delivered transcript above always comes
@@ -1952,14 +2013,30 @@ function registerWebSocket(fastify) {
           if (!transcript || !callActive) return
           if (pendingEndCall) return
           if (socket.readyState !== socket.OPEN) return
-          // C6c follow-up (STT listening): ยกเว้น cooldown ให้ transcript ที่กำลังรออยู่ (bargeInPendingFinal) —
-          // นี่คือ final ตัวจริงของ utterance ที่ interim ของมันเองเพิ่งผ่าน echo/fragment filter มาแล้วจน trigger
-          // bargeIn() สำเร็จ ไม่ใช่สัญญาณใหม่ที่ยังไม่ผ่านการตรวจสอบ ถ้าปล่อยให้ cooldown (กันเสียงสะท้อนของ AI เอง
-          // ช่วงสั้นๆ 400ms) กลืนมันไปด้วย ประโยคที่ลูกค้าเพิ่งพูดแทรกจะหายไปทั้งที่ bargeIn() ทำงานถูกต้องแล้ว
-          if (bargeInCooldown && !bargeInPendingFinal) {
-            console.log(`[STT] Transcript dropped (barge-in cooldown): "${transcript.substring(0, 40)}"`)
-            emitSttDiag(sttMeta, 'DROPPED', 'BARGE_IN_COOLDOWN', transcript)
-            return
+          // Final Cooldown Preservation R1.1 (design locked) — cooldown must suppress a REPEAT physical
+          // interrupt only, never the transcript itself (same "echo evidence required to drop" doctrine as
+          // Active-Playback Speech Guard R1 — a blanket time-based drop with no evidence contradicts it).
+          // If isSpeaking is already false, bargeIn() further below is a guaranteed no-op anyway (its own
+          // top-line guard) — nothing is left to physically interrupt, so this transcript must flow through
+          // to the exact same queue/immediate-dispatch path bargeInPendingFinal already uses (sttProcessing
+          // check further below), not be silently dropped. If isSpeaking is true, a NEW pipeline started
+          // speaking during the old cooldown window — a genuinely new interruption target unrelated to the
+          // previous barge-in's trailing-echo grace window — so it must not be gated here at all; let the
+          // isSpeaking branch below handle it exactly as if there were no cooldown.
+          if (bargeInCooldown && !bargeInPendingFinal && !isSpeaking) {
+            // Echo evidence still wins over cooldown-preservation (design section 10 — must remain FIRST).
+            // activeSpokenRef of the pipeline that was just interrupted is still valid/readable here —
+            // bargeIn() never bumps activePipelineId itself (only the next real speaking pipeline does), so
+            // this is the same reference isLikelyPostMarkEcho() would use during isSpeaking=true, just read
+            // one step later. Same Tier1-ack exemption as the isSpeaking branch (see its own comment).
+            const cooldownRefText = (activeSpokenRef && activeSpokenRef.pipelineId === activePipelineId) ? activeSpokenRef.text : null
+            const cooldownAckTier = classifyAck(transcript)
+            if (cooldownAckTier !== 'TIER1' && isLikelyPostMarkEcho(transcript, cooldownRefText)) {
+              console.log(`[STT] Active-playback echo (post-interrupt cooldown) — ignoring: "${transcript}"`)
+              emitSttDiag(sttMeta, 'DROPPED', 'ACTIVE_PLAYBACK_ECHO', transcript)
+              return
+            }
+            console.log(`[STT] BARGE_COOLDOWN_INTERRUPT_SUPPRESSED — no repeat interrupt, transcript preserved: "${transcript.substring(0, 40)}"`)
           }
           // Post-mark echo filter: fragment ภายใน 500ms ของ mark ที่เป็นหางของสิ่ง AI เพิ่งพูดจริง =
           // delayed PSTN echo (Lightweight Post-Mark Echo Guard, design locked — เดิมใช้ whitespace
@@ -1995,11 +2072,16 @@ function registerWebSocket(fastify) {
               emitSttDiag(sttMeta, 'DEFERRED', 'TIER2_ACK', transcript)
               return
             }
-            const wordCount = transcript.trim().split(/\s+/).length
-            if (ackTier !== 'TIER1' && wordCount < 2 && transcript.length < 8) {
-              // Fragment สั้น = echo หรือ noise → ไม่ barge-in
-              console.log(`[STT] Short fragment during AI speech — ignoring echo: "${transcript}"`)
-              emitSttDiag(sttMeta, 'DROPPED', 'SHORT_FRAGMENT_ECHO', transcript)
+            // Active-Playback Speech Guard R1 (design locked) — replaces the old whitespace wordCount/length
+            // heuristic (invalid for Thai — see isLikelyPostMarkEcho's own comment). ECHO EVIDENCE REQUIRED
+            // TO DROP: compare against activeSpokenRef (AI text whose audio has actually started being sent,
+            // for the CURRENTLY active pipeline only — never a stale one) using the exact same algorithm as
+            // POST_MARK_ECHO. No reference available (e.g. very first words of this pipeline's audio, before
+            // any chunk committed yet) → ACCEPT by default, per isLikelyPostMarkEcho's own null-safe contract.
+            const activeRefText = (activeSpokenRef && activeSpokenRef.pipelineId === activePipelineId) ? activeSpokenRef.text : null
+            if (ackTier !== 'TIER1' && isLikelyPostMarkEcho(transcript, activeRefText)) {
+              console.log(`[STT] Active-playback echo — ignoring: "${transcript}"`)
+              emitSttDiag(sttMeta, 'DROPPED', 'ACTIVE_PLAYBACK_ECHO', transcript)
               return
             }
             bargeIn()
@@ -2075,8 +2157,45 @@ function registerWebSocket(fastify) {
             // interrupt control อีกต่อไป) เร็วกว่ารอ final ซึ่งมี debounce 900ms ในตัว แต่ห้ามส่ง text นี้เข้า
             // Claude ตรงๆ เด็ดขาด — ต้องรอ final ของประโยคเดียวกันเสมอ (ดู bargeInPendingFinal ใน onTranscript ด้านบน)
             // เพื่อไม่ให้ Claude เห็นประโยคที่พูดยังไม่จบ
-            const wordCount = interimText.trim().split(/\s+/).length
-            if (wordCount < 2 && interimText.length < 8) return // fragment สั้น = echo/noise เหมือน filter ของ final-transcript path
+            //
+            // Active-Playback Speech Guard R1 (design locked) — replaces the old whitespace wordCount/length
+            // heuristic with two checks, in order:
+            //   1. Echo evidence (same isLikelyPostMarkEcho() used everywhere else) — a strong reproduction
+            //      of the AI's own in-flight audio never counts as barge-in evidence at all, regardless of
+            //      2-signal state.
+            //   2. 2-signal confirmation — a single interim is no longer enough on its own. The FIRST
+            //      non-echo interim for this pipeline just opens a candidate; only a SECOND, COHERENT interim
+            //      (same normalized text, or a forward extension of it — i.e. genuine STT progress on the
+            //      same utterance, not a different fragment) within BARGE_CONFIRM_WINDOW_MS actually fires
+            //      bargeIn(). This trades a small amount of latency on some true barge-ins (typically one
+            //      extra interim tick, ~100-400ms in production) for eliminating false barge-ins on short
+            //      fragments that used to fail the old length heuristic — and for short/numeric speech where
+            //      the 2nd interim often arrives before the old heuristic's word-count would even have passed,
+            //      it can trigger EARLIER than before, not later.
+            const activeRefText = (activeSpokenRef && activeSpokenRef.pipelineId === activePipelineId) ? activeSpokenRef.text : null
+            if (isLikelyPostMarkEcho(interimText, activeRefText)) return // ACTIVE_PLAYBACK_ECHO — no candidate created/advanced, no diagnostic (interim path is diagnostic-free by design, same as before)
+
+            const normalized = normalizeForEchoCompare(interimText)
+            const noCandidate = !bargeCandidate || bargeCandidate.pipelineId !== activePipelineId || (Date.now() - bargeCandidate.firstAt) > BARGE_CONFIRM_WINDOW_MS
+            if (noCandidate) {
+              bargeCandidate = { pipelineId: activePipelineId, previousText: normalized, firstAt: Date.now() }
+              return
+            }
+            if (bargeCandidate.previousText.startsWith(normalized) && normalized !== bargeCandidate.previousText) {
+              // Regression (STT shrank back, e.g. "1697 ค่ะ" → "1697") — not new evidence, but not discarded
+              // either; leave the existing candidate exactly as-is per design (a later coherent interim vs.
+              // the ORIGINAL previousText can still confirm).
+              return
+            }
+            const coherent = normalized === bargeCandidate.previousText || normalized.startsWith(bargeCandidate.previousText)
+            if (!coherent) {
+              // Not a continuation of the same utterance (e.g. "คิดถึง" → "ระบบ") — reset to a fresh
+              // candidate seeded by THIS interim, don't confirm on unrelated fragments.
+              bargeCandidate = { pipelineId: activePipelineId, previousText: normalized, firstAt: Date.now() }
+              return
+            }
+            // Coherent second signal: exact repeat OR a forward extension of the candidate's previous text.
+            bargeCandidate = null
             bargeIn()
             bargeInPendingFinal = true // ตั้งเฉพาะตอน trigger จาก interim เท่านั้น — บอก onTranscript ว่า final ตัวถัดไปคือประโยคที่พูดแทรกจริง
             bargeInCooldown = true
@@ -2119,6 +2238,7 @@ function registerWebSocket(fastify) {
               let sent = 0
               for (const chunk of chunks) {
                 if (socket.readyState !== socket.OPEN || greetingAbortController?.signal.aborted) break
+                if (sent === 0) noteActiveSpokenChunk(pipelineId, session.greetingText)
                 socket.send(JSON.stringify({ event: 'media', streamSid, media: { payload: chunk.toString('base64') } }))
                 sent++
               }

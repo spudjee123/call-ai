@@ -180,6 +180,17 @@ function sendInterim(text) {
   state.lastSttCallbacks.onInterim(text)
 }
 
+// Active-Playback Speech Guard R1 — a single interim no longer confirms barge-in during isSpeaking=true (see
+// audioStream.js's 2-signal bargeCandidate logic); it takes a second COHERENT interim within
+// BARGE_CONFIRM_WINDOW_MS. Exact repeat counts as coherent, so sending the same text twice is the simplest
+// way to simulate "STT confirmed the same partial text again" and reach a real bargeIn() for tests whose
+// intent is "this interim actually interrupts the AI", without each test having to know the confirmation
+// mechanics itself.
+function sendInterimConfirmed(text) {
+  state.lastSttCallbacks.onInterim(text)
+  state.lastSttCallbacks.onInterim(text)
+}
+
 function getState() { return state }
 
-module.exports = { ensureStubbed, connect, sendStart, sendStop, sendFinalTranscript, sendInterim, disconnect, getState }
+module.exports = { ensureStubbed, connect, sendStart, sendStop, sendFinalTranscript, sendInterim, sendInterimConfirmed, disconnect, getState }

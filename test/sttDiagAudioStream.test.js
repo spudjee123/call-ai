@@ -113,7 +113,7 @@ test('sttMeta ไม่ถูกส่งมา (undefined) → ไม่ emit [
   }
 })
 
-test('DROPPED/BARGE_IN_COOLDOWN: transcript ที่มาระหว่าง cooldown 400ms หลัง bargeIn() (final-triggered, ไม่ใช่ interim-triggered) ต้อง emit DROPPED', async () => {
+test('DEFERRED/PENDING_TRANSCRIPT: transcript ที่มาระหว่าง cooldown 400ms หลัง bargeIn() (final-triggered, ไม่ใช่ interim-triggered) ต้อง preserve ไม่ใช่ DROP (Final Cooldown Preservation R1.1)', async () => {
   const callSid = nextCallSid()
   const { socket, state } = await connectPastGreeting(callSid)
   try {
@@ -127,13 +127,16 @@ test('DROPPED/BARGE_IN_COOLDOWN: transcript ที่มาระหว่าง
     await harness.sendFinalTranscript('เดี๋ยวก่อนครับขอถามเรื่องอื่นก่อน')
 
     const { diagLines } = await captureSttDiag(async () => {
-      // ตัวนี้มาระหว่าง cooldown (400ms) และ bargeInPendingFinal=false → ต้องโดน DROPPED/BARGE_IN_COOLDOWN
+      // R1.1 (design locked) — ตัวนี้มาระหว่าง cooldown (400ms) และ bargeInPendingFinal=false แต่ต้องไม่ถูก DROP
+      // อีกต่อไป (BARGE_IN_COOLDOWN reason ถูกถอดไปแล้ว) — cooldown ต้อง suppress แค่ physical re-interrupt ซ้ำ
+      // (isSpeaking เป็น false อยู่แล้วตอนนี้ ไม่มีอะไรให้ barge ซ้ำจริง) แต่ transcript ต้อง preserve เข้าคิว pendingTranscript
+      // เหมือน path อื่นที่ sttProcessing=true ยัง busy อยู่ทุกประการ
       await harness.sendFinalTranscript('ข้อความที่มาซ้ำระหว่าง cooldown', FAKE_META)
     })
 
     assert.equal(diagLines.length, 1)
-    assert.equal(diagLines[0].disposition, 'DROPPED')
-    assert.equal(diagLines[0].reason, 'BARGE_IN_COOLDOWN')
+    assert.equal(diagLines[0].disposition, 'DEFERRED')
+    assert.equal(diagLines[0].reason, 'PENDING_TRANSCRIPT')
 
     resumeOldTurn()
     await oldTurnPromise
@@ -168,26 +171,44 @@ test('DEFERRED/TIER2_ACK: Tier2 ack ("ครับ") ระหว่าง isSpe
   }
 })
 
-test('DROPPED/SHORT_FRAGMENT_ECHO: fragment สั้นที่ไม่ใช่ ack ระหว่าง isSpeaking=true ต้อง emit DROPPED', async () => {
+test('DELIVERED: fragment สั้นที่ไม่ใช่ ack และไม่มีหลักฐาน echo ระหว่าง isSpeaking=true ต้องไม่ถูกทิ้งอีกต่อไป (Active-Playback Speech Guard R1 — ECHO EVIDENCE REQUIRED TO DROP แทนที่ whitespace/length heuristic เดิมซึ่งผิดกับภาษาไทย)', async () => {
   const callSid = nextCallSid()
   const { socket, state } = await connectPastGreeting(callSid)
   try {
-    let resumeOldTurn
-    const gate = new Promise(resolve => { resumeOldTurn = resolve })
-    state.claudeStreamImpl = async function* () { yield 'คำตอบหลักที่กำลังตอบอยู่'; await gate }
-    const oldTurnPromise = harness.sendFinalTranscript('ขอสอบถามโปรโมชั่นหน่อยค่ะ')
-    await delay(30) // isSpeaking=true
+    state.claudeStreamImpl = async function* () { yield 'คำตอบหลักที่กำลังตอบอยู่' }
+    await harness.sendFinalTranscript('ขอสอบถามโปรโมชั่นหน่อยค่ะ') // เทิร์นจบเร็ว (ttsImpl default ไม่ gate) — sttProcessing=false แล้ว
+    // ไม่ echo mark กลับ — isSpeaking ยังเป็น true (audio ยัง "เล่นอยู่" ตามความหมายของ owned-mark design) ต่างจาก POST_MARK_ECHO ที่ทดสอบ "หลัง" mark กลับมาแล้ว
 
     const { diagLines } = await captureSttDiag(async () => {
-      await harness.sendFinalTranscript('เอ่อ', FAKE_META) // 1 คำ, สั้นกว่า 8 ตัวอักษร, ไม่ใช่ ack ที่รู้จัก
+      await harness.sendFinalTranscript('เอ่อ', FAKE_META) // สั้น, ไม่ใช่ ack ที่รู้จัก, ไม่ใช่หางของ "คำตอบหลักที่กำลังตอบอยู่" เลย — ไม่มีหลักฐาน echo
+    })
+
+    assert.equal(diagLines.length, 1)
+    assert.equal(diagLines[0].disposition, 'DELIVERED')
+    assert.equal(diagLines[0].reason, null)
+    assert.ok(socket.sent.some(e => e.event === 'clear'), 'ต้อง bargeIn() จริง (ส่ง clear event) ไม่ใช่แค่ผ่าน filter เฉยๆ')
+  } finally {
+    harness.disconnect(socket)
+  }
+})
+
+test('DROPPED/ACTIVE_PLAYBACK_ECHO: fragment ที่เป็นหางของสิ่ง AI กำลังพูดอยู่จริง (audio เริ่มส่งไปแล้ว) ระหว่าง isSpeaking=true ต้องถูกทิ้ง ไม่ trigger bargeIn', async () => {
+  const callSid = nextCallSid()
+  const { socket, state } = await connectPastGreeting(callSid)
+  try {
+    // เทิร์นจบแบบปกติ (ไม่ gate) — CONTROL/legacy path รอ Claude ตอบครบก่อนค่อยพูด (ไม่ stream ทีละ delta เหมือน L2b)
+    // ข้อความเต็มถูกส่งเข้า TTS จริงแล้ว activeSpokenRef จึงมีข้อมูลจริง — isSpeaking ยังเป็น true เพราะไม่ได้ echo mark กลับ
+    state.claudeStreamImpl = async function* () { yield 'ตอนนี้คุณลูกค้าสะดวกคุยไหมคะ' }
+    await harness.sendFinalTranscript('ขอสอบถามโปรโมชั่นหน่อยค่ะ')
+
+    const { diagLines } = await captureSttDiag(async () => {
+      await harness.sendFinalTranscript('คุยไหมคะ', FAKE_META) // หางของสิ่ง AI กำลังพูดอยู่จริง
     })
 
     assert.equal(diagLines.length, 1)
     assert.equal(diagLines[0].disposition, 'DROPPED')
-    assert.equal(diagLines[0].reason, 'SHORT_FRAGMENT_ECHO')
-
-    resumeOldTurn()
-    await oldTurnPromise
+    assert.equal(diagLines[0].reason, 'ACTIVE_PLAYBACK_ECHO')
+    assert.equal(socket.sent.filter(e => e.event === 'clear').length, 0, 'ไม่ควร bargeIn() เลยเพราะเป็น echo')
   } finally {
     harness.disconnect(socket)
   }
@@ -460,7 +481,7 @@ test('DEFERRED/PENDING_TRANSCRIPT (2/3 — final หลัง interim-triggered 
     const oldTurnPromise = harness.sendFinalTranscript('ขอสอบถามโปรโมชั่นหน่อยค่ะ')
     await delay(30) // isSpeaking=true, sttProcessing=true (gated)
 
-    harness.sendInterim('เดี๋ยวก่อนครับขอถามเรื่องอื่นก่อน') // trigger bargeIn ผ่าน onInterim → bargeInPendingFinal=true, isSpeaking=false
+    harness.sendInterimConfirmed('เดี๋ยวก่อนครับขอถามเรื่องอื่นก่อน') // trigger bargeIn ผ่าน onInterim (2-signal confirmed) → bargeInPendingFinal=true, isSpeaking=false
     await delay(5)
 
     const { diagLines } = await captureSttDiag(async () => {
