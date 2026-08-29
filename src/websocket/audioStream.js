@@ -1,6 +1,7 @@
 const callSessions = require('../utils/callSessions')
 const { transcribeStream } = require('../services/googleSTT')
-const { askClaude, askClaudeStream, askClaudeObservedFullResponse, askClaudeConditionalStream } = require('../services/claude')
+const { askClaude, askClaudeStream, askClaudeObservedFullResponse } = require('../services/claude')
+const { askConversationConditionalStream } = require('../services/conversationAI')
 const { synthesizeSpeechStream } = require('../services/tts')
 const healthMonitor = require('../utils/healthMonitor')
 const { createCallState, bumpGeneration, isCurrentGeneration, endCall } = require('../utils/generationGuard')
@@ -1026,6 +1027,21 @@ function registerWebSocket(fastify) {
 
         console.log(`[Rollout] callSid=${callSid} bucket=${rollout.bucket} percent=${rollout.percentAtStart} chunked=${rollout.useChunkedStreaming} legacyObserved=${legacyObserved} legacyObservedBucket=${legacyObservedBucket} legacyObservedPercent=${observedConfig.percent} campaignMatched=${legacyObservedCampaignMatched} legacyEarlyTts=${legacyEarlyTts} legacyEarlyTtsBucket=${legacyEarlyTtsBucket} legacyEarlyTtsPercent=${earlyTtsConfig.percent} earlyTtsCampaignMatched=${legacyEarlyTtsCampaignMatched} sttA2=${sttA2} sttA2Bucket=${sttA2Bucket} sttA2Percent=${sttA2Config.percent} sttA2CampaignMatched=${sttA2CampaignMatched} sttA2Shadow=${sttA2Shadow} sttA2ShadowBucket=${sttA2ShadowBucket} sttA2ShadowPercent=${sttA2ShadowConfig.percent} sttA2ShadowCampaignMatched=${sttA2ShadowCampaignMatched}`)
 
+        // Dual Conversation Provider A/B (design locked) — logged unconditionally, every call, so a silent
+        // provider mismatch (UI says Gemini, call actually ran Claude) is visible from this ONE line without
+        // cross-referencing campaign config. We report existing rollout flags exactly as computed above
+        // (never mutated by provider selection) alongside the actual resolved route, so the two can never
+        // silently disagree without it showing up right here.
+        const providerOverrideActive = !!session.llmProvider
+        // Review Gate fix — must check providerOverrideActive FIRST: an explicit provider now bypasses the
+        // chunked branch too (see the audioStream.js fix at the top-level `if (rollout.useChunkedStreaming
+        // && !currentSession.llmProvider)` gate), so it always resolves to CONDITIONAL regardless of chunked.
+        const conversationRoute = providerOverrideActive
+          ? 'CONDITIONAL'
+          : rollout.useChunkedStreaming ? 'CHUNKED' : legacyEarlyTts ? 'CONDITIONAL' : 'CONTROL'
+        const effectiveLlmProvider = providerOverrideActive ? session.llmProvider : 'claude'
+        console.log(`[LLMRoute] callSid=${callSid} source=${providerOverrideActive ? 'CAMPAIGN_EXPLICIT' : 'DEFAULT'} provider=${effectiveLlmProvider} model=${session.llmModel || 'claude-sonnet-5'} route=${conversationRoute} providerOverride=${providerOverrideActive} rolloutChunked=${rollout.useChunkedStreaming} legacyObserved=${legacyObserved} legacyEarlyTts=${legacyEarlyTts}`)
+
         // L1a: ต้องคำนวณหลัง rollout freeze แล้วเท่านั้น (ดูหมายเหตุที่ค่าคงที่ด้านบนไฟล์)
         const interimFinalizeMs = rollout.useChunkedStreaming ? STT_INTERIM_FINALIZE_MS_CHUNKED : 900
 
@@ -1133,7 +1149,17 @@ function registerWebSocket(fastify) {
 
           // C3a: ตัดสิน branch ก่อน Claude side effect แรกเสมอ — ห้ามมี code เรียก Claude ก่อนจุดนี้ไม่ว่า path ไหน
           // rollout ยัง 0% เสมอตอนนี้ จึงยังไม่มีสายไหนเข้า branch นี้จริงในโปรดักชัน (ดู C0/decideRollout)
-          if (rollout.useChunkedStreaming) {
+          //
+          // Dual Conversation Provider A/B (Review Gate fix) — must ALSO exclude an explicit provider
+          // override, not just check legacyEarlyTts further down: this `if` is a SEPARATE top-level branch
+          // that runs before the `if (legacyEarlyTts || currentSession.llmProvider)` bypass ever gets a
+          // chance to fire. Without this exclusion, a campaign explicitly set to Gemini would silently fall
+          // into the chunked path (askClaudeStreamChunked — a different system prompt, different [END_CALL]
+          // mechanism, and Claude only) the moment chunked rollout ever goes above 0%, reproducing the exact
+          // silent-no-op failure mode this whole design was built to prevent — just gated by a different
+          // rollout percent than legacyEarlyTts's. Caught by formal review, not by design — chunked is 0%
+          // in production today so this was never exercised, but the config can change without a deploy.
+          if (rollout.useChunkedStreaming && !currentSession.llmProvider) {
             try {
               // C6c follow-up: legacy มี t2 (Claude request sent) แต่ chunked branch ไม่เคยถูกใส่ไว้เลยตั้งแต่ C1 —
               // เจอจาก production trace จริงที่ t2 เป็น null ทุกเทิร์น ทำให้ claudeTTFT (t2→t3) และ requestToAudio
@@ -1489,7 +1515,21 @@ function registerWebSocket(fastify) {
             if (prewarmPromise === myPrewarm) clearPrewarm()
 
             if (!aiText && !signal.aborted && callActive && isSpeaking) {
-              if (legacyEarlyTts) {
+              // Dual Conversation Provider A/B (design locked) — an explicit per-campaign provider choice
+              // has the HIGHEST precedence for conversation-LLM routing and forces this same conditional/L2b
+              // branch regardless of legacyEarlyTts's own rollout bucket/campaign match. This is deliberate,
+              // not a shortcut: without it, a campaign explicitly set to Gemini could silently fall through
+              // to the CONTROL branch below (still speaking Claude) whenever it happens not to match the
+              // legacyEarlyTts rollout cohort — exactly the silent no-op this design was revised to prevent.
+              // Symmetric for explicit Claude too (not just Gemini): forcing BOTH explicit choices through
+              // this same branch keeps the A/B comparison apples-to-apples even if legacyEarlyTts's rollout
+              // percent changes later — otherwise an explicit-Claude campaign could end up compared against
+              // the CONTROL architecture instead of the CONDITIONAL one Gemini is forced through.
+              if (legacyEarlyTts || currentSession.llmProvider) {
+                if (turnMetrics.llmProvider == null) {
+                  turnMetrics.llmProvider = currentSession.llmProvider === 'gemini' ? 'gemini' : 'claude'
+                  turnMetrics.llmModel = currentSession.llmModel || 'claude-sonnet-5'
+                }
                 // L2b exposure gate (design revision 2026-08-21, review round 3) — TTS happens INSIDE run()
                 // itself, interleaved with Claude streaming, unlike CONTROL/OBSERVED below where aiText is
                 // set first and the shared TTS block (:1177) speaks it afterward. legacyEarlyTts deliberately
@@ -1616,7 +1656,7 @@ function registerWebSocket(fastify) {
                       if (key === 'firstDeltaAt' && !t3Marked) { markOnce(turnMetrics, 't3'); t3Marked = true }
                       if (key === 'firstSafeAt' && !t4Marked) { markOnce(turnMetrics, 't4'); t4Marked = true }
                     }
-                    for await (const chunk of askClaudeConditionalStream(currentSession, childSignal, wrappedMilestone)) {
+                    for await (const chunk of askConversationConditionalStream(currentSession, childSignal, wrappedMilestone)) {
                       const ttsPromise = speakFixedText({
                         text: chunk, signal, socket, streamSid,
                         voiceId: currentSession.campaign.voice_id,
@@ -1938,6 +1978,11 @@ function registerWebSocket(fastify) {
           }
 
           markDone(turnState) // ทุก pre-terminal phase ไปจบที่ DONE ได้ตรงๆ (turnState.js ไม่ guard transition นี้) — ครอบคลุมทุกทางจบของ legacy turn
+          // Dual Conversation Provider A/B — generic alias, set only for turns that actually went through
+          // the conditional/L2b branch (turnMetrics.llmProvider non-null there); stays null otherwise. Never
+          // computed independently of legacyEarlyTtsOutcome, so it can't drift from the value that enum's
+          // own branch-by-branch assignments already produced.
+          if (turnMetrics.llmProvider != null) turnMetrics.llmOutcome = turnMetrics.legacyEarlyTtsOutcome
           console.log('[Metrics]', JSON.stringify({ ...turnMetrics, ...computeDerivedMetrics(turnMetrics) }))
 
           // Phase A — merge bargeIn()'s bridge into this pipeline's own audioContinuity if THIS pipeline is the
@@ -2271,6 +2316,14 @@ function registerWebSocket(fastify) {
           // ใช้ startChunkedSpeculation() แทน (คนละ mechanism แต่ throttle/guard shape เดียวกัน)
           const session = callSessions.get(callSid)
           if (!session) return
+          // Dual Conversation Provider A/B (design locked) — an explicit provider override forces the final
+          // routing decision into the conditional/L2b branch unconditionally (see the bypass further down in
+          // processTranscript()), so NEITHER legacy prewarm NOR chunked speculation may fire for this call:
+          // both would still issue a real Claude request in the background purely to measure/adopt against,
+          // which is exactly the "hidden Claude call" this design forbids — it would spend real Claude cost
+          // and pollute cost/latency attribution for a turn we're explicitly trying to measure as pure
+          // Gemini (or pure forced-path Claude, for the A/B's own symmetry).
+          if (session.llmProvider) return
           if (rollout?.useChunkedStreaming) { startChunkedSpeculation(session, interimText); return }
           // L2b Legacy Prewarm Bypass (design locked) — legacyEarlyTts calls never adopt legacy's
           // blocking/full-response prewarm result (see the `if (!aiText)` guard further down), and

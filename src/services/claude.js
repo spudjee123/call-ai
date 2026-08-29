@@ -405,8 +405,11 @@ async function* askClaudeObservedFullResponse(session, signal = null, onMileston
 }
 
 // ==========================================================================
-// askClaudeConditionalStream — L2b PROTOTYPE (design revision 2026-08-21, NOT wired into any live call
-// path — local prototype only, no rollout, no commit/push/deploy per gate instructions)
+// askClaudeConditionalStream — L2b conditional streaming implementation (design revision 2026-08-21).
+// Wired into the live conversation path by audioStream.js (see the legacyEarlyTts branch and the Dual
+// Conversation Provider routing layered on top of it). Runtime exposure is controlled by conversation
+// routing/config (legacyEarlyTts rollout, or an explicit per-campaign provider override) — check current
+// config rather than assuming a percentage from this comment, which will drift as config changes.
 // ==========================================================================
 // Design per L2a Expanded Measurement (24 production fresh-observed turns, CONDITIONAL L2b decision):
 //   first-safe boundary found → wait CONDITIONAL_GRACE_MS (150ms)
@@ -890,4 +893,10 @@ async function* askClaudeConditionalStream(session, signal = null, onMilestone =
   }
 }
 
-module.exports = { askClaude, askClaudeStream, askClaudeStreamChunked, askClaudeObservedFullResponse, askClaudeConditionalStream, summarizeCall }
+module.exports = {
+  askClaude, askClaudeStream, askClaudeStreamChunked, askClaudeObservedFullResponse, askClaudeConditionalStream, summarizeCall,
+  // Dual Conversation Provider A/B (design locked) — exported so gemini.js can reuse the EXACT same prompt
+  // builder and history window instead of maintaining a second copy that could drift from Claude's (see
+  // gemini.js's own header comment for the prompt-parity requirement this satisfies).
+  buildSystemPrompt, MAX_HISTORY,
+}

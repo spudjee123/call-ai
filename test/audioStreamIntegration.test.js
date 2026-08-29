@@ -83,6 +83,7 @@ beforeEach(() => {
   // L2b — reset เช่นกัน + คืน claudeConditionalImpl เป็น default (delegate ไป claudeStreamImpl)
   state.legacyEarlyTtsConfig = { percent: 0, campaignId: null }
   state.claudeConditionalImpl = null
+  state.geminiConditionalImpl = null
   // STT-A2 — reset เช่นกัน default fail-closed
   state.sttA2Config = { percent: 0, campaignId: null }
   // A2.1 Shadow — reset เช่นกัน default fail-closed, independent จาก sttA2Config เอง
@@ -3634,5 +3635,297 @@ test('L2b: barge-in ก่อน Claude commit เสียงใดๆ เล�
   assert.equal(oldMetrics.legacyEarlyTtsOutcome, 'ABORTED')
   const lastAssistant = session.messages.filter(m => m.role === 'assistant').at(-1)
   assert.notEqual(lastAssistant?.content, LEGACY_RECOVERY_PHRASE)
+  harness.disconnect(socket)
+})
+
+// ===== Dual Conversation Provider A/B (design locked, 2026-08-28) =====
+// Provider selection is resolved once at session creation (twilio.js/webhook.js — not exercised by this
+// harness, which builds sessions directly via makeSession()) and frozen as session.llmProvider/llmModel.
+// These tests set that field directly on the session, exactly as the real resolveExplicitProvider() output
+// would land there, and prove the audioStream.js wiring built on top of it: the gate-bypass (explicit
+// provider must reach the conditional/L2b path even when legacyEarlyTts itself would say no), the router
+// dispatch (right provider actually gets called), and the prewarm/speculation isolation (no hidden Claude
+// call for an explicit-Gemini turn).
+
+test('Dual Provider: explicit Gemini + legacyEarlyTts percent=0 (would otherwise be CONTROL) → still forced into CONDITIONAL, Gemini actually called', async () => {
+  const callSid = 'CA_PROVIDER_GEMINI_BYPASS'
+  harness.getState().legacyEarlyTtsConfig = { percent: 0, campaignId: null } // deliberately fail-closed — proves the bypass, not a lucky rollout match
+  let geminiCalled = false
+  harness.getState().geminiConditionalImpl = async function* (session, signal, onMilestone) {
+    geminiCalled = true
+    onMilestone?.('requestAt', Date.now())
+    onMilestone?.('firstDeltaAt', Date.now())
+    onMilestone?.('fullAt', Date.now())
+    onMilestone?.('mode', 'SINGLE_SHOT')
+    onMilestone?.('finalText', 'ตอบจาก Gemini')
+    onMilestone?.('endCallRequested', false)
+    yield 'ตอบจาก Gemini'
+  }
+  const { socket } = await connectPastGreeting(callSid, {
+    rolloutPercent: 0,
+    sessionOverrides: { llmProvider: 'gemini', llmModel: 'gemini-3.7-flash' },
+  })
+
+  const metrics = await captureMetrics(() => harness.sendFinalTranscript('ทดสอบ'))
+
+  assert.equal(metrics.legacyEarlyTts, false, 'rollout gate เองยัง false อยู่ตามที่ตั้ง — ไม่ใช่ legacyEarlyTts ที่ทำให้เข้า conditional')
+  assert.equal(geminiCalled, true, 'ต้องเรียก Gemini จริง แม้ legacyEarlyTts=false')
+  assert.equal(metrics.llmProvider, 'gemini')
+  assert.equal(metrics.llmModel, 'gemini-3.7-flash')
+  assert.equal(metrics.llmOutcome, 'COMPLETED')
+  harness.disconnect(socket)
+})
+
+test('Dual Provider: explicit Claude + legacyEarlyTts percent=0 → still forced into CONDITIONAL (symmetry with Gemini, not just a Gemini-only bypass)', async () => {
+  const callSid = 'CA_PROVIDER_CLAUDE_BYPASS'
+  harness.getState().legacyEarlyTtsConfig = { percent: 0, campaignId: null }
+  let claudeConditionalCalled = false
+  harness.getState().claudeConditionalImpl = async function* (session, signal, onMilestone) {
+    claudeConditionalCalled = true
+    onMilestone?.('requestAt', Date.now())
+    onMilestone?.('firstDeltaAt', Date.now())
+    onMilestone?.('fullAt', Date.now())
+    onMilestone?.('mode', 'SINGLE_SHOT')
+    onMilestone?.('finalText', 'ตอบจาก Claude')
+    onMilestone?.('endCallRequested', false)
+    yield 'ตอบจาก Claude'
+  }
+  const { socket } = await connectPastGreeting(callSid, {
+    rolloutPercent: 0,
+    sessionOverrides: { llmProvider: 'claude', llmModel: 'claude-sonnet-5' },
+  })
+
+  const metrics = await captureMetrics(() => harness.sendFinalTranscript('ทดสอบ'))
+
+  assert.equal(metrics.legacyEarlyTts, false)
+  assert.equal(claudeConditionalCalled, true, 'explicit Claude ต้องบังคับเข้า CONDITIONAL เหมือน Gemini ไม่ใช่ตกไป CONTROL')
+  assert.equal(metrics.llmProvider, 'claude')
+  assert.equal(metrics.llmModel, 'claude-sonnet-5')
+  harness.disconnect(socket)
+})
+
+test('Dual Provider: campaign เดิมไม่มี llm_provider เลย (default/blank) → llmProvider/llmModel/llmOutcome เป็น null ทั้งหมด, ไม่ fabricate ค่า', async () => {
+  const callSid = 'CA_PROVIDER_DEFAULT_NULL'
+  harness.getState().legacyEarlyTtsConfig = { percent: 0, campaignId: null }
+  const { socket } = await connectPastGreeting(callSid, { rolloutPercent: 0, sessionOverrides: { llmProvider: null, llmModel: null } })
+
+  const metrics = await captureMetrics(() => harness.sendFinalTranscript('ทดสอบ'))
+
+  assert.equal(metrics.legacyEarlyTts, false)
+  assert.equal(metrics.llmProvider, null)
+  assert.equal(metrics.llmModel, null)
+  assert.equal(metrics.llmOutcome, null)
+  harness.disconnect(socket)
+})
+
+test('Dual Provider: explicit provider ระหว่าง interim → ไม่มี legacy prewarm (askClaudeStream) ถูกเรียกเลยแม้แต่ครั้งเดียว — กัน hidden Claude call ที่ทำลาย A/B cost attribution', async () => {
+  const callSid = 'CA_PROVIDER_NO_PREWARM'
+  harness.getState().legacyEarlyTtsConfig = { percent: 0, campaignId: null }
+  const { socket, state } = await connectPastGreeting(callSid, {
+    rolloutPercent: 0,
+    sessionOverrides: { llmProvider: 'gemini', llmModel: 'gemini-3.7-flash' },
+  })
+
+  let legacyStreamCalls = 0
+  const originalImpl = state.claudeStreamImpl
+  state.claudeStreamImpl = async function* (...args) { legacyStreamCalls++; yield* originalImpl(...args) }
+  state.geminiConditionalImpl = async function* (session, signal, onMilestone) {
+    onMilestone?.('requestAt', Date.now())
+    onMilestone?.('firstDeltaAt', Date.now())
+    onMilestone?.('fullAt', Date.now())
+    onMilestone?.('mode', 'SINGLE_SHOT')
+    onMilestone?.('finalText', 'ตอบจาก Gemini')
+    onMilestone?.('endCallRequested', false)
+    yield 'ตอบจาก Gemini'
+  }
+
+  harness.sendInterim('ทดสอบ') // interim ก่อน final — จุดที่ startPrewarm()/startChunkedSpeculation() เดิมจะยิง Claude
+  await delay(50)
+  assert.equal(legacyStreamCalls, 0, 'ต้องไม่มี Claude prewarm request เกิดขึ้นเลยระหว่าง interim ของเทิร์นที่มี explicit provider')
+
+  await captureMetrics(() => harness.sendFinalTranscript('ทดสอบ'))
+  assert.equal(legacyStreamCalls, 0, 'จบเทิร์นแล้วก็ยังต้องไม่มี Claude ถูกเรียกเลยตลอดทั้งเทิร์น (เฉพาะ Gemini เท่านั้นที่ควรรัน)')
+  harness.disconnect(socket)
+})
+
+test('Dual Provider: campaign.llm_provider ถูกแก้ระหว่างสายกำลังคุยอยู่ (turn 1 เสร็จแล้ว ก่อน turn 2 เริ่ม) → turn 2 ยังใช้ provider เดิมที่ freeze ไว้ตอนเริ่มสาย ไม่สลับตาม', async () => {
+  const callSid = 'CA_PROVIDER_FROZEN_MIDCALL'
+  harness.getState().legacyEarlyTtsConfig = { percent: 0, campaignId: null }
+  const geminiCampaign = l2bCampaign({ llm_provider: 'gemini' })
+  const { socket, session } = await connectPastGreeting(callSid, {
+    rolloutPercent: 0,
+    sessionOverrides: { campaign: geminiCampaign, llmProvider: 'gemini', llmModel: 'gemini-3.7-flash' },
+  })
+
+  const calls = []
+  const simpleImpl = (fn) => (sess, signal, onMilestone) => (async function* () {
+    calls.push(fn)
+    onMilestone?.('requestAt', Date.now())
+    onMilestone?.('firstDeltaAt', Date.now())
+    onMilestone?.('fullAt', Date.now())
+    onMilestone?.('mode', 'SINGLE_SHOT')
+    onMilestone?.('finalText', `ตอบจาก ${fn}`)
+    onMilestone?.('endCallRequested', false)
+    yield `ตอบจาก ${fn}`
+  })()
+  harness.getState().geminiConditionalImpl = simpleImpl('gemini')
+  harness.getState().claudeConditionalImpl = simpleImpl('claude')
+
+  await captureMetrics(() => harness.sendFinalTranscript('เทิร์นแรก'))
+  assert.deepEqual(calls, ['gemini'], 'เทิร์นแรกต้องใช้ Gemini ตามที่ตั้งไว้')
+
+  // จำลอง admin แก้ campaign กลับเป็น Claude "ระหว่างที่สายนี้กำลังคุยอยู่" — session.campaign เป็น live object
+  // reference เดียวกับที่ผูกกับสายนี้ (ไม่ใช่ snapshot) การ mutate ตรงนี้จำลองว่าถ้าโค้ดจุดไหนดันไปอ่าน
+  // session.campaign.llm_provider ซ้ำระหว่างสาย ก็จะเห็นค่าใหม่ทันที — ที่ต้องพิสูจน์คือ "ไม่มีจุดไหนอ่านซ้ำจริง"
+  session.campaign.llm_provider = 'claude'
+  assert.equal(session.llmProvider, 'gemini', 'field ที่ freeze ไว้ (session.llmProvider) ต้องไม่ขยับตาม session.campaign ที่เพิ่งถูกแก้')
+
+  calls.length = 0
+  await captureMetrics(() => harness.sendFinalTranscript('เทิร์นสอง หลังจากแก้ campaign ไปแล้ว'))
+  assert.deepEqual(calls, ['gemini'], 'เทิร์นสองต้องยังใช้ Gemini เหมือนเดิม แม้ session.campaign.llm_provider จะถูกแก้เป็น claude ไปแล้วระหว่างสาย')
+
+  harness.disconnect(socket)
+})
+
+test('Dual Provider: Gemini error ก่อน commit เสียงใดๆ เลย (จำลอง 429/rate-limit) → เข้า recovery phrase เดิมทุกประการ ไม่มี fallback แอบไป Claude', async () => {
+  const callSid = 'CA_PROVIDER_GEMINI_429'
+  harness.getState().legacyEarlyTtsConfig = { percent: 0, campaignId: null }
+  const { socket, session, state } = await connectPastGreeting(callSid, {
+    rolloutPercent: 0,
+    sessionOverrides: { llmProvider: 'gemini', llmModel: 'gemini-3.7-flash' },
+  })
+
+  let claudeCalls = 0
+  const originalClaudeStreamImpl = state.claudeStreamImpl
+  state.claudeStreamImpl = async function* (...args) { claudeCalls++; yield* originalClaudeStreamImpl(...args) }
+  state.claudeConditionalImpl = (sess, signal, onMilestone) => (async function* () { claudeCalls++; yield 'ไม่ควรถูกเรียกเลย' })()
+  state.geminiConditionalImpl = () => (async function* () {
+    throw Object.assign(new Error('429 Too Many Requests — จำลอง Gemini rate limit'), { status: 429 })
+  })()
+
+  const metrics = await captureMetrics(() => harness.sendFinalTranscript('ทดสอบ'))
+
+  assert.equal(metrics.llmProvider, 'gemini')
+  assert.equal(metrics.llmOutcome, 'ERROR')
+  assert.equal(claudeCalls, 0, 'ห้ามมี Claude call ใดๆ เกิดขึ้นเลย — no cross-provider fallback ระหว่าง A/B experiment')
+  const lastAssistant = session.messages.filter(m => m.role === 'assistant').at(-1)
+  assert.equal(lastAssistant?.content, LEGACY_RECOVERY_PHRASE, 'ต้องพูด recovery phrase เดิมทุกประการ เหมือน Claude error เคสเดียวกัน')
+
+  // พิสูจน์ว่า state ไม่ค้าง — เทิร์นถัดไปในสายเดียวกันต้องทำงานได้ปกติ ไม่ใช่ sttProcessing/isSpeaking ค้าง true ตลอดไป
+  state.geminiConditionalImpl = (sess, signal, onMilestone) => (async function* () {
+    onMilestone?.('requestAt', Date.now())
+    onMilestone?.('firstDeltaAt', Date.now())
+    onMilestone?.('fullAt', Date.now())
+    onMilestone?.('mode', 'SINGLE_SHOT')
+    onMilestone?.('finalText', 'กลับมาทำงานปกติแล้วค่ะ')
+    onMilestone?.('endCallRequested', false)
+    yield 'กลับมาทำงานปกติแล้วค่ะ'
+  })()
+  const metrics2 = await captureMetrics(() => harness.sendFinalTranscript('ยังอยู่ไหมคะ'))
+  assert.equal(metrics2.llmOutcome, 'COMPLETED', 'เทิร์นถัดไปต้องสำเร็จได้ปกติ พิสูจน์ว่า error รอบก่อนไม่ทำให้ state ค้าง')
+  assert.equal(claudeCalls, 0, 'เทิร์นถัดไปก็ยังต้องไม่มี Claude ถูกเรียกเลย')
+
+  harness.disconnect(socket)
+})
+
+test('Dual Provider: Gemini ค้างเกิน watchdog timeout ก่อน commit เสียงใดๆ (precommit) → TIMEOUT_PRECOMMIT, recovery phrase เดิม, ไม่ fallback ไป Claude', { timeout: 15000 }, async () => {
+  const callSid = 'CA_PROVIDER_GEMINI_TIMEOUT'
+  harness.getState().legacyEarlyTtsConfig = { percent: 0, campaignId: null }
+  const { socket, session, state } = await connectPastGreeting(callSid, {
+    rolloutPercent: 0,
+    sessionOverrides: { llmProvider: 'gemini', llmModel: 'gemini-3.7-flash' },
+  })
+
+  let claudeCalls = 0
+  state.claudeConditionalImpl = () => (async function* () { claudeCalls++; yield 'ไม่ควรถูกเรียกเลย' })()
+  state.geminiConditionalImpl = () => (async function* () { await new Promise(() => {}) })() // ไม่เคย yield อะไรเลย ไม่มี delta ใดๆ มาถึง — บังคับ watchdog (80ms override) timeout จริง
+
+  const metrics = await captureMetrics(() => harness.sendFinalTranscript('ทดสอบ'))
+
+  assert.equal(metrics.llmProvider, 'gemini')
+  assert.equal(metrics.llmOutcome, 'TIMEOUT_PRECOMMIT')
+  assert.equal(claudeCalls, 0, 'ห้าม fallback ไป Claude เมื่อ Gemini timeout')
+  const lastAssistant = session.messages.filter(m => m.role === 'assistant').at(-1)
+  assert.equal(lastAssistant?.content, LEGACY_RECOVERY_PHRASE)
+  harness.disconnect(socket)
+})
+
+test('Dual Provider: Gemini abort กลางทางหลังส่ง delta แรกไปแล้วจริง (barge-in ระหว่างพูด) → stale delta หลัง abort ต้องไม่ถูกใช้เลย ไม่ fabricate history', async () => {
+  const callSid = 'CA_PROVIDER_GEMINI_ABORT_MIDSTREAM'
+  harness.getState().legacyEarlyTtsConfig = { percent: 0, campaignId: null }
+  const { socket, session, state } = await connectPastGreeting(callSid, {
+    rolloutPercent: 0,
+    sessionOverrides: { llmProvider: 'gemini', llmModel: 'gemini-3.7-flash' },
+  })
+
+  let resumeAfterFirstDelta
+  const staleGate = new Promise(resolve => { resumeAfterFirstDelta = resolve })
+  state.geminiConditionalImpl = (sess, signal, onMilestone) => (async function* () {
+    onMilestone?.('requestAt', Date.now())
+    onMilestone?.('firstDeltaAt', Date.now())
+    yield 'พูดไปก้อนแรกจริงแล้วค่ะ' // delta แรกออกไปจริง (audio อาจเริ่มเล่นไปแล้ว)
+    await staleGate // ค้างรอตรงนี้จนกว่า barge-in จะเกิดขึ้นจริงก่อน แล้วค่อยพยายาม yield ก้อนที่สอง (stale)
+    yield 'ก้อนสองนี้ต้องไม่ถูกใช้เด็ดขาด — มาถึงหลัง abort แล้ว'
+  })()
+
+  const originalLog = console.log
+  const logs = []
+  console.log = (...args) => { logs.push(args.join(' ')); originalLog(...args) }
+
+  const oldTurnPromise = harness.sendFinalTranscript('คำถามแรกครับ')
+  await delay(30) // ให้เทิร์นแรกส่ง delta แรกออกไปจริงก่อน (mirrors the existing L2b ABORTED test's timing)
+
+  state.claudeStreamImpl = async function* () { yield 'ตอบเรื่องใหม่' }
+  await harness.sendFinalTranscript('เดี๋ยวก่อนครับ ขอถามเรื่องอื่นก่อน') // ยาวพอ trigger bargeIn จริง
+
+  resumeAfterFirstDelta() // ปล่อยให้ generator เดิมพยายาม yield ก้อนที่สอง (stale) หลัง abort ไปแล้ว
+  await oldTurnPromise
+  await delay(20)
+  console.log = originalLog
+
+  const oldMetricsLine = logs.find(l => l.includes('[Metrics]') && l.includes('"generationId":1,'))
+  assert.ok(oldMetricsLine, 'ต้องเจอ [Metrics] log ของเทิร์นแรก (generationId=1)')
+  const oldMetrics = JSON.parse(oldMetricsLine.slice(oldMetricsLine.indexOf('{')))
+  assert.equal(oldMetrics.llmProvider, 'gemini')
+  assert.equal(oldMetrics.legacyEarlyTtsOutcome, 'ABORTED')
+  const lastAssistant = session.messages.filter(m => m.role === 'assistant').at(-1)
+  assert.notEqual(lastAssistant?.content, 'ก้อนสองนี้ต้องไม่ถูกใช้เด็ดขาด — มาถึงหลัง abort แล้ว', 'stale chunk ที่มาหลัง abort ต้องไม่ถูกนำไปใช้เป็นคำตอบเลย')
+  harness.disconnect(socket)
+})
+
+test('Dual Provider (Review Gate fix): explicit Gemini + rollout chunked=true (would otherwise take the chunked path) → ยังบังคับเข้า CONDITIONAL, Gemini ถูกเรียกจริง ไม่ตกไป chunked/Claude เงียบๆ', async () => {
+  const callSid = 'CA_PROVIDER_GEMINI_VS_CHUNKED'
+  harness.getState().legacyEarlyTtsConfig = { percent: 0, campaignId: null }
+  let geminiCalled = false
+  let chunkedSpeculationCalled = false
+  const originalChunkedImpl = harness.getState().claudeStreamChunkedImpl
+  harness.getState().claudeStreamChunkedImpl = async function* (...args) { chunkedSpeculationCalled = true; yield* originalChunkedImpl(...args) }
+  harness.getState().geminiConditionalImpl = async function* (session, signal, onMilestone) {
+    geminiCalled = true
+    onMilestone?.('requestAt', Date.now())
+    onMilestone?.('firstDeltaAt', Date.now())
+    onMilestone?.('fullAt', Date.now())
+    onMilestone?.('mode', 'SINGLE_SHOT')
+    onMilestone?.('finalText', 'ตอบจาก Gemini')
+    onMilestone?.('endCallRequested', false)
+    yield 'ตอบจาก Gemini'
+  }
+  // rolloutPercent: 100 → rollout.useChunkedStreaming = true for every bucket (same convention existing
+  // test "2) rollout 100% → chunked path only" already uses) — the scenario that exposed the gap.
+  const { socket } = await connectPastGreeting(callSid, {
+    rolloutPercent: 100,
+    sessionOverrides: { llmProvider: 'gemini', llmModel: 'gemini-3.7-flash' },
+  })
+
+  const metrics = await captureMetrics(() => harness.sendFinalTranscript('ทดสอบ'))
+
+  assert.equal(geminiCalled, true, 'Gemini ต้องถูกเรียกจริง แม้ rollout จะบอกว่าเป็น chunked cohort')
+  assert.equal(chunkedSpeculationCalled, false, 'ห้ามมี chunked/askClaudeStreamChunked ถูกเรียกเลยเมื่อ campaign เลือก provider ไว้ชัดเจน')
+  assert.equal(metrics.llmProvider, 'gemini')
+  // หมายเหตุ: turnMetrics.path สะท้อนค่า rollout.useChunkedStreaming ดิบๆ เสมอ (ตั้งใจคงความหมายเดิมไว้เพื่อ
+  // historical dashboard continuity) ไม่ได้สะท้อน branch ที่ execute จริง — จึงยังเป็น 'chunked' แม้ turn นี้จะ
+  // ไม่ได้วิ่งผ่าน chunked branch เลยจริงๆ (พิสูจน์แล้วด้านบนผ่าน chunkedSpeculationCalled=false) ใช้ llmProvider
+  // + [LLMRoute] log's route field ต่างหากเพื่อดู execution path จริงสำหรับ turn ที่มี explicit provider
+  assert.equal(metrics.path, 'chunked')
   harness.disconnect(socket)
 })

@@ -1,6 +1,7 @@
 const twilio = require('twilio')
 const callSessions = require('../utils/callSessions')
 const { askClaude } = require('./claude')
+const { resolveExplicitProvider } = require('./conversationAI')
 const { synthesizeSpeech } = require('./tts')
 const { sheetsService } = require('./googleSheets')
 const healthMonitor = require('../utils/healthMonitor')
@@ -23,6 +24,13 @@ async function makeOutboundCall(contact, campaign, onCallCreated) {
   // เบอร์ที่ใช้โทรออกจริง — เก็บไว้ใน session เพื่อบันทึกลงผลการโทร (ให้หน้าประวัติการโทรโชว์/กรองตามเบอร์ที่ใช้จริงได้)
   const twilioNumber = effectiveTwilioNumber(campaign)
 
+  // Dual Conversation Provider A/B (design locked) — resolved ONCE here and frozen as a scalar on the
+  // session for the rest of the call. Deliberately not re-read from session.campaign later: session.campaign
+  // is a live object reference (not a deep copy), so relying on it mid-call would break the "provider frozen
+  // per call" invariant if the campaign is edited while this call is still in progress. null means no
+  // explicit choice — existing rollout routing (legacyEarlyTts, etc.) stays completely untouched.
+  const explicitProvider = resolveExplicitProvider(campaign)
+
   const session = {
     callSid: null,
     phone: contact.phone,
@@ -33,6 +41,8 @@ async function makeOutboundCall(contact, campaign, onCallCreated) {
     startTime: Date.now(),
     greetingChunks: null,
     twilioNumber,
+    llmProvider: explicitProvider?.provider || null,
+    llmModel: explicitProvider?.model || null,
   }
 
   // Pre-generate greeting ขณะรอสายต่อ (~3-4s) เพื่อลด silence

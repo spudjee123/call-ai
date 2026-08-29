@@ -1,6 +1,7 @@
 const twilio = require('twilio')
 const { v4: uuidv4 } = require('uuid')
 const { sheetsService } = require('../services/googleSheets')
+const { resolveExplicitProvider } = require('../services/conversationAI')
 const callSessions = require('../utils/callSessions')
 const { synthesizeSpeechWavThai } = require('../services/googleTTS')
 
@@ -82,6 +83,11 @@ module.exports = async function webhookRoutes(fastify) {
       return reply.send(twiml.toString())
     }
 
+    // Dual Conversation Provider A/B (design locked) — same one-time freeze as the outbound path in
+    // twilio.js's makeOutboundCall(). See that call site's comment for why this can't be re-read from
+    // session.campaign later.
+    const explicitProvider = resolveExplicitProvider(campaign)
+
     callSessions.set(callSid, {
       callSid,
       phone: from,
@@ -91,6 +97,8 @@ module.exports = async function webhookRoutes(fastify) {
       direction: 'inbound',
       startTime: Date.now(),
       twilioNumber: to,
+      llmProvider: explicitProvider?.provider || null,
+      llmModel: explicitProvider?.model || null,
     })
 
     const wsUrl = `${process.env.BASE_URL.replace(/^http/, 'ws')}/stream?callSid=${callSid}`

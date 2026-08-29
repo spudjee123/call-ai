@@ -31,6 +31,11 @@ function ensureStubbed() {
     // contract จริง แต่เป็น SINGLE_SHOT เสมอ (chunk เดียว) — เทสที่ต้องการคุม CHUNKED mode/milestone ละเอียดค่อย
     // set claudeConditionalImpl ตรงๆ แทน
     claudeConditionalImpl: null,
+    // Dual Conversation Provider A/B — askGeminiConditionalStream(session, signal, onMilestone) ค่า default
+    // เป็น null: stub ด้านล่าง delegate ไปที่ claudeStreamImpl เหมือนกัน (SINGLE_SHOT เสมอ) ยิง milestone
+    // contract เดียวกับ claudeConditionalImpl's default ทุกประการ ยกเว้นไม่มี mode 'CHUNKED' — เทสที่ต้องการคุม
+    // Gemini behavior/milestone ละเอียดกว่านี้ค่อย set geminiConditionalImpl ตรงๆ แทน
+    geminiConditionalImpl: null,
     ttsImpl: async function* () { yield Buffer.from('audio') }, // synthesizeSpeechStream(text, voiceId, signal)
     rolloutPercent: 0,
     // L2a production exposure gate — default fail-closed {percent:0, campaignId:null} เหมือน production cold
@@ -75,6 +80,44 @@ function ensureStubbed() {
       // claudeConditionalImpl ตรงๆ แทน
       askClaudeConditionalStream: (session, signal, onMilestone) => {
         if (state.claudeConditionalImpl) return state.claudeConditionalImpl(session, signal, onMilestone)
+        return (async function* () {
+          onMilestone?.('requestAt', Date.now())
+          let text = ''
+          let first = true
+          for await (const chunk of state.claudeStreamImpl(session, false, signal)) {
+            if (first) { onMilestone?.('firstDeltaAt', Date.now()); first = false }
+            text += (text ? ' ' : '') + chunk
+          }
+          if (signal?.aborted) return
+          onMilestone?.('fullAt', Date.now())
+          onMilestone?.('mode', 'SINGLE_SHOT')
+          const finalText = text.replace(/\[END_CALL\]/g, '').trim()
+          onMilestone?.('finalText', finalText)
+          onMilestone?.('endCallRequested', text.includes('[END_CALL]'))
+          if (finalText.length >= 3) yield finalText
+        })()
+      },
+      // Dual Conversation Provider A/B (design locked) — real claude.js exports these for gemini.js to reuse
+      // (prompt parity requirement); the stub needs the same two exports so conversationAI.js's require('./
+      // claude') resolves them the same way in tests as in production, or gemini.js/conversationAI.js would
+      // throw calling undefined(). Simplified (real templating/instructions stripped) — tests here only need
+      // A value, never the exact production wording.
+      buildSystemPrompt: (campaignPrompt, customerName) => `${campaignPrompt}\n\nชื่อลูกค้า: ${customerName}`,
+      MAX_HISTORY: 20,
+    },
+  }
+
+  // Dual Conversation Provider A/B (design locked) — stubbed the same way as claude.js above, own
+  // geminiConditionalImpl hook so a test can control Gemini's streamed response/milestones independently of
+  // Claude's. audioStream.js never imports this module directly — conversationAI.js's askConversationConditional
+  // Stream() does, dispatching on session.llmProvider — so this stub also proves the router picks the right one.
+  const geminiPath = require.resolve('../src/services/gemini')
+  require.cache[geminiPath] = {
+    id: geminiPath, filename: geminiPath, loaded: true,
+    exports: {
+      GEMINI_MODEL: 'gemini-3.7-flash',
+      askGeminiConditionalStream: (session, signal, onMilestone) => {
+        if (state.geminiConditionalImpl) return state.geminiConditionalImpl(session, signal, onMilestone)
         return (async function* () {
           onMilestone?.('requestAt', Date.now())
           let text = ''

@@ -123,6 +123,21 @@ function createTurnMetrics({
     // Always populated whenever l2bChunkReason is non-null (never a third, unpopulated state for this field
     // specifically) — HARD_MAX_TIMER can only ever co-occur with l2bChunkReason='NATURAL_BOUNDARY_HARD_MAX'.
     l2bChunkFirstSafeTrigger: null,
+    // Dual Conversation Provider A/B (design locked) — generic, provider-labeled fields, populated for
+    // every turn that goes through the conditional/L2b conversation path (askConversationConditionalStream,
+    // whether routed to Claude or Gemini), null for every other path. Deliberately separate from the
+    // legacyEarlyTts*/l2b* fields above rather than reusing them: those predate this experiment and keep
+    // their "legacy"/"L2b" naming for historical-dashboard continuity (never deleted, per the locked
+    // design), but a future reader grouping [Metrics] by provider should never have to know that a Gemini
+    // turn's timing also happens to live under a field literally named legacyEarlyTtsFirstDeltaAt.
+    llmProvider: null, // 'claude' | 'gemini' — the provider that ACTUALLY ran this turn (defaults to 'claude' at the router when a campaign has no explicit choice), never null for a conditional-path turn
+    llmModel: null, // exact model id string actually requested, e.g. 'claude-sonnet-5' or 'gemini-3.7-flash'
+    llmOutcome: null, // COMPLETED | ABORTED | ERROR | TIMEOUT — mirrors legacyEarlyTtsOutcome's enum, set by the same call site
+    // llmCacheCreationTokens/llmCacheReadTokens deliberately NOT included here — Gemini's caching semantics
+    // are not Anthropic's cache_creation_input_tokens/cache_read_input_tokens concept, and this design
+    // explicitly rejects forcing them into one shared field pair. l2bCacheCreationTokens/l2bCacheReadTokens
+    // above remain the Claude-only record of that; a Gemini-specific cache metric, if ever added, gets its
+    // own gemini*-prefixed field instead of being pooled with Claude's under a fake-generic name.
   }
 }
 
@@ -154,6 +169,14 @@ function computeDerivedMetrics(metrics) {
     legacyEarlyTtsFirstSafeMs: duration(metrics.legacyEarlyTtsRequestAt, metrics.legacyEarlyTtsFirstSafeAt),
     legacyEarlyTtsFullCompletionMs: duration(metrics.legacyEarlyTtsRequestAt, metrics.legacyEarlyTtsFullAt),
     legacyEarlyTtsEarlyOpportunityMs: duration(metrics.legacyEarlyTtsFirstSafeAt, metrics.legacyEarlyTtsFullAt),
+    // Dual Conversation Provider A/B (design locked) — generic aliases of the three durations above, valid
+    // for EITHER provider since askConversationConditionalStream's Claude and Gemini branches both feed the
+    // exact same legacyEarlyTts* milestone keys (see gemini.js's onMilestone contract comment). null
+    // whenever metrics.llmProvider is null (turn never went through the conditional/L2b path at all) —
+    // never computed independently, so these can never drift from the legacyEarlyTts* numbers they mirror.
+    llmTTFTMs: metrics.llmProvider ? duration(metrics.legacyEarlyTtsRequestAt, metrics.legacyEarlyTtsFirstDeltaAt) : null,
+    llmFirstSafeMs: metrics.llmProvider ? duration(metrics.legacyEarlyTtsRequestAt, metrics.legacyEarlyTtsFirstSafeAt) : null,
+    llmFullCompletionMs: metrics.llmProvider ? duration(metrics.legacyEarlyTtsRequestAt, metrics.legacyEarlyTtsFullAt) : null,
   }
 }
 
