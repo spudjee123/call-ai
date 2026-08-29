@@ -149,7 +149,7 @@ test('request config: model/thinkingLevel/maxOutputTokens/abortSignal ถูก�
   assert.equal(state.lastParams.model, GEMINI_MODEL)
   assert.equal(state.lastParams.model, 'gemini-3.7-flash')
   assert.equal(state.lastParams.config.thinkingConfig.thinkingLevel, 'LOW')
-  assert.equal(state.lastParams.config.maxOutputTokens, 200)
+  assert.equal(state.lastParams.config.maxOutputTokens, 2048)
   assert.equal(state.lastParams.config.abortSignal, controller.signal)
 })
 

@@ -93,7 +93,15 @@ async function* askGeminiConditionalStream(session, signal = null, onMilestone =
     contents,
     config: {
       systemInstruction: { parts: [{ text: systemPrompt }] },
-      maxOutputTokens: 200,
+      // Gemini Latency Root-Cause Test (2026-08-29) — raised from 200. Production calls (CA8d849c...,
+      // CAd05fda..., CAa691f3...) all showed firstDeltaAt=null and TIMEOUT_PRECOMMIT at exactly ~6000ms —
+      // zero visible text ever arrived. Hypothesis: thinkingConfig tokens draw from the SAME maxOutputTokens
+      // budget as the visible answer (Google's own usage metadata separates thoughtsTokenCount from output
+      // tokens, implying they share one ceiling) — at 200 tokens, thinking alone could exhaust the budget
+      // before any answer token is ever emitted, which would look exactly like "no delta, ever" rather than
+      // a truncated answer. This is a single-variable diagnostic change: nothing else in this file, and
+      // nothing in Claude's path, chunker, or the watchdog constant, changes alongside it.
+      maxOutputTokens: 2048,
       thinkingConfig: { thinkingLevel: 'LOW' },
       abortSignal: signal || undefined,
     },
