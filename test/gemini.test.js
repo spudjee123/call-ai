@@ -146,10 +146,11 @@ test('request config: model/thinkingLevel/maxOutputTokens/abortSignal ถูก�
   const controller = new AbortController()
   const gen = askGeminiConditionalStream(session([{ role: 'user', content: 'ทดสอบ' }]), controller.signal)
   for await (const _ of gen) { /* drain */ }
+  // Asserts against the exported GEMINI_MODEL constant, not a hardcoded string — this stays correct through
+  // the Gemini Latency Root-Cause Test's temporary model swaps (3.7 → 3.6 → back) without needing an edit here.
   assert.equal(state.lastParams.model, GEMINI_MODEL)
-  assert.equal(state.lastParams.model, 'gemini-3.7-flash')
-  assert.equal(state.lastParams.config.thinkingConfig.thinkingLevel, 'LOW')
-  assert.equal(state.lastParams.config.maxOutputTokens, 2048)
+  assert.equal(state.lastParams.config.thinkingConfig.thinkingLevel, 'MINIMAL')
+  assert.equal(state.lastParams.config.maxOutputTokens, 200)
   assert.equal(state.lastParams.config.abortSignal, controller.signal)
 })
 

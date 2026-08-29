@@ -30,7 +30,11 @@ const { buildSystemPrompt, MAX_HISTORY } = require('./claude')
 // inherent cost difference from Claude's abort behavior that no amount of correct wiring here can avoid —
 // flagged for the A/B cost analysis, not something this file can fix.
 const CONDITIONAL_GRACE_MS = 150
-const GEMINI_MODEL = 'gemini-3.7-flash'
+// Gemini Latency Root-Cause Test (2026-08-29) — temporarily gemini-3.6-flash instead of the design-locked
+// gemini-3.7-flash, testing whether 3.7's thinking floor (only low/medium/high, no true "off") is the cause
+// of the 6s+ time-to-first-token seen on every real production attempt so far. Revert to gemini-3.7-flash
+// once this diagnostic gate concludes, win or lose — this is not a permanent model change.
+const GEMINI_MODEL = 'gemini-3.6-flash'
 
 let cachedClient = null
 function getClient() {
@@ -93,16 +97,14 @@ async function* askGeminiConditionalStream(session, signal = null, onMilestone =
     contents,
     config: {
       systemInstruction: { parts: [{ text: systemPrompt }] },
-      // Gemini Latency Root-Cause Test (2026-08-29) — raised from 200. Production calls (CA8d849c...,
-      // CAd05fda..., CAa691f3...) all showed firstDeltaAt=null and TIMEOUT_PRECOMMIT at exactly ~6000ms —
-      // zero visible text ever arrived. Hypothesis: thinkingConfig tokens draw from the SAME maxOutputTokens
-      // budget as the visible answer (Google's own usage metadata separates thoughtsTokenCount from output
-      // tokens, implying they share one ceiling) — at 200 tokens, thinking alone could exhaust the budget
-      // before any answer token is ever emitted, which would look exactly like "no delta, ever" rather than
-      // a truncated answer. This is a single-variable diagnostic change: nothing else in this file, and
-      // nothing in Claude's path, chunker, or the watchdog constant, changes alongside it.
-      maxOutputTokens: 2048,
-      thinkingConfig: { thinkingLevel: 'LOW' },
+      // Gemini Latency Root-Cause Test (2026-08-29) — RULED OUT: raising this to 2048 (CA69b68704...) made
+      // no difference at all — still firstDeltaAt=null, still TIMEOUT_PRECOMMIT at ~6000ms, identical to the
+      // 200-token runs. "Thinking tokens exhausting the output budget" is not the cause. Reverted to 200.
+      // Now testing the next hypothesis instead: GEMINI_MODEL below is temporarily gemini-3.6-flash with
+      // thinkingLevel MINIMAL, to check whether 3.7's thinking floor (low/medium/high only, no true "off")
+      // is itself what exceeds the 6s watchdog, or whether an older/lighter-thinking model responds in time.
+      maxOutputTokens: 200,
+      thinkingConfig: { thinkingLevel: 'MINIMAL' },
       abortSignal: signal || undefined,
     },
   })
