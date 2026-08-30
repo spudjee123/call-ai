@@ -868,7 +868,11 @@ async function* askClaudeConditionalStream(session, signal = null, onMilestone =
       } else {
         mode = 'SINGLE_SHOT'
         onMilestone?.('mode', mode)
-        if (finalText.length >= 3) push({ type: 'chunk', text: finalText })
+        // Fix (2026-08-30) — เดิม >=3 ตัวอักษรเป็นเกณฑ์คนละอันกับที่ audioStream.js ใช้ตัดสิน COMPLETED
+        // (canonicalFinalText?.trim() แค่ truthy check) ทำให้คำตอบสั้นจริง 1-2 ตัวอักษร (เช่น "คะ") ถูกบันทึกว่า
+        // ตอบสำเร็จในประวัติ/metrics แต่ไม่เคยถูก push เข้า queue เลยสักครั้ง — ไม่มี TTS เกิดขึ้น ลูกค้าเงียบสนิท
+        // ทั้งที่ระบบคิดว่าตอบไปแล้ว ปรับให้ตรงกับเกณฑ์ truthy เดียวกัน (finalText ผ่าน trim() มาแล้วก่อนหน้านี้)
+        if (finalText) push({ type: 'chunk', text: finalText })
       }
       sendDone()
     } catch (err) {

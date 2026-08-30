@@ -365,18 +365,54 @@ test('6b) end_call ที่ shouldBlockEndCall=false (ไม่มีสัญ�
 // chunked พัง → fallback เริ่ม → ElevenLabs ช้า/ค้างระหว่างทาง → terminal watchdog เดิม abort กลางประโยคทั้งที่
 // ลูกค้าได้ยินไปแล้วบางส่วน (totalSent/fullText หายไปเป็น 0/'') ทดสอบชุดนี้ (9-14) ครอบ DoD A-F ที่ล็อกไว้ก่อน patch
 
-test('9) fallback pre-commit timeout (ไม่มีเสียงคอมมิตเลย) → FALLBACK_TIMEOUT, totalSent=0, ไม่มี media event ส่งออกเลย [DoD A]', { timeout: 15000 }, async () => {
+test('9) fallback pre-commit timeout (ไม่มีเสียงคอมมิตเลย) → FALLBACK_TIMEOUT, ต้องพูด recovery phrase (Track 4 fix — เดิมเงียบสนิท) [DoD A]', { timeout: 15000 }, async () => {
   const callSid = nextCallSid()
-  const { socket, state } = await connectPastGreeting(callSid)
+  const { socket, session, state } = await connectPastGreeting(callSid)
   state.claudeStreamChunkedImpl = async function* () { throw new Error('chunked boom') } // ล้มทันที → เข้า fallback ไม่ต้องรอ watchdog 3 วง
   state.claudeStreamImpl = async function* () { yield 'คำตอบจาก fallback ที่จะไม่ได้พูดเลย.' }
-  state.ttsImpl = async function* () { await new Promise(() => {}) } // ไม่ yield อะไรเลย ไม่ resolve เลย — ElevenLabs ไม่ตอบกลับมาก่อน commit
+  // ttsImpl ต้องแยกพฤติกรรมตามข้อความ — คำตอบเดิมของ fallback (ที่ต้องพิสูจน์ว่า precommit watchdog ยัง timeout
+  // ถูกต้องเหมือนเดิม) ค้างตลอดไปตามเดิม แต่ recovery phrase (คนละ TTS request ทั้งหมด, สั้นกว่ามาก) ต้องสำเร็จได้
+  // ปกติ — มิฉะนั้นเทสนี้จะ timeout เพราะพยายามพูด recovery phrase ผ่าน TTS ตัวเดียวกันที่พังอยู่แล้วด้วย (สมเหตุสมผล
+  // ในเชิงพฤติกรรม: การจำลอง "ElevenLabs ค้างตลอดไปแบบไม่มีขอบเขต" ไม่สมจริงเท่าการจำลองว่า request นี้ล้มเหลว
+  // จำเพาะเจาะจง — Track 4 ไม่ได้อ้างว่าแก้ปัญหา "TTS พังสนิททุก request" ซึ่งไม่มี watchdog ห่อ recovery phrase
+  // เองอยู่แล้วในทุก path ของระบบ ไม่ใช่แค่ path นี้)
+  state.ttsImpl = async function* (text) {
+    if (text === LEGACY_RECOVERY_PHRASE) { yield Buffer.from('recovery-audio'); return }
+    await new Promise(() => {}) // ไม่ yield อะไรเลย ไม่ resolve เลย — ElevenLabs ไม่ตอบกลับมาก่อน commit
+  }
 
   const metrics = await captureMetrics(() => harness.sendFinalTranscript('ทดสอบ')) // ใช้เวลาจริงประมาณ 8 วินาทีกว่า precommit watchdog จะ timeout
 
   assert.equal(metrics.fallbackOutcome, 'FALLBACK_TIMEOUT')
+  // Track 4 fix (2026-08-30) — เดิม precommit failure ของ chunked-fallback ไม่พูดอะไรเลย ต่างจากทุก precommit-
+  // failure path อื่นในระบบ ตอนนี้ต้องพูด recovery phrase เหมือนกันหมด แม้คำตอบจริงจาก fallback (fresh Claude
+  // call) จะไม่มีทางได้ยินเพราะ TTS ไม่เคยตอบเลยก็ตาม
   const mediaEvents = socket.sent.filter(e => e.event === 'media')
-  assert.equal(mediaEvents.length, 0, 'ไม่ควรมี media event ใดๆ เลยถ้าไม่เคย commit')
+  assert.ok(mediaEvents.length > 0, 'ต้องมีเสียง recovery phrase ออกไปจริง ไม่ใช่ความเงียบสนิทเหมือนเดิม')
+  const lastAssistant = session.messages.filter(m => m.role === 'assistant').at(-1)
+  assert.equal(lastAssistant?.content, LEGACY_RECOVERY_PHRASE)
+  harness.disconnect(socket)
+})
+
+test('9b) Track 4: fallback pre-commit ERROR (ไม่ใช่ timeout — TTS throw ทันทีก่อน yield อะไรเลย) → FALLBACK_ERROR ต้องพูด recovery phrase เช่นกัน', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid)
+  state.claudeStreamChunkedImpl = async function* () { throw new Error('chunked boom') }
+  state.claudeStreamImpl = async function* () { yield 'คำตอบจาก fallback ที่จะไม่ได้พูดเลย.' }
+  // แยกพฤติกรรมตามข้อความเหมือน test 9 — คำตอบเดิมของ fallback พังจริง (พิสูจน์ FALLBACK_ERROR ยังถูกต้อง) แต่
+  // recovery phrase (คนละ request) ต้องสำเร็จได้ปกติ
+  state.ttsImpl = async function* (text) {
+    if (text === LEGACY_RECOVERY_PHRASE) { yield Buffer.from('recovery-audio'); return }
+    throw new Error('ElevenLabs boom ก่อน yield อะไรเลย') // precommit error จริง ไม่ใช่ timeout
+  }
+
+  const metrics = await captureMetrics(() => harness.sendFinalTranscript('ทดสอบ'))
+
+  assert.equal(metrics.fallbackOutcome, 'FALLBACK_ERROR')
+  const mediaEvents = socket.sent.filter(e => e.event === 'media')
+  assert.ok(mediaEvents.length > 0, 'ต้องมีเสียง recovery phrase ออกไปจริง ไม่ใช่ความเงียบสนิทเหมือนเดิม')
+  const lastAssistant = session.messages.filter(m => m.role === 'assistant').at(-1)
+  assert.equal(lastAssistant?.content, LEGACY_RECOVERY_PHRASE)
   harness.disconnect(socket)
 })
 
@@ -1338,6 +1374,29 @@ test('32b) Commit A2: fresh Claude สำเร็จ (success) แต่ไม�
   assert.equal(assistantMessages[0].content, LEGACY_RECOVERY_PHRASE)
   const mediaEvents = socket.sent.filter(e => e.event === 'media')
   assert.ok(mediaEvents.length > 0, 'ต้องมีเสียง recovery phrase ออกไปจริง ไม่ใช่ความเงียบ')
+  harness.disconnect(socket)
+})
+
+test('32c) Track 3: fresh Claude สำเร็จ มีข้อความจริง แต่ TTS throw ก่อนส่งเสียงแม้แต่ byte เดียว → ต้องพูด recovery phrase ไม่ใช่บันทึกคำตอบที่ไม่เคยพูดออกไปว่า "ตอบสำเร็จ" (เดิมเงียบสนิท, dead-air bug)', async () => {
+  const callSid = nextCallSid()
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0 })
+
+  state.claudeStreamImpl = async function* () { yield 'คำตอบจริงที่ Claude ตอบสำเร็จ แต่จะไม่มีใครได้ยินเลย' }
+  // แยกพฤติกรรมตามข้อความ — คำตอบเดิมของ Claude พังจริงตอนพูด (นี่คือ dead-air bug ที่ต้องพิสูจน์ว่าแก้แล้ว) แต่
+  // recovery phrase (คนละ TTS request) ต้องสำเร็จได้ปกติ ไม่งั้นเทสนี้จะ fail เพราะพยายามพูด recovery phrase ผ่าน
+  // TTS request เดียวกันที่พังอยู่แล้วด้วย (ดูหมายเหตุเดียวกันที่ test 9 สำหรับเหตุผลเต็ม)
+  state.ttsImpl = async function* (text) {
+    if (text === LEGACY_RECOVERY_PHRASE) { yield Buffer.from('recovery-audio'); return }
+    throw new Error('ElevenLabs boom ก่อน yield อะไรเลย') // precommit error จริง ไม่ใช่ barge-in cancel
+  }
+
+  await harness.sendFinalTranscript('สวัสดีค่ะขอสอบถามโปรโมชั่น')
+
+  const assistantMessages = session.messages.filter(m => m.role === 'assistant')
+  assert.equal(assistantMessages.length, 1, 'ห้ามมีข้อความที่ไม่เคยพูดออกไปจริงถูกบันทึกเป็นคำตอบสำเร็จ')
+  assert.equal(assistantMessages[0].content, LEGACY_RECOVERY_PHRASE, 'ประวัติต้องสะท้อนสิ่งที่พูดออกไปจริง (recovery phrase) ไม่ใช่คำตอบเดิมที่ไม่เคยถูกพูด')
+  const mediaEvents = socket.sent.filter(e => e.event === 'media')
+  assert.ok(mediaEvents.length > 0, 'ต้องมีเสียง recovery phrase ออกไปจริง ไม่ใช่ความเงียบสนิทเหมือนเดิม')
   harness.disconnect(socket)
 })
 

@@ -93,6 +93,19 @@ test('SINGLE_SHOT: ตอบสั้นจบภายใน grace 150ms → yi
   assert.equal(milestones.finalText, 'สวัสดีค่ะ ยินดีให้บริการ')
 })
 
+// Track 2 fix (2026-08-30) — mirror ของ claudeConditional.test.js เป๊ะ: SINGLE_SHOT push gate เดิม >=3 ตัวอักษร
+// ทำให้คำตอบสั้นจริง (เช่น "คะ") ไม่เคยถูกพูดเลยทั้งที่ milestone finalText บอกว่าตอบสำเร็จแล้ว
+test('Track 2: SINGLE_SHOT คำตอบสั้นจริง 1-2 ตัวอักษร (เช่น "คะ") ต้องถูก push เป็น chunk ด้วย ไม่ใช่หายไปเงียบๆ', async () => {
+  state.chunks = [{ text: 'คะ' }]
+  const milestones = {}
+  const gen = askGeminiConditionalStream(session([{ role: 'user', content: 'ทดสอบ' }]), null, (k, v) => { milestones[k] = v })
+  const chunks = []
+  for await (const c of gen) chunks.push(c)
+  assert.deepEqual(chunks, ['คะ'], 'คำตอบสั้นแต่จริง ต้องถูกพูดออกไป ไม่ใช่หายเงียบทั้งที่ milestone finalText บอกว่าตอบสำเร็จ')
+  assert.equal(milestones.mode, 'SINGLE_SHOT')
+  assert.equal(milestones.finalText, 'คะ')
+})
+
 test('CHUNKED: stream ยังไม่จบเมื่อ grace หมดเวลา → เปลี่ยนเป็น mode=CHUNKED และ yield หลายก้อน', async () => {
   state.streamImpl = (chunks, signal) => makeSlowFakeStream(chunks, [0, 250], signal)
   state.chunks = [{ text: 'ประโยคแรกจบแล้วค่ะ ' }, { text: 'ประโยคที่สองตามมา' }]

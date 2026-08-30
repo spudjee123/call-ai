@@ -355,7 +355,10 @@ async function* askGeminiConditionalStream(session, signal = null, onMilestone =
       } else {
         mode = 'SINGLE_SHOT'
         onMilestone?.('mode', mode)
-        if (finalText.length >= 3) push({ type: 'chunk', text: finalText })
+        // Fix (2026-08-30) — mirror ของ claude.js เป๊ะ (คงพฤติกรรมเหมือนกันทั้งสอง provider ตาม design doctrine
+        // เดิม): >=3 ตัวอักษรทำให้คำตอบสั้นจริง 1-2 ตัวอักษรไม่ถูกพูดเลยทั้งที่บันทึกว่าตอบสำเร็จ — ดูคอมเมนต์เต็มที่
+        // claude.js จุดเดียวกัน
+        if (finalText) push({ type: 'chunk', text: finalText })
       }
       sendDone()
     } catch (err) {

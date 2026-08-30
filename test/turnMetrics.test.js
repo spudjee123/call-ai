@@ -9,7 +9,7 @@ test('createTurnMetrics: field ที่ให้มาถูกเก็บค�
   assert.equal(m.path, 'legacy')
   assert.equal(m.rolloutBucket, 42)
   assert.equal(m.rolloutPercent, 0)
-  for (const key of ['t1', 't2', 't3', 't4', 't5', 't6', 't7']) {
+  for (const key of ['t0', 't1', 't2', 't3', 't4', 't5', 't6', 't7']) {
     assert.equal(m[key], null, `${key} ต้องเริ่มต้นเป็น null`)
   }
   assert.equal(m.fallbackTriggered, false)
@@ -92,4 +92,20 @@ test('computeDerivedMetrics: turn ที่จบก่อนถึง TTS เ�
   assert.equal(d.sttToTwilio, null)
   assert.equal(d.ttsTTFB, null)
   assert.equal(d.requestToAudio, null)
+})
+
+// Track 6 (2026-08-30) — sttProcessingMs ปิด blind spot latency ต้นทาง (t0 = frame เสียงแรกที่เห็นตั้งแต่เริ่มฟังรอบล่าสุด)
+test('computeDerivedMetrics: sttProcessingMs = t1 - t0 เมื่อมีค่าทั้งคู่', () => {
+  const m = createTurnMetrics({ callSid: 'CA1', generationId: 0, path: 'legacy', rolloutBucket: 0, rolloutPercent: 0 })
+  m.t0 = 50
+  m.t1 = 1350
+  const d = computeDerivedMetrics(m)
+  assert.equal(d.sttProcessingMs, 1300)
+})
+
+test('computeDerivedMetrics: sttProcessingMs เป็น null ถ้าไม่เคย mark t0 (เช่น deploy ใหม่ยังไม่มี media frame มาก่อน final)', () => {
+  const m = createTurnMetrics({ callSid: 'CA1', generationId: 0, path: 'legacy', rolloutBucket: 0, rolloutPercent: 0 })
+  m.t1 = 1350
+  const d = computeDerivedMetrics(m)
+  assert.equal(d.sttProcessingMs, null)
 })

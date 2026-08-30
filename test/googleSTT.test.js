@@ -50,7 +50,10 @@ test('rotate ทันทีหลัง synthetic 900ms finalize deliver — �
   await delay(950) // เกิน INTERIM_FINALIZE_MS (900ms)
 
   assert.deepEqual(transcripts, ['สวัสดี'])
-  assert.equal(createdStreams.length, 2, 'ไม่ควรสร้าง stream ที่สามเพิ่ม — ต้อง rotate ไปใช้ prewarm ตัวที่สองที่มีอยู่แล้วแทน')
+  // Track 1 fix (2026-08-30): activatePrewarm() ตอนนี้ proactive re-prewarm ทันที (ไม่รอ interim ถัดไป) —
+  // rotate ไปใช้ prewarm ตัวที่สองที่มีอยู่แล้ว (ไม่สร้าง stream ที่สามจาก rotation นี้เอง) แต่ต้อง "เติม" prewarm
+  // ตัวใหม่ (ตัวที่สาม) ทันทีหลัง promote เสมอ — ปิดช่องว่างที่เคยทำให้ recovery event ถัดไปตกไปใช้ cold createStream
+  assert.equal(createdStreams.length, 3, 'rotate ไปใช้ prewarm ตัวที่สอง แล้วต้องเติม prewarm ใหม่ (ตัวที่สาม) ทันที ไม่รอ interim ถัดไป')
   assert.equal(first.ended, true, 'stream แรก (เก่า) ต้องถูกปิดทันทีหลัง rotate ไม่ปล่อยค้าง')
 
   sttStream.end()
@@ -65,9 +68,16 @@ test('stream ที่เพิ่ง rotate มา (จาก prewarm) ต้�
   emitInterim(first, 'สวัสดี')
   await delay(950) // rotate ไปยัง stream ที่สอง (prewarm) แล้ว
 
+  // Track 1 fix (2026-08-30): rotate ตอนนี้ proactive re-prewarm ทันที ดังนั้น prewarm ตัวที่สาม "มีอยู่แล้ว"
+  // ก่อน interim ถัดไปจะมาถึงด้วยซ้ำ (ต่างจากเดิมที่ต้องรอ interim ถัดไปเป็นคนสร้างเอง) — ยืนยันจุดนี้ก่อน
+  assert.equal(createdStreams.length, 3, 'prewarm ตัวที่สามต้องถูกเติมทันทีตอน rotate (Track 1) ก่อน interim ถัดไปมาถึงด้วยซ้ำ')
+
   const second = createdStreams[1]
   emitInterim(second, 'เดี๋ยวก่อนครับ') // นี่คือ interim ของ "utterance ถัดไป" ที่ควรฟังได้ระหว่าง AI พูดอยู่พอดี
-  assert.equal(createdStreams.length, 3, 'stream ที่สอง (เพิ่ง rotate มา) ต้องรับ interim ได้ปกติ แล้ว prewarm ตัวที่สามต่อ — พิสูจน์ว่าไม่ได้ utteranceClosed=true ค้างมาจาก rotate (บั๊กที่ต้องระวังตามที่ออกแบบไว้)')
+  // stream ที่สอง (เพิ่ง rotate มา) ต้องรับ interim ได้ปกติ ไม่ถูก mark closed ค้างจาก utterance ก่อนหน้า (บั๊กที่
+  // ต้องระวังตามที่ออกแบบไว้) — prewarm ตัวที่สามมีอยู่แล้วจาก Track 1 จึงไม่มีการสร้างตัวที่สี่เพิ่มจาก interim นี้เอง
+  // (nextStream ไม่ null ตั้งแต่ก่อน emitInterim แล้ว) การพิสูจน์หลักว่า utteranceClosed ไม่รั่วอยู่ที่ transcripts ท้าย test
+  assert.equal(createdStreams.length, 3, 'ไม่มีการสร้าง stream ที่สี่จาก interim นี้ — prewarm ตัวที่สามเติมไว้แล้วตั้งแต่ตอน rotate')
 
   await delay(950)
   assert.deepEqual(transcripts, ['สวัสดี', 'เดี๋ยวก่อนครับ'], 'utterance ที่สองต้อง deliver ได้ปกติเช่นกัน')
@@ -170,7 +180,9 @@ test('L1a: rotation ยังเกิดหลัง transcript deliver แม�
   await delay(650)
 
   assert.deepEqual(transcripts, ['ทดสอบ'])
-  assert.equal(createdStreams.length, 2, 'ต้อง rotate ไปใช้ prewarm stream ที่สองทันที เหมือนกับ default 900ms')
+  // Track 1 fix (2026-08-30): rotate ไปใช้ prewarm ตัวที่สอง แล้วเติม prewarm ใหม่ (ตัวที่สาม) ทันที — ดูหมายเหตุ
+  // เดียวกับ test แรกของไฟล์นี้
+  assert.equal(createdStreams.length, 3, 'ต้อง rotate ไปใช้ prewarm stream ที่สอง แล้วเติม prewarm ใหม่ทันที เหมือนกับ default 900ms')
   assert.equal(first.ended, true)
 
   sttStream.end()
@@ -371,7 +383,10 @@ test('EOS Case 2b: มี prewarm (nextStream) พร้อมอยู่แล
   emitEos(second) // second สะอาดจริง (ไม่มี pending interim) → EOS watchdog arm ได้ปกติ
   await delay(300) // เลย grace(250ms)
 
-  assert.equal(createdStreams.length, 4, 'grace หมดอายุต้อง promote P2 ที่มีอยู่แล้วเป็น current — ไม่สร้าง stream ที่ห้าเพิ่ม')
+  // Track 1 fix (2026-08-30): grace หมดอายุต้อง promote P2 ที่มีอยู่แล้วเป็น current (ไม่ cold-create) — แต่ตอนนี้
+  // activatePrewarm() proactive re-prewarm ทันทีด้วย จึงต้องมี stream ที่ห้าเกิดขึ้นจริง (ไม่ใช่ "ต้องไม่มี" แบบเดิม
+  // ก่อน fix นี้) นี่คือพฤติกรรมที่ตั้งใจ — ปิดช่องว่างที่เคยทำให้ recovery event ถัดไปตกไปใช้ cold createStream(false)
+  assert.equal(createdStreams.length, 5, 'grace หมดอายุต้อง promote P2 เป็น current แล้วเติม prewarm ใหม่ (ตัวที่ห้า) ทันที')
   assert.equal(second.ended, true)
 
   emitFinal(p2, 'ใช้ prewarm ต่อได้ปกติ')
@@ -447,6 +462,36 @@ test('EOS Case 4: END_OF_SINGLE_UTTERANCE ตามด้วย stream error() �
 
   await delay(300) // เลย error-recovery 100ms เดิมไปแล้ว และเลย grace(250ms) เดิมของ EOS ไปด้วย
   assert.equal(createdStreams.length, 2, 'error-recovery เดิม (setTimeout 100ms) ต้องสร้าง stream ใหม่แค่ 1 ครั้งตามปกติ — ไม่ใช่ 3 ที่จะเกิดถ้า EOS watchdog ไม่ถูก clear ตอน error แล้วมา fire ซ้ำเพิ่มอีกรอบตอน grace(250ms) หมดอายุ')
+
+  sttStream.end()
+})
+
+test('Track 1 fix (2026-08-30): recovery event ที่เกิดทันทีหลัง rotate ปกติ (ไม่มี interim คั่นเลย) ต้องยังใช้ prewarm ได้ ไม่ตกไป cold-create — นี่คือ short-utterance-loss bug ตัวจริงที่ Track 1 แก้', async () => {
+  createdStreams = []
+  const transcripts = []
+  const sttStream = transcribeStream((t) => transcripts.push(t), () => {})
+  const first = createdStreams[0]
+
+  emitInterim(first, 'สวัสดี')
+  await delay(950) // rotate ปกติ — ก่อน fix นี้ ตอนนี้จะมีแค่ 2 stream (first, prewarm ที่ถูก promote) และ nextStream=null
+                    // ทำให้ recovery event ถัดไปที่ยังไม่ทันมี interim ใหม่มาเลยตกไปใช้ cold createStream(false) (เปิด
+                    // cold-mute 200ms) — Track 1 แก้ด้วยการเติม prewarm ทันทีตอน rotate ไม่ต้องรอ interim ถัดไป
+  assert.equal(createdStreams.length, 3, 'ต้องมี prewarm ตัวใหม่ (ตัวที่สาม) พร้อมอยู่แล้วก่อน interim ถัดไปจะมาถึงด้วยซ้ำ')
+
+  const second = createdStreams[1] // stream ที่เพิ่งถูก promote เป็น current
+  // จำลอง recovery event (EOS-stuck) เกิดขึ้นทันทีบน current stream โดยไม่มี interim ใหม่มาเลยตั้งแต่ rotate
+  emitEos(second)
+  await delay(300) // เลย grace(250ms)
+
+  // ก่อน fix: ตรงนี้จะเป็น cold createStream(false) เพราะ nextStream เป็น null (ไม่มี interim มาเติมให้) — มี
+  // cold-mute 200ms เปิดอยู่ ถ้าลูกค้าพูดคำสั้นพอดีตอนนั้นจะหายทั้งคำไม่มีร่องรอย (ปัญหาที่รายงานมา)
+  // หลัง fix: ต้องใช้ prewarm ที่เติมไว้แล้ว (ตัวที่สาม) แทน — ไม่มี cold-mute เลย
+  assert.equal(createdStreams.length, 4, 'recovery event ต้อง promote prewarm ที่เติมไว้แล้ว (ตัวที่สาม) แล้วเติมตัวที่สี่ต่อทันที ไม่ใช่ cold-create')
+  assert.equal(second.ended, true)
+
+  const third = createdStreams[2]
+  emitFinal(third, 'ฟังต่อได้ปกติผ่าน prewarm ไม่ใช่ cold stream')
+  assert.deepEqual(transcripts, ['สวัสดี', 'ฟังต่อได้ปกติผ่าน prewarm ไม่ใช่ cold stream'])
 
   sttStream.end()
 })
@@ -559,7 +604,8 @@ test('EOS Case 12 (Review Fix 1 blocker): EOS ขณะมี pending interim (T
 
   await delay(650) // รวม ~950ms จาก interim แรก — เลย TIMER_FINAL(900ms) ไปแล้ว
   assert.deepEqual(transcripts, ['สนใจครับ'], 'TIMER_FINAL ต้อง deliver ข้อความเดิมที่ได้จาก interim ก่อน EOS จะมาถึง ครั้งเดียว ไม่หายไปไหน')
-  assert.equal(createdStreams.length, 2, 'rotate ไปใช้ prewarm ที่มีอยู่แล้ว (จาก interim แรก) ไม่ใช่สร้าง stream ที่สาม')
+  // Track 1 fix (2026-08-30): rotate ไปใช้ prewarm ที่มีอยู่แล้ว (จาก interim แรก) แล้วเติม prewarm ใหม่ (ตัวที่สาม) ทันที
+  assert.equal(createdStreams.length, 3, 'rotate ไปใช้ prewarm ที่มีอยู่แล้ว แล้วเติม prewarm ใหม่ทันที ไม่ใช่รอ interim ถัดไป')
   assert.equal(first.ended, true, 'stream เดิมต้องถูกปิดหลัง rotate ปกติ (ผ่าน TIMER_FINAL path ไม่ใช่ EOS watchdog)')
 
   const second = createdStreams[1]
@@ -582,11 +628,12 @@ test('EOS Case 13 (Review Fix 1): EOS ขณะมี pending interim แล้�
   emitFinal(first, 'สนใจครับผม') // GOOGLE_FINAL มาก่อน TIMER_FINAL/grace ใดๆ จะครบ
 
   assert.deepEqual(transcripts, ['สนใจครับผม'], 'ต้อง deliver ผ่าน GOOGLE_FINAL ครั้งเดียว ไม่ใช่ค่า interim เดิม')
-  assert.equal(createdStreams.length, 2, 'rotate ครั้งเดียวไปใช้ prewarm')
+  // Track 1 fix (2026-08-30): rotate ครั้งเดียวไปใช้ prewarm แล้วเติม prewarm ใหม่ (ตัวที่สาม) ทันที
+  assert.equal(createdStreams.length, 3, 'rotate ไปใช้ prewarm แล้วเติมใหม่ทันที')
   assert.equal(first.ended, true)
 
   await delay(300) // เลยทั้ง grace(250ms) เดิมและ TIMER_FINAL(900ms) เดิมไปแล้ว — ต้องไม่มีอะไรเพิ่มอีกเลย
-  assert.equal(createdStreams.length, 2, 'ไม่มี recovery ซ้ำจากทั้ง EOS watchdog (ไม่เคย arm) และ TIMER_FINAL เดิม (ถูก clear ไปแล้วตอน GOOGLE_FINAL rotate)')
+  assert.equal(createdStreams.length, 3, 'ไม่มี recovery ซ้ำจากทั้ง EOS watchdog (ไม่เคย arm) และ TIMER_FINAL เดิม (ถูก clear ไปแล้วตอน GOOGLE_FINAL rotate)')
   assert.deepEqual(transcripts, ['สนใจครับผม'], 'ไม่มี delivery ซ้ำ')
 
   sttStream.end()

@@ -100,6 +100,47 @@ test('campaign ที่ไม่ได้ตั้ง twilio_number ไว้�
   createdCalls.forEach(c => callQueue.release(c.sid))
 })
 
+test('Track 5 — add() ซ้ำด้วยเบอร์เดียวกันก่อนสายแรกจบ ต้องข้าม ไม่โทรซ้ำสอง', async () => {
+  const campaignA = { id: 'campA', twilio_number: '+66811110008' }
+  callQueue.add({ contact: { phone: '+66892220001' }, campaign: campaignA })
+  // เรียกซ้ำทันที (จำลอง double-click / client retry) ก่อนสายแรกจะ release เลย
+  callQueue.add({ contact: { phone: '+66892220001' }, campaign: campaignA })
+  callQueue.add({ contact: { phone: '+66892220001' }, campaign: campaignA })
+  await wait(20)
+
+  assert.equal(createdCalls.length, 1, 'เบอร์เดียวกันต้องถูกโทรแค่ครั้งเดียวแม้เรียก add() ซ้ำสามครั้ง')
+  assert.equal(callQueue.runningCount('+66811110008'), 1)
+  assert.equal(callQueue.size('+66811110008'), 0, 'สอง add() ที่ซ้ำต้องไม่ถูกเก็บเข้าคิวเลย ไม่ใช่แค่ไม่โทร')
+
+  callQueue.release(createdCalls[0].sid)
+  await wait(20)
+
+  // หลัง release แล้ว เบอร์เดิมต้อง add() ใหม่ได้อีกครั้งตามปกติ (ไม่ใช่ถูกแบนถาวร)
+  callQueue.add({ contact: { phone: '+66892220001' }, campaign: campaignA })
+  await wait(20)
+  assert.equal(createdCalls.length, 2, 'หลัง release แล้วเบอร์เดิมต้องโทรซ้ำได้ปกติ')
+  callQueue.release(createdCalls[1].sid)
+})
+
+test('Track 5 — clearByNumber ต้องปล่อยเบอร์ที่ยังไม่ได้โทร ให้ add() ซ้ำได้อีกครั้ง', async () => {
+  const campaignA = { id: 'campA', twilio_number: '+66811110009' }
+  // เติมให้เต็มโควตา 2 ก่อน แล้วเบอร์ที่ 3 จะติดอยู่ในคิว (ไม่ถูกโทร)
+  callQueue.add({ contact: { phone: '+66893330001' }, campaign: campaignA })
+  callQueue.add({ contact: { phone: '+66893330002' }, campaign: campaignA })
+  callQueue.add({ contact: { phone: '+66893330003' }, campaign: campaignA })
+  await wait(20)
+  assert.equal(callQueue.size('+66811110009'), 1)
+
+  callQueue.clearByNumber('+66811110009')
+  // เบอร์ที่ 3 ถูกล้างออกจากคิวไปแล้ว ต้อง add() ใหม่ได้ทันที ไม่ถูกมองว่ายัง "in flight"
+  callQueue.add({ contact: { phone: '+66893330003' }, campaign: campaignA })
+  await wait(20)
+  assert.equal(callQueue.size('+66811110009'), 1, 'add() ใหม่หลัง clearByNumber ต้องเข้าคิวได้ปกติ ไม่ถูกกันซ้ำผิดๆ')
+
+  callQueue.clearByNumber('+66811110009')
+  createdCalls.filter(c => c.twilioNumber === '+66811110009').forEach(c => callQueue.release(c.sid))
+})
+
 test('clear(campaignId) แบบเดิม: ไม่ระบุ campaignId ต้องล้างทุกคิวทุกเบอร์ (คงพฤติกรรมเดิมไว้)', async () => {
   const campaignA = { id: 'campA', twilio_number: '+66811110006' }
   const campaignB = { id: 'campB', twilio_number: '+66811110007' }

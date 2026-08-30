@@ -113,6 +113,18 @@ test('SINGLE_SHOT: ไม่เคยเจอ boundary เลยตลอด st
   assert.equal(events.find(e => e.key === 'endCallRequested')?.value, false)
 })
 
+// Track 2 fix (2026-08-30) — เดิม SINGLE_SHOT push gate คือ finalText.length >= 3 คนละเกณฑ์กับ audioStream.js
+// ที่ตัดสิน COMPLETED จาก canonicalFinalText?.trim() (แค่ truthy) ทำให้คำตอบสั้นจริง 1-2 ตัวอักษร (เช่น "คะ")
+// ถูกบันทึกว่าตอบสำเร็จแต่ไม่เคยถูก push เป็น chunk เลย — ไม่มี TTS เกิดขึ้น ลูกค้าเงียบสนิท
+test('Track 2: SINGLE_SHOT คำตอบสั้นจริง 1-2 ตัวอักษร (เช่น "คะ") ต้องถูก push เป็น chunk ด้วย ไม่ใช่หายไปเงียบๆ', async () => {
+  state.events = [textDelta('คะ')] // สั้นกว่า MIN_CHUNK_LENGTH(6) ของ speechChunker — ไม่มีทางเจอ boundary กลาง stream เลย
+  const { events, onMilestone } = makeMilestoneRecorder()
+  const chunks = await collect(askClaudeConditionalStream(makeSession(), null, onMilestone))
+  assert.deepEqual(chunks, ['คะ'], 'คำตอบสั้นแต่จริง ต้องถูกพูดออกไป ไม่ใช่หายเงียบทั้งที่ milestone finalText บอกว่าตอบสำเร็จ')
+  assert.equal(events.find(e => e.key === 'mode')?.value, 'SINGLE_SHOT')
+  assert.equal(events.find(e => e.key === 'finalText')?.value, 'คะ')
+})
+
 test('SINGLE_SHOT: เจอ boundary แล้ว แต่ Claude จบ stream ภายใน grace (150ms) → ยัง yield เต็มก้อนครั้งเดียว ไม่แยกเป็น chunk', async () => {
   const delaysMs = [0, 20] // delta ที่สองมาเร็วมาก (20ms) เร็วกว่า grace (150ms) มาก — stream จบก่อน grace fire
   state.streamImpl = (events, signal) => makeSlowFakeStream(events, delaysMs, signal)

@@ -30,6 +30,11 @@ function createTurnMetrics({
     legacyEarlyTtsPercentAtStart,
     legacyEarlyTtsCampaignMatched,
     startedAt: new Date().toISOString(), // สำหรับ correlate กับ log บรรทัดอื่น — ไม่ใช้คำนวณ latency (wall clock กระโดดได้)
+    // Track 6 (observability fix, 2026-08-30) — ปิด blind spot เดิมที่ไม่มี timestamp ใดๆ เลยตอนเสียงจาก Twilio
+    // มาถึงจริง (t1 เป็นจุดแรกสุดที่เคยวัดได้ ซึ่งอยู่หลังผ่าน echo/ack filter ไปแล้ว) — t0 คือ frame แรกที่เห็นนับจาก
+    // จุดที่ AI พูดจบ/ถูกขัดจังหวะครั้งล่าสุด (ดู audioStream.js ที่ตั้ง/ล้างค่านี้) เป็นค่าประมาณ "เริ่มฟังลูกค้าใหม่"
+    // ไม่ใช่ boundary ของ utterance เป๊ะๆ ระดับ STT-internal แต่เพียงพอสำหรับ diagnose latency ต้นทางได้แล้ว
+    t0: null, // frame เสียงแรกที่สังเกตเห็นนับจากเริ่มฟังรอบล่าสุด
     t1: null, // STT final
     t2: null, // Claude request sent (หรือเริ่มรอ prewarm ที่ในไฟลท์อยู่แล้ว)
     t3: null, // first Claude delta
@@ -152,6 +157,9 @@ function duration(a, b) {
 
 function computeDerivedMetrics(metrics) {
   return {
+    // Track 6 — null โดยธรรมชาติทุกครั้งที่ t0 ไม่เคยถูก mark (ยังไม่ได้ deploy ใหม่/เทิร์นแรกสุดของ event บาง
+    // ชนิดที่ไม่ผ่าน media handler) เหมือน metric อื่นๆ ทุกตัวในไฟล์นี้ — ไม่ fabricate ค่า
+    sttProcessingMs: duration(metrics.t0, metrics.t1),
     sttToTwilio: duration(metrics.t1, metrics.t7),
     claudeTTFT: duration(metrics.t2, metrics.t3),
     chunkDelay: duration(metrics.t3, metrics.t4),

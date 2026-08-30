@@ -369,6 +369,10 @@ function registerWebSocket(fastify) {
     let ttsAbortController = null       // barge-in: cancel STT→TTS pipeline
     let sttProcessing = false     // mutex: ป้องกัน concurrent Claude calls
     let bargeInCooldown = false   // cooldown หลัง barge-in ป้องกัน echo false-trigger
+    // Track 6 (observability fix, 2026-08-30) — timestamp ของ media frame แรกที่เห็นนับจากรอบฟังล่าสุด (AI พูด
+    // จบ/ถูกขัดจังหวะครั้งล่าสุด) ใช้ mark turnMetrics.t0 เพื่อปิด blind spot latency ต้นทาง (ดู turnMetrics.js)
+    // ล้างค่าที่จุดเริ่มฟังรอบใหม่ (mark handler ปกติ, bargeIn) และถูก "บริโภค" ทิ้งตอน processTranscript() อ่านไปแล้ว
+    let firstMediaFrameAt = null
     let silenceTimer = null
     let silencePromptCount = 0
     let durationTimer = null
@@ -900,6 +904,7 @@ function registerWebSocket(fastify) {
         }
       }
       isSpeaking = false
+      firstMediaFrameAt = null // Track 6 — ลูกค้าพูดแทรกคือจุดเริ่มฟังรอบใหม่เช่นกัน
       // C6c follow-up: ไม่ set sttProcessing = false ที่นี่อีกต่อไป — ถ้าเทิร์นเดิมยัง await Claude/TTS อยู่จริง
       // (sttProcessing ยังเป็น true) นี่ยังไม่ใช่จังหวะปลอดภัยที่จะเริ่ม pipeline ใหม่ซ้อนกัน ปล่อยให้เทิร์นเดิมเป็น
       // เจ้าของ sttProcessing แต่ผู้เดียว (single writer) — reset เองใน finally ของมันตามปกติเมื่อ async work จริงๆ จบ
@@ -1092,6 +1097,8 @@ function registerWebSocket(fastify) {
             legacyEarlyTtsCampaignMatched,
           })
           markOnce(turnMetrics, 't1')
+          turnMetrics.t0 = firstMediaFrameAt // Track 6 — บริโภคแล้วล้างทิ้งทันที ไม่ให้เทิร์นถัดไปเห็นค่าเก่าซ้ำ
+          firstMediaFrameAt = null
 
           // Phase A — Audio Continuity Telemetry (Implementation Gate #1, design locked). Own object, own
           // [AudioContinuity] log line — never merged into turnMetrics/[Metrics] (kept as a separate namespace
@@ -1405,11 +1412,33 @@ function registerWebSocket(fastify) {
                       }
                     } else if (fallbackAttempt.outcome === 'timeout') {
                       turnMetrics.fallbackOutcome = 'FALLBACK_TIMEOUT'
-                      console.error('[Fallback] FALLBACK_TIMEOUT — giving up before any audio committed, no further recovery attempted')
+                      console.error('[Fallback] FALLBACK_TIMEOUT — giving up before any audio committed, speaking recovery phrase')
+                      // Fix (2026-08-30) — เดิม precommit failure ของ chunked-fallback (dormant, chunked
+                      // rollout=0% ในโปรดักชันวันนี้) ไม่พูดอะไรเลย ต่างจากทุก precommit-failure path อื่นในระบบที่
+                      // พูด recovery phrase เสมอ (ดู L2a/L2b/CONTROL) — ต้องอยู่ใน branch นี้เท่านั้น (precommit จริง
+                      // ผ่าน turnState.audioCommitted===false ที่เช็คไปแล้วด้านบน) ห้ามหลุดไปโดน branch postcommit
+                      // (FALLBACK_PARTIAL_TIMEOUT/FALLBACK_PARTIAL_ERROR) เด็ดขาด — นั่นคือเสียงที่คอมมิตไปแล้วจริง
+                      // ห้ามพูดทับ
+                      const recoveryResult = await speakFixedText({
+                        text: LEGACY_RECOVERY_PHRASE, signal, socket, streamSid,
+                        voiceId: currentSession.campaign.voice_id, turnMetrics, turnState, callState, generationId,
+                        startingSentCount: totalSent,
+                        onChunkAudioStart: (t) => noteActiveSpokenChunk(pipelineId, t),
+                      })
+                      totalSent += recoveryResult.sentCount
+                      fullText = recoveryResult.sentCount > 0 ? LEGACY_RECOVERY_PHRASE : ''
                     } else {
                       turnMetrics.fallbackOutcome = 'FALLBACK_ERROR'
                       console.error('[Fallback error]', fallbackAttempt.error.message)
                       healthMonitor.reportError('ai_tts_fallback', fallbackAttempt.error.message)
+                      const recoveryResult = await speakFixedText({
+                        text: LEGACY_RECOVERY_PHRASE, signal, socket, streamSid,
+                        voiceId: currentSession.campaign.voice_id, turnMetrics, turnState, callState, generationId,
+                        startingSentCount: totalSent,
+                        onChunkAudioStart: (t) => noteActiveSpokenChunk(pipelineId, t),
+                      })
+                      totalSent += recoveryResult.sentCount
+                      fullText = recoveryResult.sentCount > 0 ? LEGACY_RECOVERY_PHRASE : ''
                     }
                   }
                 }
@@ -1880,6 +1909,8 @@ function registerWebSocket(fastify) {
               console.log(`[AI] "${aiText}"`)
               fullText = aiText
               const cleanText = aiText.replace(/\[END_CALL\]/g, '').trim()
+              let ttsThrew = false // Fix (2026-08-30) — แยก "TTS throw จริง" ออกจาก "TTS จบปกติแต่คืน 0 chunks โดยไม่ error"
+                                    // (เคสหลังมีกลไก no-audio hand-off ของตัวเองอยู่แล้ว ไม่ใช่ dead-air bug ที่ต้องแก้)
               if (cleanText) {
                 try {
                   markOnce(turnMetrics, 't5')
@@ -1901,8 +1932,32 @@ function registerWebSocket(fastify) {
                   if (err.code !== 'ERR_CANCELED' && err.name !== 'CanceledError') {
                     console.error('[TTS error]', err.message)
                     healthMonitor.reportError('tts', err.message)
+                    ttsThrew = true
                   }
                 }
+              }
+
+              // Fix (2026-08-30) — เดิม fullText ถูกตั้งเป็น aiText ก่อนเข้า TTS loop (บรรทัดด้านบน) แล้วไม่เคยถูก
+              // แก้กลับเลยแม้ TTS จะพังก่อนส่งเสียงแม้แต่ byte เดียว (totalSent ยังเป็น 0) — ทำให้คำตอบที่ไม่เคย
+              // ถูกพูดออกไปเลยถูก push เข้า session.messages ว่า "ตอบไปแล้ว" (ดู tail ด้านล่าง) ลูกค้าได้ยินความเงียบ
+              // สนิท ไม่มี recovery phrase ต่างจากทุก path อื่นในระบบ (L2b ไม่เจอปัญหานี้เพราะ speakFixedText/
+              // synthesizeAndSend ใน chunkedTurn.js ไม่กลืน error แบบนี้ — exception หลุดไปให้ runAttemptWithWatchdog
+              // จัดการ precommit/postcommit ให้เองอยู่แล้ว) แก้เฉพาะ branch นี้ (CONTROL/L2a) ให้เข้า recovery-phrase
+              // path เดียวกับเคส "ตอบสำเร็จแต่ข้อความว่างเปล่า" ที่มีอยู่แล้วด้านบน — ต้องเช็ค ttsThrew===true เท่านั้น
+              // (ไม่ใช่แค่ totalSent===0 เฉยๆ) เพราะ totalSent===0 แบบไม่มี error เลย (TTS จบปกติแต่คืน 0 chunks) มี
+              // กลไก no-audio hand-off ของตัวเองอยู่แล้ว (tryDeliverPendingShortAck ผ่าน hasAudio===false ด้านล่าง)
+              // ไม่ใช่ dead-air bug ที่ต้องแก้ตรงนี้ — ถ้าเผลอครอบคลุมเคสนั้นด้วยจะไปแย่ง flow ของกลไกเดิมที่ถูกต้องอยู่แล้ว
+              if (aiText && cleanText && ttsThrew && totalSent === 0) {
+                console.error('[AI/TTS error] TTS failed before any audio sent — speaking recovery phrase (CONTROL/L2a)')
+                const recoveryResult = await speakFixedText({
+                  text: LEGACY_RECOVERY_PHRASE, signal, socket, streamSid,
+                  voiceId: currentSession.campaign.voice_id, turnMetrics, turnState, callState, generationId,
+                  startingSentCount: totalSent,
+                  onChunkAudioStart: (t) => noteActiveSpokenChunk(pipelineId, t),
+                })
+                totalSent += recoveryResult.sentCount
+                fullText = recoveryResult.sentCount > 0 ? LEGACY_RECOVERY_PHRASE : ''
+                if (legacyObserved) turnMetrics.legacyClaudeOutcome = 'ERROR'
               }
             }
 
@@ -2386,6 +2441,7 @@ function registerWebSocket(fastify) {
       if (msg.event === 'media' && sttStream) {
         // ส่งเสียงลูกค้าให้ STT เสมอ (รวมถึงตอน AI พูด เพื่อ barge-in detection)
         // Twilio PSTN handles echo cancellation — ไม่ต้องกังวลเสียง AI ย้อนกลับ
+        if (firstMediaFrameAt === null) firstMediaFrameAt = performance.now() // Track 6
         try {
           const audioData = Buffer.from(msg.media.payload, 'base64')
           sttStream.write(audioData)
@@ -2409,6 +2465,7 @@ function registerWebSocket(fastify) {
         }
 
         isSpeaking = false
+        firstMediaFrameAt = null // Track 6 — เริ่มนับรอบฟังใหม่จาก AI พูดจบจริง (mark ผ่าน owner-verification แล้ว ณ จุดนี้)
         lastMarkTime = Date.now()
         // Lightweight Post-Mark Echo Guard fix (Review Blocker 1) — promote only now that ownerId is verified
         // above to actually equal activePipelineId; pendingSpokenText was set with that same pipelineId at

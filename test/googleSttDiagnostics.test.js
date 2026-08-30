@@ -229,8 +229,10 @@ test('streamId/utteranceId เป็น monotonic ไม่ reuse ข้าม u
   assert.equal(calls[0].meta.streamId, 1)
   assert.equal(calls[0].meta.utteranceId, 1)
 
-  // rotateForNextUtterance() ต้องสลับไป prewarm stream (สร้างไว้แล้วตอน interim แรกของ utterance ก่อนหน้า)
-  assert.equal(stt.streams.length, 2, 'ต้องมี prewarm stream ถูกสร้างไว้ล่วงหน้าแล้วตอน interim แรก')
+  // rotateForNextUtterance() ต้องสลับไป prewarm stream (สร้างไว้แล้วตอน interim แรกของ utterance ก่อนหน้า) —
+  // Track 1 fix (2026-08-30): activatePrewarm() proactive re-prewarm ทันทีตอน promote จึงมี stream ที่สาม (ตัวใหม่
+  // ที่เพิ่งเติม) อยู่ด้วยแล้ว ไม่ใช่แค่สองตัวเหมือนเดิม
+  assert.equal(stt.streams.length, 3, 'ต้องมี prewarm stream ถูกสร้างไว้ล่วงหน้าแล้วตอน interim แรก แล้วเติม prewarm ใหม่ทันทีตอน rotate')
   const secondStream = stt.streams[1]
 
   stt.emitInterim(secondStream, 'สมาชิกใหม่ฝากขั้นต่ำเท่าไหร่')
@@ -288,7 +290,8 @@ test('coldMutePackets: stream ที่มาจาก prewarm (activatePrewarm)
   stt.emitInterim(first, 'เรียบร้อยดีครับ') // trigger สร้าง prewarm stream (streams[1]) ทันที
   await waitFor(() => calls.length === 1) // TIMER_FINAL fire แล้ว rotate ไปใช้ prewarm stream (streams[1]) เป็น currentStream
 
-  assert.equal(stt.streams.length, 2)
+  // Track 1 fix (2026-08-30): activatePrewarm() เติม prewarm ใหม่ (streams[2]) ทันทีตอน promote — เห็น 3 ไม่ใช่ 2
+  assert.equal(stt.streams.length, 3)
   // เขียนทันทีบน stream ที่สอง (มาจาก prewarm) — ต้องไม่ถูก mute เลยแม้จะเขียนทันทีก็ตาม
   handle.write(Buffer.from([1, 2, 3]))
   handle.write(Buffer.from([4, 5, 6]))

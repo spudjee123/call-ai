@@ -266,11 +266,21 @@ function transcribeStream(onTranscript, onInterim, { interimFinalizeMs = 900, ma
     eosRecovery = recovery
   }
 
+  // Proactive re-prewarm (fix, 2026-08-30) — เดิม nextStream ถูกเติมใหม่แบบ reactive เท่านั้น (จาก onInterim
+  // เมื่อมี interim จริงมาถึง) ทำให้มีช่วงเวลาสั้นๆ หลัง activatePrewarm() ทุกครั้งที่ nextStream เป็น null อยู่ —
+  // ถ้า recovery event (EOS-stuck/error/end/write-error) เกิดขึ้นพอดีในช่วงนั้น จะตกไปที่ createStream(false)
+  // (cold-mute 200ms) ทั้งที่ระบบตั้งใจ prefer prewarm อยู่แล้วทุกจุด (ดู .on('error')/.on('end')/write()/
+  // armEosRecovery ด้านล่าง — ทุกจุด "if (nextStream) activatePrewarm() else createStream(false)" เหมือนกันหมด)
+  // แก้โดยเติม nextStream ใหม่ทันทีที่ตัวเก่าถูกเลื่อนไปเป็น currentStream แทนที่จะรอ interim ครั้งถัดไป — ปิดช่องว่าง
+  // นี้เกือบทั้งหมดโดยไม่ต้องแก้ recovery path ทีละจุด (createStream(true) ไม่ตั้ง coldStreamMuteUntil อยู่แล้ว
+  // และ nextStream ถูก assign แบบ synchronous ในตัว createStream() เอง ทำให้ onInterim's `if (!nextStream...)`
+  // เห็นว่าเติมแล้วไม่สร้างซ้ำ)
   function activatePrewarm() {
     resetUtteranceState()
     currentStream = nextStream
     nextStream = null
     coldStreamMuteUntil = 0 // stream ที่ prewarm ไว้ฟังมาสักพักแล้ว ไม่ใช่ cold start ไม่ต้อง mute
+    if (!destroyed) createStream(true)
   }
 
   // C6c follow-up (production discovery 2026-08-19): singleUtterance:true ทำให้ Google หยุดฟังทันทีที่จับ
