@@ -13,7 +13,7 @@ const { runChunkedTurn, speakFixedText, createChunkedProducer, adoptChunkedProdu
 const { runAttemptWithWatchdog, bridgeAbort } = require('../utils/attemptWithWatchdog')
 const { isSpeculationMatch, classifyForAdoption } = require('../utils/chunkedSpeculation')
 const { createRolloutConfig } = require('../utils/rolloutConfig')
-const { CHUNK_REASON } = require('../utils/speechChunker')
+const { CHUNK_REASON, stripEndCallMarker, hasEndCallMarker } = require('../utils/speechChunker')
 const { performance } = require('perf_hooks')
 
 const MAX_CALL_DURATION_MS = (parseInt(process.env.MAX_CALL_DURATION_SECONDS) || 300) * 1000
@@ -268,8 +268,8 @@ async function runLegacyFallback({ session, signal, socket, streamSid, voiceId, 
   }
   if (!rawText || signal.aborted) return { fullText: '', endCallRequested: false, totalSent: 0 }
 
-  const legacyEndCallRequested = rawText.includes('[END_CALL]')
-  const spokenText = rawText.replace(/\[END_CALL\]/g, '').trim()
+  const legacyEndCallRequested = hasEndCallMarker(rawText)
+  const spokenText = stripEndCallMarker(rawText)
 
   if (!spokenText || !isCurrentGeneration(callState, generationId)) {
     return { fullText: spokenText, endCallRequested: legacyEndCallRequested, totalSent: 0 }
@@ -1908,7 +1908,7 @@ function registerWebSocket(fastify) {
             if (aiText && !signal.aborted && callActive && isSpeaking) {
               console.log(`[AI] "${aiText}"`)
               fullText = aiText
-              const cleanText = aiText.replace(/\[END_CALL\]/g, '').trim()
+              const cleanText = stripEndCallMarker(aiText)
               let ttsThrew = false // Fix (2026-08-30) — แยก "TTS throw จริง" ออกจาก "TTS จบปกติแต่คืน 0 chunks โดยไม่ error"
                                     // (เคสหลังมีกลไก no-audio hand-off ของตัวเองอยู่แล้ว ไม่ใช่ dead-air bug ที่ต้องแก้)
               if (cleanText) {
@@ -1961,10 +1961,10 @@ function registerWebSocket(fastify) {
               }
             }
 
-            if (fullText.includes('[END_CALL]') && shouldBlockEndCall(currentSession, fullText)) {
+            if (hasEndCallMarker(fullText) && shouldBlockEndCall(currentSession, fullText)) {
               console.log('[Guard] Premature END_CALL blocked — injecting follow-up question')
               const followUp = 'มีอะไรสอบถามเพิ่มเติมไหมคะ'
-              fullText = fullText.replace(/\[END_CALL\]/g, '').trim() + ' ' + followUp
+              fullText = stripEndCallMarker(fullText) + ' ' + followUp
               try {
                 markOnce(turnMetrics, 't5')
                 markTtsPending(turnState)
@@ -2066,7 +2066,7 @@ function registerWebSocket(fastify) {
             }
           }, playbackMs)
 
-          if (fullText.includes('[END_CALL]') || endCallRequested) {
+          if (hasEndCallMarker(fullText) || endCallRequested) {
             pendingEndCall = true
             currentSession.hangupReason = 'ai_ended'
             // Fallback: ปิดสายถ้า mark ไม่มาภายในเวลาที่คาดไว้

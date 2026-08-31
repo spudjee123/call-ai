@@ -66,6 +66,29 @@ async function getClient() {
   return sheets
 }
 
+// Schema guard (Hardening Batch, 2026-08-30) — audit finding: updateRowByKey/appendRowByFields already
+// silently skip any field whose name doesn't match a header (colIdx === -1 → no-op), so a renamed/missing
+// critical column doesn't throw — it just quietly stops reading/writing that field, with nothing in the
+// logs to say why. This only ADDS a warning log when a sheet's actual headers are missing a column this
+// codebase depends on elsewhere (id/status for Campaigns, phone/status for Contacts) — never blocks a
+// read/write, never changes what gets returned. Warned once per sheet per process (not every read — this
+// function runs on nearly every Sheets call) so it can't spam the logs.
+const CRITICAL_HEADERS = {
+  [SHEETS.CAMPAIGNS]: ['id', 'name', 'status'],
+  [SHEETS.CONTACTS]: ['phone', 'campaign', 'status'],
+}
+const schemaWarnedSheets = new Set()
+
+function warnMissingCriticalHeaders(sheetName, headers) {
+  const critical = CRITICAL_HEADERS[sheetName]
+  if (!critical || schemaWarnedSheets.has(sheetName)) return
+  schemaWarnedSheets.add(sheetName)
+  const missing = critical.filter(h => !headers.includes(h))
+  if (missing.length) {
+    console.error(`[SCHEMA_WARNING] Sheet "${sheetName}" ขาดคอลัมน์สำคัญ: ${missing.join(', ')} — field เหล่านี้จะอ่าน/เขียนไม่ได้เงียบๆ จนกว่าจะแก้หัวคอลัมน์`)
+  }
+}
+
 // ดึงข้อมูลดิบ (headers ที่ normalize แล้ว + rows แบบ array) เก็บ row index ไว้ใช้ update ทีหลัง
 async function getSheetData(sheetName) {
   const client = await getClient()
@@ -76,6 +99,7 @@ async function getSheetData(sheetName) {
   const values = res.data.values || []
   if (!values.length) return { headers: [], rows: [] }
   const headers = values[0].map(h => h.toLowerCase().trim().replace(/\s+/g, '_'))
+  warnMissingCriticalHeaders(sheetName, headers)
   return { headers, rows: values.slice(1) }
 }
 
@@ -530,4 +554,9 @@ const sheetsService = {
 
 // isRetryableSheetsError/withRetry exported แยกจาก sheetsService ตั้งใจ — ไม่ใช่ API ที่ route อื่นควรเรียกใช้ตรงๆ
 // export ไว้แค่ให้เทสยิง withRetry({baseDelayMs: เล็กๆ}) ได้ตรงๆ กันเทสช้าจากรอ backoff จริงหลักวินาที
-module.exports = { sheetsService, isRetryableSheetsError, withRetry }
+module.exports = {
+  sheetsService,
+  isRetryableSheetsError,
+  withRetry,
+  _resetSchemaWarningsForTest: () => schemaWarnedSheets.clear(),
+}

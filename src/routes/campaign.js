@@ -3,6 +3,26 @@ const { callQueue } = require('../utils/callQueue')
 const { isValidPhone, normalizePhone } = require('../utils/phone')
 const twilioService = require('../services/twilio')
 
+// Campaign field validation (Hardening Batch, 2026-08-30) — audit finding: PATCH/POST accepted any
+// llm_provider string as-is; a typo (e.g. 'gemni') silently falls back to Claude at the router
+// (resolveExplicitProvider in conversationAI.js returns null for anything it doesn't recognize) instead
+// of surfacing the mistake to whoever set it. Blank stays valid — it means "use the system default", not
+// an error. Only validates the one field this codebase actually branches on; does not attempt a full
+// column whitelist (updateRowByKey/appendRowByFields already silently ignore unknown field names, so
+// unrecognized keys are a no-op today, not a corruption risk).
+const VALID_LLM_PROVIDERS = new Set(['', 'claude', 'gemini'])
+function validateCampaignFields(fields) {
+  if (!fields || fields.llm_provider === undefined) return null // field ไม่ได้ถูกส่งมาเลย (เช่น PATCH แก้แค่ name) — ไม่ต้องตรวจ
+  const raw = fields.llm_provider
+  if (typeof raw !== 'string') {
+    return `llm_provider ต้องเป็นข้อความ (ค่าว่าง, 'claude', หรือ 'gemini') ไม่ใช่ ${typeof raw}`
+  }
+  if (!VALID_LLM_PROVIDERS.has(raw.trim().toLowerCase())) {
+    return `llm_provider ต้องเป็นค่าว่าง, 'claude', หรือ 'gemini' เท่านั้น (ได้รับ: '${raw}')`
+  }
+  return null
+}
+
 module.exports = async function campaignRoutes(fastify) {
 
   // รายชื่อ campaign ทั้งหมด (สำหรับ dropdown + ตาราง)
@@ -27,6 +47,9 @@ module.exports = async function campaignRoutes(fastify) {
     const { id, name } = req.body || {}
     if (!id || !name) return reply.code(400).send({ error: 'id and name required' })
 
+    const validationError = validateCampaignFields(req.body)
+    if (validationError) return reply.code(400).send({ error: validationError })
+
     const existing = await sheetsService.getCampaign(id)
     if (existing) return reply.code(409).send({ error: 'Campaign id already exists' })
 
@@ -45,6 +68,9 @@ module.exports = async function campaignRoutes(fastify) {
   fastify.patch('/api/campaigns/:id', async (req, reply) => {
     // ตัด id ออกจาก body เสมอ — กันแก้ primary key ผ่าน PATCH โดยไม่เช็ค unique (ต่างจาก POST ที่เช็คซ้ำก่อนสร้าง)
     const { id, ...updates } = req.body || {}
+    const validationError = validateCampaignFields(updates)
+    if (validationError) return reply.code(400).send({ error: validationError })
+
     const updated = await sheetsService.updateCampaign(req.params.id, updates)
     if (!updated) return reply.code(404).send({ error: 'Campaign not found' })
     return reply.send({ message: 'Campaign updated' })

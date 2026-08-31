@@ -1,6 +1,6 @@
 const { GoogleGenAI } = require('@google/genai')
 const { performance } = require('perf_hooks')
-const { findChunkBoundary, getNumericProtectionRemainingMs, evaluateNumericProtectionDiagnostic, CHUNK_REASON, SOFT_TIMEOUT_MS: CHUNKER_SOFT_TIMEOUT_MS } = require('../utils/speechChunker')
+const { findChunkBoundary, getNumericProtectionRemainingMs, evaluateNumericProtectionDiagnostic, CHUNK_REASON, SOFT_TIMEOUT_MS: CHUNKER_SOFT_TIMEOUT_MS, CONDITIONAL_GRACE_MS, stripEndCallMarker, hasEndCallMarker } = require('../utils/speechChunker')
 const { buildSystemPrompt, MAX_HISTORY } = require('./claude')
 
 // Dual Conversation Provider A/B (design locked) — Gemini side of the experiment. Deliberately a FULL
@@ -29,7 +29,7 @@ const { buildSystemPrompt, MAX_HISTORY } = require('./claude')
 // Google's server keeps generating and bills for the full completion regardless of our abort. This is an
 // inherent cost difference from Claude's abort behavior that no amount of correct wiring here can avoid —
 // flagged for the A/B cost analysis, not something this file can fix.
-const CONDITIONAL_GRACE_MS = 150
+// CONDITIONAL_GRACE_MS moved to speechChunker.js (Hardening Batch, 2026-08-30) — shared with claude.js.
 // Gemini Latency Root-Cause Test (2026-08-29) — temporarily gemini-3.6-flash instead of the design-locked
 // gemini-3.7-flash, testing whether 3.7's thinking floor (only low/medium/high, no true "off") is the cause
 // of the 6s+ time-to-first-token seen on every real production attempt so far. Revert to gemini-3.7-flash
@@ -343,14 +343,14 @@ async function* askGeminiConditionalStream(session, signal = null, onMilestone =
 
       // END_CALL contract — same marker convention as Claude (design lock: no Gemini function-calling for
       // END_CALL in this round, see file header).
-      const finalText = rawText.replace(/\[END_CALL\]/g, '').trim()
-      const endCallRequested = rawText.includes('[END_CALL]')
+      const finalText = stripEndCallMarker(rawText)
+      const endCallRequested = hasEndCallMarker(rawText)
       onMilestone?.('finalText', finalText)
       try { onMilestone?.('responseCharCount', finalText.length) } catch (_) { /* diagnostic only */ }
       onMilestone?.('endCallRequested', endCallRequested)
 
       if (mode === 'CHUNKED') {
-        const lastSpeechChunk = buffer.replace(/\[END_CALL\]/g, '').trim()
+        const lastSpeechChunk = stripEndCallMarker(buffer)
         if (lastSpeechChunk) push({ type: 'chunk', text: lastSpeechChunk })
       } else {
         mode = 'SINGLE_SHOT'

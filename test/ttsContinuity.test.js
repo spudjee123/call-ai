@@ -234,6 +234,96 @@ test('L1c2a incident hotfix: response.data อ่านไม่ได้ระ�
   assert.match(line, /"responseData":"unavailable"/)
 })
 
+// ── TTS retry-once on transient error (Hardening Batch, 2026-08-30) ──────────────────────────────────
+// MAX RETRY = 1, only for the connection-establishment phase (before any audio byte), only for
+// transient status/network codes, never for barge-in (ERR_CANCELED/CanceledError).
+
+test('TTS retry: 503 บน attempt แรก แล้วสำเร็จ attempt ที่ 2 → ได้ audio จริง ไม่ throw ไม่ log [TTSProviderError]', async () => {
+  let calls = 0
+  const err503 = new Error('Request failed with status code 503')
+  err503.response = { status: 503, statusText: 'Service Unavailable', data: streamOf(['{}']) }
+  state.axiosPostImpl = async () => {
+    calls++
+    if (calls === 1) throw err503
+    return { data: streamOf([Buffer.alloc(8)]) }
+  }
+
+  const { result: out, logs } = await withCapturedErrorLogs(async () =>
+    drain(synthesizeSpeechStream('สวัสดีค่ะ', 'voice1', null))
+  )
+
+  assert.equal(calls, 2, 'ต้องเรียก axios.post 2 ครั้ง (attempt แรก + retry 1 ครั้ง)')
+  assert.equal(logs.filter(l => l.includes('[TTSProviderError]')).length, 0, 'retry สำเร็จแล้วไม่ควร log ว่าเป็น provider error')
+  assert.ok(out.length >= 0)
+})
+
+test('TTS retry: 503 ทั้ง 2 attempt (เกิน budget) → throw error ล่าสุด และเรียกแค่ 2 ครั้งเท่านั้น (MAX RETRY = 1 ไม่ใช่ retry ไม่จำกัด)', async () => {
+  let calls = 0
+  const makeErr = () => { const e = new Error('Request failed with status code 503'); e.response = { status: 503, statusText: 'Service Unavailable', data: streamOf(['{}']) }; return e }
+  let lastErr = null
+  state.axiosPostImpl = async () => {
+    calls++
+    lastErr = makeErr()
+    throw lastErr
+  }
+
+  let caught = null
+  const { logs } = await withCapturedErrorLogs(async () => {
+    try { await drain(synthesizeSpeechStream('สวัสดีค่ะ', 'voice1', null)) } catch (e) { caught = e }
+  })
+
+  assert.equal(calls, 2, 'ต้อง retry แค่ 1 ครั้งพอดี ไม่ retry ไม่จำกัด')
+  assert.equal(caught, lastErr, 'ต้อง throw error ของความพยายามล่าสุด')
+  assert.equal(logs.filter(l => l.includes('[TTSProviderError]')).length, 1, 'พัง 2 ครั้งจริงต้อง log เป็น provider error ครั้งเดียวตอนสุดท้าย')
+})
+
+test('TTS retry: 400 (ไม่ใช่ transient) → ไม่ retry เลย เรียก axios.post แค่ครั้งเดียว', async () => {
+  let calls = 0
+  const err400 = new Error('Request failed with status code 400')
+  err400.response = { status: 400, statusText: 'Bad Request', data: streamOf(['{}']) }
+  state.axiosPostImpl = async () => { calls++; throw err400 }
+
+  let caught = null
+  await (async () => {
+    try { await drain(synthesizeSpeechStream('สวัสดีค่ะ', 'voice1', null)) } catch (e) { caught = e }
+  })()
+
+  assert.equal(calls, 1, '400 ไม่ใช่ transient error ต้องไม่ retry')
+  assert.equal(caught, err400)
+})
+
+test('TTS retry: network error ไม่มี response เลย (ECONNRESET) → ถือเป็น transient ด้วย ต้อง retry', async () => {
+  let calls = 0
+  state.axiosPostImpl = async () => {
+    calls++
+    if (calls === 1) { const e = new Error('socket hang up'); e.code = 'ECONNRESET'; throw e }
+    return { data: streamOf([Buffer.alloc(8)]) }
+  }
+
+  await drain(synthesizeSpeechStream('สวัสดีค่ะ', 'voice1', null))
+  assert.equal(calls, 2)
+})
+
+test('TTS retry: barge-in (signal aborted) ระหว่างสอง attempt → ไม่ retry แม้ error เป็น transient type', async () => {
+  const controller = new AbortController()
+  let calls = 0
+  state.axiosPostImpl = async () => {
+    calls++
+    const e = new Error('Request failed with status code 503')
+    e.response = { status: 503, statusText: 'Service Unavailable', data: streamOf(['{}']) }
+    controller.abort() // ลูกค้าพูดแทรกพอดีตอน attempt แรกกำลังพัง
+    throw e
+  }
+
+  let caught = null
+  await (async () => {
+    try { await drain(synthesizeSpeechStream('สวัสดีค่ะ', 'voice1', controller.signal)) } catch (e) { caught = e }
+  })()
+
+  assert.equal(calls, 1, 'signal aborted แล้วต้องไม่ retry แม้ error จะเป็น transient type ก็ตาม')
+  assert.equal(caught.response.status, 503)
+})
+
 test('L1c2a incident hotfix: response.data stream ค้างกลางทาง (ไม่มี data/error/end event มาเพิ่มเลย ไม่ถึง byte cap ด้วย) → ต้อง bounded ด้วย wall-clock timeout ไม่ใช่แค่ byte cap ไม่งั้น throw err ตัวเดิมจะค้างไม่จำกัดเวลาไปด้วย', async () => {
   const originalErr = new Error('Request failed with status code 400')
   originalErr.response = {

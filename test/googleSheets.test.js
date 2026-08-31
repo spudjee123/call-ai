@@ -35,9 +35,12 @@ require.cache[googleapisPath] = {
   exports: { google: { auth: { GoogleAuth: function () {} }, sheets: () => fakeClient } },
 }
 
-const { sheetsService, isRetryableSheetsError, withRetry } = require('../src/services/googleSheets')
+const { sheetsService, isRetryableSheetsError, withRetry, _resetSchemaWarningsForTest } = require('../src/services/googleSheets')
 
-beforeEach(() => { state.data = {}; state.calls = []; state.throwOnRange = new Set(); state.failGetNTimes = 0 })
+beforeEach(() => {
+  state.data = {}; state.calls = []; state.throwOnRange = new Set(); state.failGetNTimes = 0
+  _resetSchemaWarningsForTest()
+})
 
 function lastCall(method) {
   return [...state.calls].reverse().find(c => c.method === method)
@@ -48,6 +51,36 @@ test('appendRowByFields วางค่าตามตำแหน่ง column 
   await sheetsService.addContact({ phone: '0812345678', name: 'ทดสอบ', campaign: 'camp1' })
   const call = lastCall('append')
   assert.deepEqual(call.requestBody.values[0], ['pending', 'camp1', 'ทดสอบ', '0812345678'])
+})
+
+test('Schema guard: Contacts ชีตขาดคอลัมน์สำคัญ (status) ต้อง log [SCHEMA_WARNING] หนึ่งครั้ง ไม่ throw ไม่กระทบผลลัพธ์', async () => {
+  state.data['Contacts'] = [['Phone', 'Name', 'Campaign']] // ขาด "Status" ไปเลย
+  const originalError = console.error
+  const logs = []
+  console.error = (...args) => logs.push(args.join(' '))
+  try {
+    await sheetsService.getContacts()
+    await sheetsService.getContacts() // เรียกซ้ำ — ต้อง warn แค่ครั้งเดียวต่อ process ไม่ spam log
+  } finally {
+    console.error = originalError
+  }
+  const warnings = logs.filter(l => l.includes('[SCHEMA_WARNING]'))
+  assert.equal(warnings.length, 1)
+  assert.match(warnings[0], /Contacts/)
+  assert.match(warnings[0], /status/)
+})
+
+test('Schema guard: ชีตที่มีคอลัมน์สำคัญครบ ต้องไม่ log warning ใดๆ', async () => {
+  state.data['Campaigns'] = [['Id', 'Name', 'Status']]
+  const originalError = console.error
+  const logs = []
+  console.error = (...args) => logs.push(args.join(' '))
+  try {
+    await sheetsService.getCampaigns()
+  } finally {
+    console.error = originalError
+  }
+  assert.equal(logs.filter(l => l.includes('[SCHEMA_WARNING]')).length, 0)
 })
 
 test('getRows normalize header เป็น lowercase + underscore และเติม field ที่ขาด/แถวสั้นกว่า header เป็นค่าว่าง', async () => {

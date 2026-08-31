@@ -4,6 +4,7 @@ const { sheetsService } = require('../services/googleSheets')
 const { resolveExplicitProvider } = require('../services/conversationAI')
 const callSessions = require('../utils/callSessions')
 const { synthesizeSpeechWavThai } = require('../services/googleTTS')
+const { twilioSignatureGuard } = require('../utils/twilioSignature')
 
 // เริ่มบันทึกเสียงทั้งสาย (สองแชนแนลแยก AI/ลูกค้า) แบบขนานกับ media stream — ไม่บล็อก TwiML ที่เหลือ
 function addRecording(twiml) {
@@ -44,7 +45,7 @@ function getInboundFallbackWav() {
 module.exports = async function webhookRoutes(fastify) {
 
   // Twilio โทรออกแล้วลูกค้ารับสาย
-  fastify.post('/webhook/outbound', async (req, reply) => {
+  fastify.post('/webhook/outbound', { preHandler: twilioSignatureGuard }, async (req, reply) => {
     const callSid = req.body.CallSid
     const to = req.body.To
     const session = callSessions.get(callSid)
@@ -62,7 +63,7 @@ module.exports = async function webhookRoutes(fastify) {
   })
 
   // Twilio รับสายเข้า
-  fastify.post('/webhook/inbound', async (req, reply) => {
+  fastify.post('/webhook/inbound', { preHandler: twilioSignatureGuard }, async (req, reply) => {
     const callSid = req.body.CallSid
     const from = req.body.From
     const to = req.body.To
@@ -113,7 +114,7 @@ module.exports = async function webhookRoutes(fastify) {
 
   // Twilio แจ้งว่าไฟล์บันทึกเสียงพร้อมแล้ว — ผูกกับแถวผลการโทรผ่าน call_sid
   // (มักมาถึงหลัง webhook/status สักพัก เพราะ Twilio ต้อง process ไฟล์เสียงก่อน)
-  fastify.post('/webhook/recording', async (req, reply) => {
+  fastify.post('/webhook/recording', { preHandler: twilioSignatureGuard }, async (req, reply) => {
     const { CallSid, RecordingUrl, RecordingStatus } = req.body
     if (RecordingStatus === 'completed' && CallSid && RecordingUrl) {
       // ไม่ await — ตอบ Twilio กลับทันที ไม่ให้ต้องรอ retry (อาจกินเวลาหลายสิบวินาที) ก่อน Twilio จะได้ 200
@@ -123,7 +124,7 @@ module.exports = async function webhookRoutes(fastify) {
   })
 
   // Twilio แจ้งสถานะสาย (วางสาย, ไม่รับ ฯลฯ)
-  fastify.post('/webhook/status', async (req, reply) => {
+  fastify.post('/webhook/status', { preHandler: twilioSignatureGuard }, async (req, reply) => {
     const { CallSid, CallStatus, CallDuration } = req.body
     const session = callSessions.get(CallSid)
 

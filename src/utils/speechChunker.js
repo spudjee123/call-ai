@@ -172,4 +172,32 @@ function getNumericProtectionRemainingMs(buffer, elapsedMs) {
   return HARD_MAX_MS - elapsedMs
 }
 
-module.exports = { findChunkBoundary, getNumericProtectionRemainingMs, evaluateNumericProtectionDiagnostic, CHUNK_REASON, SOFT_TIMEOUT_MS }
+// Shared conversation constants (Hardening Batch, 2026-08-30) — CONDITIONAL_GRACE_MS was previously
+// declared identically (150) in both claude.js and gemini.js, a duplication risk this file's own header
+// comment already called this the shared home for ("CONDITIONAL_GRACE_MS race... reuses the SAME shared
+// speechChunker.js utilities"). Extracted here so a future change to the race window can't accidentally
+// update one provider and not the other.
+const CONDITIONAL_GRACE_MS = 150
+
+// END_CALL marker helpers (Hardening Batch, 2026-08-30) — the exact same
+// `.replace(/\[END_CALL\]/g, '').trim()` / `.includes('[END_CALL]')` pair was duplicated across
+// claude.js, gemini.js, and audioStream.js. Centralized here (same file already shared by both
+// providers) so the marker convention has exactly one definition — no behavior change, same regex.
+function stripEndCallMarker(text) {
+  return (text || '').replace(/\[END_CALL\]/g, '').trim()
+}
+
+function hasEndCallMarker(text) {
+  return (text || '').includes('[END_CALL]')
+}
+
+module.exports = {
+  findChunkBoundary,
+  getNumericProtectionRemainingMs,
+  evaluateNumericProtectionDiagnostic,
+  CHUNK_REASON,
+  SOFT_TIMEOUT_MS,
+  CONDITIONAL_GRACE_MS,
+  stripEndCallMarker,
+  hasEndCallMarker,
+}

@@ -70,6 +70,24 @@ async function readErrorResponseBody(err) {
   try { return JSON.stringify(data).slice(0, MAX_ERROR_BODY_BYTES) } catch { return null }
 }
 
+// TTS retry-once (Hardening Batch, 2026-08-30) — only covers the CONNECTION-ESTABLISHMENT phase (the
+// initial axios.post() before any audio byte has streamed back), never a failure mid-stream after chunks
+// have already been yielded — retrying there would mean re-synthesizing from the start while the caller
+// may have already sent earlier chunks to Twilio, producing duplicated/garbled audio. This mirrors the
+// same precommit/postcommit boundary already used throughout audioStream.js (totalSent === 0): a retry
+// here only ever happens before the caller could have committed anything. MAX RETRY = 1 — a realtime call
+// can't afford more; barge-in (ERR_CANCELED/CanceledError) is never retried, only genuinely transient
+// provider/network failures are.
+const TTS_RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504])
+const TTS_RETRYABLE_CODES = new Set(['ECONNRESET', 'ETIMEDOUT', 'ECONNABORTED', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN'])
+
+function isTransientTtsError(err) {
+  if (err.code === 'ERR_CANCELED' || err.name === 'CanceledError') return false
+  const status = err.response?.status
+  if (status != null) return TTS_RETRYABLE_STATUS.has(status)
+  return TTS_RETRYABLE_CODES.has(err.code)
+}
+
 // ไม่เคย throw จาก path นี้เอง (ห้าม logging ทำให้ error path ของ caller พังซ้ำ) และไม่เคยสร้าง error ใหม่ — แค่
 // log แล้วให้ caller เป็นคน rethrow err ตัวเดิมเป๊ะ เพราะ upstream (chunkedTurn.js/audioStream.js) ใช้ err.source/
 // error object เดิมในการจัดหมวด fallback อยู่แล้ว ห้าม log headers/api key หรือ axios config ทั้งก้อนเด็ดขาด
@@ -175,32 +193,40 @@ async function* synthesizeSpeechStream(text, voiceId, signal, previousText) {
   if (previousText) body.previous_text = previousText
 
   let response
-  try {
-    response = await axios.post(
-      `${BASE_URL}/text-to-speech/${voiceId}/stream?output_format=${OUTPUT_FORMAT}`,
-      body,
-      {
-        headers: {
-          'xi-api-key': API_KEY,
-          'Content-Type': 'application/json',
-        },
-        responseType: 'stream',
-        signal,  // AbortController signal สำหรับ barge-in
+  let attempt = 0
+  const requestUrl = `${BASE_URL}/text-to-speech/${voiceId}/stream?output_format=${OUTPUT_FORMAT}`
+  const requestOptions = {
+    headers: {
+      'xi-api-key': API_KEY,
+      'Content-Type': 'application/json',
+    },
+    responseType: 'stream',
+    signal,  // AbortController signal สำหรับ barge-in
+  }
+  for (;;) {
+    attempt++
+    try {
+      response = await axios.post(requestUrl, body, requestOptions)
+      break
+    } catch (err) {
+      const canRetry = attempt === 1 && !signal?.aborted && isTransientTtsError(err)
+      if (canRetry) {
+        console.warn(`[ElevenLabs Stream] transient error (${err.response?.status || err.code}) ก่อนได้เสียงสักไบต์ — retry อีก 1 ครั้ง`)
+        continue
       }
-    )
-  } catch (err) {
-    // barge-in ที่ยกเลิก request กลางทางไม่ใช่ provider error จริง — ไม่ log เป็น [TTSProviderError] (จะกลาย
-    // เป็น log noise มหาศาลเพราะ barge-in เกิดเป็นปกติทุกสาย) ใช้ convention เดียวกับที่อื่นในโค้ดฐาน (audioStream.js)
-    // ที่กัน ERR_CANCELED/CanceledError ไว้แล้วก่อน log เป็น error จริง
-    if (err.code !== 'ERR_CANCELED' && err.name !== 'CanceledError') {
-      await logElevenLabsProviderError(err, {
-        modelId: 'eleven_v3',
-        hasPreviousText: Boolean(previousText),
-        textLength: text?.length ?? 0,
-        previousTextLength: previousText?.length ?? 0,
-      })
+      // barge-in ที่ยกเลิก request กลางทางไม่ใช่ provider error จริง — ไม่ log เป็น [TTSProviderError] (จะกลาย
+      // เป็น log noise มหาศาลเพราะ barge-in เกิดเป็นปกติทุกสาย) ใช้ convention เดียวกับที่อื่นในโค้ดฐาน (audioStream.js)
+      // ที่กัน ERR_CANCELED/CanceledError ไว้แล้วก่อน log เป็น error จริง
+      if (err.code !== 'ERR_CANCELED' && err.name !== 'CanceledError') {
+        await logElevenLabsProviderError(err, {
+          modelId: 'eleven_v3',
+          hasPreviousText: Boolean(previousText),
+          textLength: text?.length ?? 0,
+          previousTextLength: previousText?.length ?? 0,
+        })
+      }
+      throw err
     }
-    throw err
   }
 
   let pcmBuffer = Buffer.alloc(0)   // incomplete 4-byte PCM frames

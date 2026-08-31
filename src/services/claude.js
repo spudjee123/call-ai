@@ -1,6 +1,6 @@
 const Anthropic = require('@anthropic-ai/sdk')
 const { performance } = require('perf_hooks')
-const { findChunkBoundary, getNumericProtectionRemainingMs, evaluateNumericProtectionDiagnostic, CHUNK_REASON, SOFT_TIMEOUT_MS: CHUNKER_SOFT_TIMEOUT_MS } = require('../utils/speechChunker')
+const { findChunkBoundary, getNumericProtectionRemainingMs, evaluateNumericProtectionDiagnostic, CHUNK_REASON, SOFT_TIMEOUT_MS: CHUNKER_SOFT_TIMEOUT_MS, CONDITIONAL_GRACE_MS, stripEndCallMarker, hasEndCallMarker } = require('../utils/speechChunker')
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
 
@@ -455,7 +455,8 @@ async function* askClaudeObservedFullResponse(session, signal = null, onMileston
 // as independent ElevenLabs requests with no previous_text threading, same as the current L1b chunked path
 // (ENABLE_PREVIOUS_TEXT_CONTINUITY is hardcoded false in chunkedTurn.js after a production 400 incident) —
 // L2b prototype inherits that same known prosody-seam risk, does not attempt to fix or worsen it.
-const CONDITIONAL_GRACE_MS = 150
+// CONDITIONAL_GRACE_MS moved to speechChunker.js (Hardening Batch, 2026-08-30) — shared with gemini.js,
+// see that file's comment.
 
 async function* askClaudeConditionalStream(session, signal = null, onMilestone = null) {
   const { name, campaign, messages } = session
@@ -853,8 +854,8 @@ async function* askClaudeConditionalStream(session, signal = null, onMilestone =
       // yielded speech chunks (CHUNKED mode's chunks have already been marker-stripped independently per
       // chunk, so concatenating them is not guaranteed to equal the canonical text byte-for-byte, and must
       // never be relied on as if it were).
-      const finalText = rawText.replace(/\[END_CALL\]/g, '').trim()
-      const endCallRequested = rawText.includes('[END_CALL]')
+      const finalText = stripEndCallMarker(rawText)
+      const endCallRequested = hasEndCallMarker(rawText)
       onMilestone?.('finalText', finalText)
       // Track L — Claude's own canonical response length, captured here (before audioStream.js can ever
       // substitute a recovery phrase or append an END_CALL follow-up) so it reflects what the model actually
@@ -863,7 +864,7 @@ async function* askClaudeConditionalStream(session, signal = null, onMilestone =
       onMilestone?.('endCallRequested', endCallRequested)
 
       if (mode === 'CHUNKED') {
-        const lastSpeechChunk = buffer.replace(/\[END_CALL\]/g, '').trim()
+        const lastSpeechChunk = stripEndCallMarker(buffer)
         if (lastSpeechChunk) push({ type: 'chunk', text: lastSpeechChunk })
       } else {
         mode = 'SINGLE_SHOT'

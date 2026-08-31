@@ -3,7 +3,7 @@ const assert = require('node:assert/strict')
 const Fastify = require('fastify')
 
 // stub googleSheets ก่อน require route — กันยิง Sheets API จริงและคุมข้อมูลทดสอบเองได้
-const state = { campaigns: {}, contactsByCampaign: {}, pendingByCampaign: {}, twilioNumbers: [], updates: [], deleted: [], queued: [], numberUpdates: [] }
+const state = { campaigns: {}, contactsByCampaign: {}, pendingByCampaign: {}, twilioNumbers: [], updates: [], deleted: [], queued: [], numberUpdates: [], added: [], campaignUpdates: [] }
 
 const googleSheetsPath = require.resolve('../src/services/googleSheets')
 require.cache[googleSheetsPath] = {
@@ -13,6 +13,8 @@ require.cache[googleSheetsPath] = {
       getContacts: async ({ campaignId } = {}) => state.contactsByCampaign[campaignId] || [],
       getPendingContacts: async (campaignId) => state.pendingByCampaign[campaignId] || [],
       getCampaign: async (id) => state.campaigns[id] || null,
+      addCampaign: async (fields) => { state.added.push(fields) },
+      updateCampaign: async (id, updates) => { state.campaignUpdates.push({ id, updates }); return true },
       updateContact: async (phone, updates) => { state.updates.push({ phone, updates }); return true },
       deleteCampaign: async (id) => { state.deleted.push(id); return true },
       getTwilioNumberForCampaign: async (campaignId) => state.twilioNumbers.find(n => n.campaign_id === campaignId) || null,
@@ -61,6 +63,45 @@ beforeEach(() => {
   state.deleted = []
   state.queued = []
   state.numberUpdates = []
+  state.added = []
+  state.campaignUpdates = []
+})
+
+test('POST /api/campaigns: llm_provider ผิด (พิมพ์ผิด) ต้องปฏิเสธ 400 ไม่เขียนลง Sheet แบบเงียบๆ', async () => {
+  const app = await buildApp()
+  const res = await app.inject({ method: 'POST', url: '/api/campaigns', payload: { id: 'new1', name: 'ทดสอบ', llm_provider: 'gemni' } })
+  assert.equal(res.statusCode, 400)
+  assert.equal(state.added.length, 0)
+})
+
+test('POST /api/campaigns: llm_provider ว่างเปล่าหรือค่าที่ถูกต้อง (claude/gemini) ต้องผ่าน', async () => {
+  const app = await buildApp()
+  const res1 = await app.inject({ method: 'POST', url: '/api/campaigns', payload: { id: 'new1', name: 'ทดสอบ' } })
+  assert.equal(res1.statusCode, 200)
+  const res2 = await app.inject({ method: 'POST', url: '/api/campaigns', payload: { id: 'new2', name: 'ทดสอบ2', llm_provider: 'Gemini' } })
+  assert.equal(res2.statusCode, 200)
+  assert.equal(state.added.length, 2)
+})
+
+test('PATCH /api/campaigns/:id: llm_provider ผิด ต้องปฏิเสธ 400 ไม่แตะ Sheet เลย', async () => {
+  const app = await buildApp()
+  const res = await app.inject({ method: 'PATCH', url: '/api/campaigns/camp1', payload: { llm_provider: 'chatgpt' } })
+  assert.equal(res.statusCode, 400)
+  assert.equal(state.campaignUpdates.length, 0)
+})
+
+test('PATCH /api/campaigns/:id: llm_provider เป็น null (ไม่ใช่ string) ต้องปฏิเสธ 400 เช่นกัน ไม่ใช่หลุดผ่านไปเงียบๆ (Review Gate finding)', async () => {
+  const app = await buildApp()
+  const res = await app.inject({ method: 'PATCH', url: '/api/campaigns/camp1', payload: { llm_provider: null } })
+  assert.equal(res.statusCode, 400)
+  assert.equal(state.campaignUpdates.length, 0)
+})
+
+test('PATCH /api/campaigns/:id: field อื่นที่ไม่เกี่ยวกับ llm_provider ยังแก้ได้ปกติ', async () => {
+  const app = await buildApp()
+  const res = await app.inject({ method: 'PATCH', url: '/api/campaigns/camp1', payload: { name: 'ชื่อใหม่' } })
+  assert.equal(res.statusCode, 200)
+  assert.deepEqual(state.campaignUpdates, [{ id: 'camp1', updates: { name: 'ชื่อใหม่' } }])
 })
 
 test('DELETE campaign: เบอร์สถานะ retry_pending (รอโทรซ้ำ) ต้องถูกนับเป็น "ยังไม่เสร็จ" เหมือนเบอร์ pending — ไม่ใช่แค่ pending เฉยๆ', async () => {
