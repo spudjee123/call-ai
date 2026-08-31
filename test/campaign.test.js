@@ -3,7 +3,7 @@ const assert = require('node:assert/strict')
 const Fastify = require('fastify')
 
 // stub googleSheets ก่อน require route — กันยิง Sheets API จริงและคุมข้อมูลทดสอบเองได้
-const state = { campaigns: {}, contactsByCampaign: {}, pendingByCampaign: {}, twilioNumbers: [], updates: [], deleted: [], queued: [], numberUpdates: [], added: [], campaignUpdates: [] }
+const state = { campaigns: {}, contactsByCampaign: {}, pendingByCampaign: {}, twilioNumbers: [], updates: [], deleted: [], queued: [], numberUpdates: [], added: [], campaignUpdates: [], sttColumnExists: true }
 
 const googleSheetsPath = require.resolve('../src/services/googleSheets')
 require.cache[googleSheetsPath] = {
@@ -15,6 +15,7 @@ require.cache[googleSheetsPath] = {
       getCampaign: async (id) => state.campaigns[id] || null,
       addCampaign: async (fields) => { state.added.push(fields) },
       updateCampaign: async (id, updates) => { state.campaignUpdates.push({ id, updates }); return true },
+      hasCampaignColumn: async (columnName) => columnName === 'stt_provider' ? state.sttColumnExists : true,
       updateContact: async (phone, updates) => { state.updates.push({ phone, updates }); return true },
       deleteCampaign: async (id) => { state.deleted.push(id); return true },
       getTwilioNumberForCampaign: async (campaignId) => state.twilioNumbers.find(n => n.campaign_id === campaignId) || null,
@@ -65,6 +66,7 @@ beforeEach(() => {
   state.numberUpdates = []
   state.added = []
   state.campaignUpdates = []
+  state.sttColumnExists = true
 })
 
 test('POST /api/campaigns: llm_provider ผิด (พิมพ์ผิด) ต้องปฏิเสธ 400 ไม่เขียนลง Sheet แบบเงียบๆ', async () => {
@@ -102,6 +104,73 @@ test('PATCH /api/campaigns/:id: field อื่นที่ไม่เกี่
   const res = await app.inject({ method: 'PATCH', url: '/api/campaigns/camp1', payload: { name: 'ชื่อใหม่' } })
   assert.equal(res.statusCode, 200)
   assert.deepEqual(state.campaignUpdates, [{ id: 'camp1', updates: { name: 'ชื่อใหม่' } }])
+})
+
+// ===== Dual STT Provider (design frozen 2026-08-31) — mirrors llm_provider validation tests exactly,
+// plus the Lock-3 active schema check that llm_provider doesn't need (llm_provider's column already
+// exists in every real installation; stt_provider is a brand-new optional column) =====
+
+test('POST /api/campaigns: stt_provider ผิด (พิมพ์ผิด) ต้องปฏิเสธ 400 ไม่เขียนลง Sheet แบบเงียบๆ', async () => {
+  const app = await buildApp()
+  const res = await app.inject({ method: 'POST', url: '/api/campaigns', payload: { id: 'new1', name: 'ทดสอบ', stt_provider: 'deepgrm' } })
+  assert.equal(res.statusCode, 400)
+  assert.equal(state.added.length, 0)
+})
+
+test('POST /api/campaigns: stt_provider ว่างเปล่าหรือค่าที่ถูกต้อง (google/deepgram) ต้องผ่าน', async () => {
+  const app = await buildApp()
+  const res1 = await app.inject({ method: 'POST', url: '/api/campaigns', payload: { id: 'new1', name: 'ทดสอบ' } })
+  assert.equal(res1.statusCode, 200)
+  const res2 = await app.inject({ method: 'POST', url: '/api/campaigns', payload: { id: 'new2', name: 'ทดสอบ2', stt_provider: 'Deepgram' } })
+  assert.equal(res2.statusCode, 200)
+  assert.equal(state.added.length, 2)
+})
+
+test('PATCH /api/campaigns/:id: stt_provider ผิด ต้องปฏิเสธ 400 ไม่แตะ Sheet เลย', async () => {
+  const app = await buildApp()
+  const res = await app.inject({ method: 'PATCH', url: '/api/campaigns/camp1', payload: { stt_provider: 'whisper' } })
+  assert.equal(res.statusCode, 400)
+  assert.equal(state.campaignUpdates.length, 0)
+})
+
+test('PATCH /api/campaigns/:id: stt_provider เป็น null (ไม่ใช่ string) ต้องปฏิเสธ 400', async () => {
+  const app = await buildApp()
+  const res = await app.inject({ method: 'PATCH', url: '/api/campaigns/camp1', payload: { stt_provider: null } })
+  assert.equal(res.statusCode, 400)
+  assert.equal(state.campaignUpdates.length, 0)
+})
+
+test('Lock 3 — POST /api/campaigns: stt_provider=deepgram แต่ Sheet ยังไม่มีคอลัมน์ stt_provider ต้องปฏิเสธ 400 พร้อมข้อความบอกวิธีแก้ ไม่บันทึกแบบครึ่งๆ กลางๆ', async () => {
+  state.sttColumnExists = false
+  const app = await buildApp()
+  const res = await app.inject({ method: 'POST', url: '/api/campaigns', payload: { id: 'new1', name: 'ทดสอบ', stt_provider: 'deepgram' } })
+  assert.equal(res.statusCode, 400)
+  assert.match(res.json().error, /stt_provider/)
+  assert.match(res.json().error, /คอลัมน์/)
+  assert.equal(state.added.length, 0, 'ห้ามบันทึกลง Sheet เลยถ้าคอลัมน์ยังไม่มี')
+})
+
+test('Lock 3 — PATCH /api/campaigns/:id: stt_provider=google แต่ Sheet ยังไม่มีคอลัมน์ ต้องปฏิเสธ 400 เช่นกัน (ไม่ใช่แค่ deepgram)', async () => {
+  state.sttColumnExists = false
+  const app = await buildApp()
+  const res = await app.inject({ method: 'PATCH', url: '/api/campaigns/camp1', payload: { stt_provider: 'google' } })
+  assert.equal(res.statusCode, 400)
+  assert.equal(state.campaignUpdates.length, 0)
+})
+
+test('Lock 3 — stt_provider ว่างเปล่า (blank) ต้องผ่านได้เสมอแม้คอลัมน์ยังไม่มีในชีต (blank ไม่แตะคอลัมน์เลย)', async () => {
+  state.sttColumnExists = false
+  const app = await buildApp()
+  const res = await app.inject({ method: 'PATCH', url: '/api/campaigns/camp1', payload: { stt_provider: '', name: 'ชื่อใหม่' } })
+  assert.equal(res.statusCode, 200)
+  assert.equal(state.campaignUpdates.length, 1)
+})
+
+test('Lock 3 — field อื่นที่ไม่เกี่ยวกับ stt_provider ยังแก้ได้ปกติแม้คอลัมน์ stt_provider ยังไม่มีในชีต', async () => {
+  state.sttColumnExists = false
+  const app = await buildApp()
+  const res = await app.inject({ method: 'PATCH', url: '/api/campaigns/camp1', payload: { name: 'ชื่อใหม่' } })
+  assert.equal(res.statusCode, 200)
 })
 
 test('DELETE campaign: เบอร์สถานะ retry_pending (รอโทรซ้ำ) ต้องถูกนับเป็น "ยังไม่เสร็จ" เหมือนเบอร์ pending — ไม่ใช่แค่ pending เฉยๆ', async () => {

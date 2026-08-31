@@ -143,6 +143,19 @@ function createTurnMetrics({
     // explicitly rejects forcing them into one shared field pair. l2bCacheCreationTokens/l2bCacheReadTokens
     // above remain the Claude-only record of that; a Gemini-specific cache metric, if ever added, gets its
     // own gemini*-prefixed field instead of being pooled with Claude's under a fake-generic name.
+
+    // Track 2 (Gemini Lifecycle Diagnostics, Implementation Gate 2026-08-31, RCA revision 3 locked spec) —
+    // diagnostic-only, additive fields that exist ONLY to stop t3=null from collapsing several genuinely
+    // different sub-cases into one signal (RCA Part 8, Hypothesis A): (a) generateContentStream() itself
+    // never resolving, (b) stream created but no raw chunk ever arrives, (c) raw chunks arrive but never
+    // carry text. geminiRequestAt/geminiFirstTextAt are deliberately NOT duplicated here — they are the
+    // exact same instants the existing legacyEarlyTtsRequestAt/t3 milestones already capture for Gemini
+    // turns; only the two NEW observation points get new fields. Always null for Claude turns (never
+    // fabricated) and null for Gemini turns where that point was never reached.
+    geminiStreamCreatedAt: null, // performance.now() marked ONLY immediately after `await generateContentStream()` resolves — never marked before or during that await, so this stays null for the whole turn if the await itself is what's hanging (distinguishes "await never resolves" from "stream created fast, no chunk after")
+    geminiFirstRawChunkAt: null, // first raw item observed from the SDK's async iterator, regardless of whether it carries a text field — distinguishes "iterator truly silent" from "iterator moving but no text yet"
+    activeGeminiAttemptCountAtStart: null, // LOCAL-only count of OTHER Gemini attempts already in flight for this callSid the instant this attempt started (0 = no overlap observed client-side). Proves LOCAL/client-side overlap only — @google/genai's abortSignal is documented as "client-only... will not cancel the request in the service", so this can NEVER be evidence of whether Google's server is still processing an earlier aborted request. UPSTREAM overlap is a separate, unproven hypothesis that only a controlled experiment (Track 3, Test C vs D) can support.
+    geminiSignalAbortedAt: null, // performance.now() the first instant childSignal.aborted was observed true inside the Gemini driver, if it ever was during this attempt
   }
 }
 
@@ -185,6 +198,10 @@ function computeDerivedMetrics(metrics) {
     llmTTFTMs: metrics.llmProvider ? duration(metrics.legacyEarlyTtsRequestAt, metrics.legacyEarlyTtsFirstDeltaAt) : null,
     llmFirstSafeMs: metrics.llmProvider ? duration(metrics.legacyEarlyTtsRequestAt, metrics.legacyEarlyTtsFirstSafeAt) : null,
     llmFullCompletionMs: metrics.llmProvider ? duration(metrics.legacyEarlyTtsRequestAt, metrics.legacyEarlyTtsFullAt) : null,
+    // Track 2 — null for every Claude turn (fields never populated) and null for a Gemini turn that never
+    // reached that point (e.g. streamCreateMs stays null if the await itself never resolved before abort/error).
+    geminiStreamCreateMs: duration(metrics.legacyEarlyTtsRequestAt, metrics.geminiStreamCreatedAt),
+    geminiFirstRawChunkMs: duration(metrics.legacyEarlyTtsRequestAt, metrics.geminiFirstRawChunkAt),
   }
 }
 

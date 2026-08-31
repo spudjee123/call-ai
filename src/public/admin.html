@@ -1286,8 +1286,16 @@ function campaignEditPanelHtml(c, isNew){
             <option value="gemini" ${c.llm_provider==='gemini'?'selected':''}>Gemini 3.7 Flash — Low</option>
           </select>
         </div>
+        <div class="field">
+          <label>Speech-to-Text</label>
+          <select id="cf_stt_provider">
+            <option value="" ${!c.stt_provider?'selected':''}>Default — Google Production</option>
+            <option value="google" ${c.stt_provider==='google'?'selected':''}>Google Speech-to-Text</option>
+            <option value="deepgram" ${c.stt_provider==='deepgram'?'selected':''}>Deepgram Nova-3</option>
+          </select>
+        </div>
       </div>
-      <p style="font-size:12px; color:var(--text-3); margin:-10px 0 16px">เบอร์ Twilio ที่ใช้โทรออก/รับสายของ campaign นี้ ตั้งได้จากหน้า <a href="#/numbers" onclick="go('numbers')" style="color:inherit; text-decoration:underline">จัดการเบอร์</a> — "Default" ใช้ routing เดิมของระบบ ส่วน Claude/Gemini คือบังคับ A/B ทดสอบ provider นั้นแบบ explicit ทั้งสาย</p>
+      <p style="font-size:12px; color:var(--text-3); margin:-10px 0 16px">เบอร์ Twilio ที่ใช้โทรออก/รับสายของ campaign นี้ ตั้งได้จากหน้า <a href="#/numbers" onclick="go('numbers')" style="color:inherit; text-decoration:underline">จัดการเบอร์</a> — "Default" ใช้ routing เดิมของระบบ ส่วน Claude/Gemini/Google/Deepgram คือบังคับ A/B ทดสอบ provider นั้นแบบ explicit ทั้งสาย</p>
       <div class="field" style="margin-bottom:10px"><label>Prompt / Script</label><textarea id="cf_script" oninput="updateCampaignScriptCount()" placeholder="System prompt ที่ AI ใช้พูดกับลูกค้า">${esc(c.script || c.system_prompt || '')}</textarea></div>
       <div style="margin-bottom:16px"><span class="pill script-count" id="cf_scriptCharCount"></span></div>
       <label style="font-size:12px; color:var(--text-2); font-weight:600">ส่ง SMS follow-up เมื่อผลเป็น — เลือก template ที่จะใช้ต่อผลลัพธ์ (แต่ละ template มี Sendername ของตัวเองอยู่แล้ว)</label>
@@ -1358,6 +1366,7 @@ function collectCampaignForm(){
     voice_id: document.getElementById('cf_voice').value,
     type: document.getElementById('cf_type').value,
     llm_provider: document.getElementById('cf_llm_provider').value,
+    stt_provider: document.getElementById('cf_stt_provider').value,
     [scriptKey]: document.getElementById('cf_script').value,
     sms_interested: document.getElementById('cf_sms_interested').value,
     sms_callback: document.getElementById('cf_sms_callback').value,

@@ -83,6 +83,23 @@ test('Schema guard: ชีตที่มีคอลัมน์สำคัญ
   assert.equal(logs.filter(l => l.includes('[SCHEMA_WARNING]')).length, 0)
 })
 
+// ===== Dual STT Provider (design frozen 2026-08-31, Lock 3) — hasCampaignColumn() =====
+
+test('hasCampaignColumn: คืน true ถ้าคอลัมน์นั้นมีอยู่จริงในแท็บ Campaigns (ไม่สนตัวพิมพ์ใหญ่เล็ก/ช่องว่าง — ผ่าน normalize header เดิม)', async () => {
+  state.data['Campaigns'] = [['Id', 'Name', 'Stt Provider']]
+  assert.equal(await sheetsService.hasCampaignColumn('stt_provider'), true)
+})
+
+test('hasCampaignColumn: คืน false ถ้าคอลัมน์ไม่มีอยู่เลย', async () => {
+  state.data['Campaigns'] = [['Id', 'Name', 'Status']]
+  assert.equal(await sheetsService.hasCampaignColumn('stt_provider'), false)
+})
+
+test('hasCampaignColumn: ชีต Campaigns ยังไม่มีข้อมูล/แท็บว่างเปล่า → คืน false ไม่ throw', async () => {
+  state.data['Campaigns'] = []
+  assert.equal(await sheetsService.hasCampaignColumn('stt_provider'), false)
+})
+
 test('getRows normalize header เป็น lowercase + underscore และเติม field ที่ขาด/แถวสั้นกว่า header เป็นค่าว่าง', async () => {
   state.data['Contacts'] = [
     ['Phone', 'Name', 'Campaign', 'Retry Count'],

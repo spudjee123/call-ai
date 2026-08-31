@@ -11,14 +11,54 @@ const twilioService = require('../services/twilio')
 // column whitelist (updateRowByKey/appendRowByFields already silently ignore unknown field names, so
 // unrecognized keys are a no-op today, not a corruption risk).
 const VALID_LLM_PROVIDERS = new Set(['', 'claude', 'gemini'])
+
+// Dual STT Provider (design frozen 2026-08-31) — validateCampaignFields() below mirrors the exact same
+// pattern for stt_provider. hasCampaignColumn/validateSttProviderSchema is the separate, async, Lock-3
+// check for whether the Sheet's Campaigns tab actually HAS the stt_provider column yet — a typo/type
+// check alone (sync, below) can't catch "column doesn't exist," which would otherwise let a save look
+// successful while silently never persisting (updateRowByKey/appendRowByFields already skip unknown
+// column names — see googleSheets.js comment on that behavior).
+const VALID_STT_PROVIDERS = new Set(['', 'google', 'deepgram'])
+
 function validateCampaignFields(fields) {
-  if (!fields || fields.llm_provider === undefined) return null // field ไม่ได้ถูกส่งมาเลย (เช่น PATCH แก้แค่ name) — ไม่ต้องตรวจ
-  const raw = fields.llm_provider
-  if (typeof raw !== 'string') {
-    return `llm_provider ต้องเป็นข้อความ (ค่าว่าง, 'claude', หรือ 'gemini') ไม่ใช่ ${typeof raw}`
+  if (!fields) return null
+  if (fields.llm_provider !== undefined) {
+    const raw = fields.llm_provider
+    if (typeof raw !== 'string') {
+      return `llm_provider ต้องเป็นข้อความ (ค่าว่าง, 'claude', หรือ 'gemini') ไม่ใช่ ${typeof raw}`
+    }
+    if (!VALID_LLM_PROVIDERS.has(raw.trim().toLowerCase())) {
+      return `llm_provider ต้องเป็นค่าว่าง, 'claude', หรือ 'gemini' เท่านั้น (ได้รับ: '${raw}')`
+    }
   }
-  if (!VALID_LLM_PROVIDERS.has(raw.trim().toLowerCase())) {
-    return `llm_provider ต้องเป็นค่าว่าง, 'claude', หรือ 'gemini' เท่านั้น (ได้รับ: '${raw}')`
+  if (fields.stt_provider !== undefined) {
+    const raw = fields.stt_provider
+    if (typeof raw !== 'string') {
+      return `stt_provider ต้องเป็นข้อความ (ค่าว่าง, 'google', หรือ 'deepgram') ไม่ใช่ ${typeof raw}`
+    }
+    if (!VALID_STT_PROVIDERS.has(raw.trim().toLowerCase())) {
+      return `stt_provider ต้องเป็นค่าว่าง, 'google', หรือ 'deepgram' เท่านั้น (ได้รับ: '${raw}')`
+    }
+  }
+  return null
+}
+
+// Active schema check (Lock 3, locked design) — only runs when stt_provider is being set to a NON-blank
+// value, so installations that never touch the Dual STT feature never hit an extra Sheets read on every
+// campaign save. Blank stt_provider skips this entirely (blank never touches the column at all).
+//
+// Review hardening — this function must be safe standing alone, not just at its current two call sites.
+// Both current callers happen to run validateCampaignFields() first (which rejects a non-string
+// stt_provider before this ever runs), but this function shouldn't rely on that ordering to avoid
+// throwing — a future caller invoking it directly would hit `.trim()` on a non-string otherwise. The type
+// check below makes that impossible regardless of call order.
+async function validateSttProviderSchema(fields) {
+  if (!fields || fields.stt_provider === undefined) return null
+  const raw = typeof fields.stt_provider === 'string' ? fields.stt_provider.trim().toLowerCase() : ''
+  if (!raw) return null
+  const hasColumn = await sheetsService.hasCampaignColumn('stt_provider')
+  if (!hasColumn) {
+    return `ตั้งค่า stt_provider='${raw}' ไม่ได้ เพราะ Google Sheet (แท็บ Campaigns) ยังไม่มีคอลัมน์ "stt_provider" — ต้องเพิ่มคอลัมน์นี้ในชีตก่อนถึงจะเลือก STT provider ต่อ Campaign ได้`
   }
   return null
 }
@@ -50,6 +90,9 @@ module.exports = async function campaignRoutes(fastify) {
     const validationError = validateCampaignFields(req.body)
     if (validationError) return reply.code(400).send({ error: validationError })
 
+    const sttSchemaError = await validateSttProviderSchema(req.body)
+    if (sttSchemaError) return reply.code(400).send({ error: sttSchemaError })
+
     const existing = await sheetsService.getCampaign(id)
     if (existing) return reply.code(409).send({ error: 'Campaign id already exists' })
 
@@ -70,6 +113,9 @@ module.exports = async function campaignRoutes(fastify) {
     const { id, ...updates } = req.body || {}
     const validationError = validateCampaignFields(updates)
     if (validationError) return reply.code(400).send({ error: validationError })
+
+    const sttSchemaError = await validateSttProviderSchema(updates)
+    if (sttSchemaError) return reply.code(400).send({ error: sttSchemaError })
 
     const updated = await sheetsService.updateCampaign(req.params.id, updates)
     if (!updated) return reply.code(404).send({ error: 'Campaign not found' })

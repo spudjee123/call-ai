@@ -3697,6 +3697,78 @@ test('L2b: barge-in ก่อน Claude commit เสียงใดๆ เล�
   harness.disconnect(socket)
 })
 
+// Track 1 (Gemini Abort Fix + Lifecycle Diagnostics + Controlled Harness, Implementation Gate 2026-08-31) —
+// RCA (2026-08-30, confirmed 2026-08-31) traced "[AI/TTS error] (L2b precommit) This operation was
+// aborted" to a DIFFERENT code path than the test above: that test's mock generator resolves normally
+// (a plain `yield` with no throw) after barge-in, which runAttemptWithWatchdog's own success branch
+// (attemptWithWatchdog.js:87, `child.signal.aborted ? 'aborted' : 'success'`) already classified
+// correctly — untouched by this fix. Production evidence shows the REAL failure shape is the underlying
+// provider SDK call REJECTING (throwing) once the request is aborted mid-flight (e.g. an axios/fetch
+// AbortError from the in-flight HTTP call) — that exception used to propagate uncaught out of the L2b
+// run() callback straight into attemptWithWatchdog's catch branch (:88-95, which never checks
+// child.signal.aborted), landing on outcome:'error' instead of 'aborted'.
+test('L2b Track 1 fix: askConversationConditionalStream THROWS (abort-driven SDK rejection, not a graceful resolve) after barge-in → outcome=ABORTED ไม่ใช่ ERROR, ไม่ log [AI/TTS error]', async () => {
+  const callSid = 'CA_L2B_ABORT_THROW'
+  harness.getState().legacyEarlyTtsConfig = { percent: 100, campaignId: L2B_CAMPAIGN_ID }
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0, sessionOverrides: { campaign: l2bCampaign() } })
+
+  let resumeOldTurn
+  const oldTurnGate = new Promise(resolve => { resumeOldTurn = resolve })
+  state.claudeConditionalImpl = (sess, signal, onMilestone) => (async function* () {
+    onMilestone?.('requestAt', Date.now())
+    await oldTurnGate
+    // จำลองพฤติกรรมจริงที่เจอใน production log เป๊ะ: SDK call ที่ถูก abort กลางทางแล้ว reject แทนที่จะ resolve
+    // แบบปกติ — ต่างจากเทสข้างบนที่ generator resolve ปกติหลัง abort (คนละ branch ใน attemptWithWatchdog.js)
+    const err = new Error('This operation was aborted')
+    err.name = 'AbortError'
+    throw err
+  })()
+
+  const originalLog = console.log
+  const originalError = console.error
+  const logs = []
+  console.log = (...args) => { logs.push(args.join(' ')); originalLog(...args) }
+  console.error = (...args) => { logs.push(args.join(' ')); originalError(...args) }
+
+  const oldTurnPromise = harness.sendFinalTranscript('คำถามแรกครับ')
+  await delay(30) // ให้เทิร์นแรกเข้าสู่ fresh-call (L2b) แล้วจริง
+
+  state.claudeStreamImpl = async function* () { yield 'ตอบเรื่องใหม่' }
+  state.claudeConditionalImpl = null
+  await harness.sendFinalTranscript('เดี๋ยวก่อนครับ ขอถามเรื่องอื่นก่อน') // trigger barge-in จริง
+
+  resumeOldTurn()
+  await oldTurnPromise
+  await delay(20)
+  console.log = originalLog
+  console.error = originalError
+
+  const oldMetricsLine = logs.find(l => l.includes('[Metrics]') && l.includes('"generationId":1,'))
+  assert.ok(oldMetricsLine, 'ต้องเจอ [Metrics] log ของเทิร์นแรก (generationId=1)')
+  const oldMetrics = JSON.parse(oldMetricsLine.slice(oldMetricsLine.indexOf('{')))
+  assert.equal(oldMetrics.legacyEarlyTtsOutcome, 'ABORTED', 'exception ที่เกิดหลัง childSignal.aborted ต้องถูกจัดเป็น ABORTED ไม่ใช่ ERROR')
+  assert.equal(logs.some(l => l.includes('[AI/TTS error]') && l.includes('aborted')), false, 'ต้องไม่ log เป็น error เพราะเป็นแค่ barge-in ปกติ ไม่ใช่ความผิดพลาดจริง')
+  const lastAssistant = session.messages.filter(m => m.role === 'assistant').at(-1)
+  assert.notEqual(lastAssistant?.content, LEGACY_RECOVERY_PHRASE, 'ไม่ควรพูด recovery phrase ทับเสียงลูกค้าที่กำลังพูดแทรกอยู่')
+  harness.disconnect(socket)
+})
+
+test('L2b Track 1 fix: askConversationConditionalStream THROWS ตอน signal ยังไม่ aborted (genuine error จริง) → outcome=ERROR เหมือนเดิม ไม่ถูกกลืนเป็น ABORTED', async () => {
+  const callSid = 'CA_L2B_GENUINE_ERROR'
+  harness.getState().legacyEarlyTtsConfig = { percent: 100, campaignId: L2B_CAMPAIGN_ID }
+  const { socket, session, state } = await connectPastGreeting(callSid, { rolloutPercent: 0, sessionOverrides: { campaign: l2bCampaign() } })
+
+  state.claudeConditionalImpl = (sess, signal, onMilestone) => (async function* () {
+    onMilestone?.('requestAt', Date.now())
+    throw new Error('Gemini API 500 Internal Server Error') // genuine provider error, ไม่มี barge-in เกี่ยวข้องเลย
+  })()
+
+  const metrics = await captureMetrics(() => harness.sendFinalTranscript('ทดสอบ'))
+
+  assert.equal(metrics.legacyEarlyTtsOutcome, 'ERROR', 'genuine error (signal ไม่ aborted) ต้องยัง log เป็น ERROR เหมือนเดิม ไม่ใช่ถูกกลืนเป็น ABORTED โดย fix นี้')
+  harness.disconnect(socket)
+})
+
 // ===== Dual Conversation Provider A/B (design locked, 2026-08-28) =====
 // Provider selection is resolved once at session creation (twilio.js/webhook.js — not exercised by this
 // harness, which builds sessions directly via makeSession()) and frozen as session.llmProvider/llmModel.

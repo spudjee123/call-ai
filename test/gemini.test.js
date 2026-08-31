@@ -167,6 +167,93 @@ test('request config: model/thinkingLevel/maxOutputTokens/abortSignal ถูก�
   assert.equal(state.lastParams.config.abortSignal, controller.signal)
 })
 
+// ===== Track 2 (Gemini Lifecycle Diagnostics, Implementation Gate 2026-08-31, RCA revision 3 locked spec) =====
+
+test('Track 2: streamCreatedAt mark หลัง generateContentStream() resolve เท่านั้น — ไม่ mark ก่อนหน้านั้นแม้ await ยังค้างอยู่', async () => {
+  const milestones = {}
+  state.chunks = [{ text: 'สวัสดีค่ะ' }]
+  // generateContentStream เองคืน Promise ที่ resolve ช้า (จำลอง await ที่ยังไม่จบ) — ต่างจาก makeSlowFakeStream
+  // ที่จำลอง delay ระหว่าง "ทีละ chunk ของ stream ที่สร้างสำเร็จแล้ว" คนละจุดกัน
+  state.streamImpl = (chunks, signal) => new Promise(resolve => {
+    setTimeout(() => resolve(makeFakeStream(chunks, signal)), 60)
+  })
+  const gen = askGeminiConditionalStream(session([{ role: 'user', content: 'ทดสอบ' }]), null, (k, v) => { milestones[k] = v })
+
+  const drainPromise = (async () => { for await (const _ of gen) { /* drain */ } })()
+  await new Promise(r => setTimeout(r, 25)) // ยังไม่ครบ 60ms ที่ generateContentStream() ใช้ resolve
+  assert.equal(milestones.streamCreatedAt, undefined, 'ยังไม่ควร mark เพราะ await generateContentStream() เองยังไม่ resolve')
+
+  await drainPromise
+  assert.ok(milestones.streamCreatedAt != null, 'ต้อง mark แล้วหลัง await resolve จริง')
+})
+
+test('Track 2: firstRawChunkAt mark ทันทีที่ iterator resolve แม้ chunk แรกจะไม่มี .text (metadata-only) — คนละจุดกับ firstDeltaAt', async () => {
+  const milestones = {}
+  state.chunks = [{}, { text: 'ข้อความจริง' }] // chunk แรกไม่มี text เลย (เช่น metadata/thinking event)
+  const gen = askGeminiConditionalStream(session([{ role: 'user', content: 'ทดสอบ' }]), null, (k, v) => { milestones[k] = v })
+  for await (const _ of gen) { /* drain */ }
+  assert.ok(milestones.firstRawChunkAt != null, 'ต้อง mark ตั้งแต่ raw chunk แรกแม้ไม่มี text')
+  assert.ok(milestones.firstDeltaAt != null)
+  assert.ok(milestones.firstRawChunkAt <= milestones.firstDeltaAt, 'raw chunk (metadata) ต้องมาถึงก่อนหรือพร้อมกับ text delta แรกเสมอ ไม่ใช่หลัง')
+})
+
+test('Track 2: activeGeminiAttemptCountAtStart นับ LOCAL overlap ถูกต้อง — 0 ตอนไม่มีใครทำงานอยู่, เพิ่มขึ้นตอนมี attempt ค้างพร้อมกัน, กลับมา 0 หลังทุกอย่างจบ (ไม่ leak)', async () => {
+  const milestonesB = {}
+  const milestonesC = {}
+  let resolveA
+  const gateA = new Promise(resolve => { resolveA = resolve })
+  const sess = session([{ role: 'user', content: 'ทดสอบ' }], { callSid: 'CA_OVERLAP_TEST' })
+
+  let firstCall = true
+  state.streamImpl = (chunks, signal) => {
+    if (firstCall) { firstCall = false; return gateA.then(() => makeFakeStream([{ text: 'A' }], signal)) }
+    return makeFakeStream([{ text: 'ok' }], signal)
+  }
+
+  const genA = askGeminiConditionalStream(sess, null, null)
+  const drainA = (async () => { for await (const _ of genA) { /* drain */ } })()
+  await new Promise(r => setTimeout(r, 10)) // ให้ A เริ่ม request ไปแล้วจริง (ผ่าน increment แล้ว แต่ยังไม่จบ)
+
+  const genB = askGeminiConditionalStream(sess, null, (k, v) => { milestonesB[k] = v })
+  for await (const _ of genB) { /* drain */ }
+  assert.equal(milestonesB.activeGeminiAttemptCountAtStart, 1, 'B เริ่มขณะ A ยังค้างอยู่ ต้องเห็นว่ามี 1 attempt (A) ทำงานอยู่แล้ว')
+
+  resolveA()
+  await drainA
+
+  const genC = askGeminiConditionalStream(sess, null, (k, v) => { milestonesC[k] = v })
+  for await (const _ of genC) { /* drain */ }
+  assert.equal(milestonesC.activeGeminiAttemptCountAtStart, 0, 'หลัง A และ B จบไปแล้วทั้งคู่ counter ต้องกลับมา 0 ไม่ leak')
+})
+
+test('Track 2: generateContentStream() เอง throw ก่อนสร้าง stream สำเร็จ → counter ยัง decrement ถูกต้อง ไม่ leak ไปกระทบ attempt ถัดไป', async () => {
+  const sess = session([{ role: 'user', content: 'ทดสอบ' }], { callSid: 'CA_THROW_TEST' })
+  state.streamImpl = () => { throw new Error('SDK connection failed') }
+
+  const genA = askGeminiConditionalStream(sess, null, null)
+  await assert.rejects(async () => { for await (const _ of genA) { /* drain */ } })
+
+  const milestonesB = {}
+  state.streamImpl = (chunks, signal) => makeFakeStream(chunks, signal)
+  state.chunks = [{ text: 'โอเค' }]
+  const genB = askGeminiConditionalStream(sess, null, (k, v) => { milestonesB[k] = v })
+  for await (const _ of genB) { /* drain */ }
+  assert.equal(milestonesB.activeGeminiAttemptCountAtStart, 0, 'ความพยายามก่อนหน้าที่ throw ตั้งแต่ generateContentStream() เองต้องไม่ leak counter ค้างไว้')
+})
+
+test('Track 2: signalAbortedAt mark ตอน barge-in จริง (childSignal.aborted ถูกตรวจพบครั้งแรก)', async () => {
+  const milestones = {}
+  const controller = new AbortController()
+  state.streamImpl = (chunks, signal) => makeSlowFakeStream(chunks, [0, 500], signal)
+  state.chunks = [{ text: 'เริ่มพูด' }, { text: 'พูดต่อ' }]
+  const gen = askGeminiConditionalStream(session([{ role: 'user', content: 'ทดสอบ' }]), controller.signal, (k, v) => { milestones[k] = v })
+  const iterate = (async () => { for await (const _ of gen) { /* drain */ } })()
+  await new Promise(r => setTimeout(r, 50))
+  controller.abort()
+  await iterate
+  assert.ok(milestones.signalAbortedAt != null, 'ต้อง mark เวลาที่ตรวจพบ signal.aborted จริง')
+})
+
 test('chunk ที่ไม่มี .text (เช่น metadata-only) ไม่ทำให้พัง — ข้ามไปเฉยๆ', async () => {
   state.chunks = [{}, { text: 'ข้อความจริง' }]
   const gen = askGeminiConditionalStream(session([{ role: 'user', content: 'ทดสอบ' }]))

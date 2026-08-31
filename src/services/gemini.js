@@ -42,8 +42,28 @@ function getClient() {
   return cachedClient
 }
 
+// Track 2 (Gemini Lifecycle Diagnostics, Implementation Gate 2026-08-31) — LOCAL-only concurrent-attempt
+// tracker keyed by callSid. Proves client-side request overlap only (RCA Hypothesis D) — never evidence
+// of whether Google's server is still processing an aborted request (see turnMetrics.js comment on
+// activeGeminiAttemptCountAtStart for why). incrementActiveAttempts() returns the count BEFORE this
+// attempt was added, i.e. "how many were already in flight" — the number this new attempt actually cares
+// about. Paired decrement is guaranteed via the two disjoint code paths in askGeminiConditionalStream
+// below (generateContentStream() itself throwing vs. the generator's own existing finally block) — never
+// double-decremented since those two paths cannot both run for the same attempt.
+const activeGeminiAttemptsByCallSid = new Map()
+function incrementActiveAttempts(callSid) {
+  const before = activeGeminiAttemptsByCallSid.get(callSid) || 0
+  activeGeminiAttemptsByCallSid.set(callSid, before + 1)
+  return before
+}
+function decrementActiveAttempts(callSid) {
+  const current = activeGeminiAttemptsByCallSid.get(callSid) || 0
+  if (current <= 1) activeGeminiAttemptsByCallSid.delete(callSid)
+  else activeGeminiAttemptsByCallSid.set(callSid, current - 1)
+}
+
 async function* askGeminiConditionalStream(session, signal = null, onMilestone = null) {
-  const { name, campaign, messages } = session
+  const { name, campaign, messages, callSid } = session
   const systemPrompt = buildSystemPrompt(campaign.script || campaign.system_prompt, name)
   const history = messages.slice(-MAX_HISTORY)
 
@@ -92,22 +112,44 @@ async function* askGeminiConditionalStream(session, signal = null, onMilestone =
   const requestAt = performance.now()
   onMilestone?.('requestAt', requestAt)
 
-  const stream = await getClient().models.generateContentStream({
-    model: GEMINI_MODEL,
-    contents,
-    config: {
-      systemInstruction: { parts: [{ text: systemPrompt }] },
-      // Gemini Latency Root-Cause Test (2026-08-29) — RULED OUT: raising this to 2048 (CA69b68704...) made
-      // no difference at all — still firstDeltaAt=null, still TIMEOUT_PRECOMMIT at ~6000ms, identical to the
-      // 200-token runs. "Thinking tokens exhausting the output budget" is not the cause. Reverted to 200.
-      // Now testing the next hypothesis instead: GEMINI_MODEL below is temporarily gemini-3.6-flash with
-      // thinkingLevel MINIMAL, to check whether 3.7's thinking floor (low/medium/high only, no true "off")
-      // is itself what exceeds the 6s watchdog, or whether an older/lighter-thinking model responds in time.
-      maxOutputTokens: 200,
-      thinkingConfig: { thinkingLevel: 'MINIMAL' },
-      abortSignal: signal || undefined,
-    },
-  })
+  // Track 2 (Gemini Lifecycle Diagnostics, Implementation Gate 2026-08-31) — snapshot BEFORE incrementing:
+  // "how many Gemini attempts were already in flight for this callSid when this one started." Increment
+  // happens right before the SDK call it's actually measuring, not any earlier (e.g. not before the
+  // inputStats block above, which does no I/O and can't itself overlap with anything).
+  const activeGeminiAttemptCountAtStart = incrementActiveAttempts(callSid)
+  onMilestone?.('activeGeminiAttemptCountAtStart', activeGeminiAttemptCountAtStart)
+
+  let stream
+  try {
+    stream = await getClient().models.generateContentStream({
+      model: GEMINI_MODEL,
+      contents,
+      config: {
+        systemInstruction: { parts: [{ text: systemPrompt }] },
+        // Gemini Latency Root-Cause Test (2026-08-29) — RULED OUT: raising this to 2048 (CA69b68704...) made
+        // no difference at all — still firstDeltaAt=null, still TIMEOUT_PRECOMMIT at ~6000ms, identical to the
+        // 200-token runs. "Thinking tokens exhausting the output budget" is not the cause. Reverted to 200.
+        // Now testing the next hypothesis instead: GEMINI_MODEL below is temporarily gemini-3.6-flash with
+        // thinkingLevel MINIMAL, to check whether 3.7's thinking floor (low/medium/high only, no true "off")
+        // is itself what exceeds the 6s watchdog, or whether an older/lighter-thinking model responds in time.
+        maxOutputTokens: 200,
+        thinkingConfig: { thinkingLevel: 'MINIMAL' },
+        abortSignal: signal || undefined,
+      },
+    })
+    // Track 2 — mark ONLY here, immediately after the await resolves, never before it (RCA revision 3
+    // locked spec) — this is the ONE thing that lets a future reader tell "the await itself never
+    // resolved within 6s" (this field stays null) apart from "stream created fast, but no chunk followed"
+    // (this field is populated, geminiFirstRawChunkAt is the one that stays null instead).
+    onMilestone?.('streamCreatedAt', performance.now())
+  } catch (err) {
+    // generateContentStream() itself throwing (before the driver/finally below is even created) is the
+    // ONE code path that would otherwise leak the increment above — decrement here and rethrow unchanged.
+    // Never double-decrements: this catch and the existing generator-level finally further below are
+    // mutually exclusive (this only runs if the function returns before ever reaching that finally).
+    decrementActiveAttempts(callSid)
+    throw err
+  }
 
   // Internal producer/consumer split — identical shape to askClaudeConditionalStream()'s (a plain generator
   // can only yield from its own body, never from a detached setTimeout callback, so the grace-vs-stream-
@@ -247,6 +289,15 @@ async function* askGeminiConditionalStream(session, signal = null, onMilestone =
     let doneSent = false
     function sendDone() { if (!doneSent) { doneSent = true; push({ type: 'done' }) } }
 
+    // Track 2 — mark-once helpers, called from the existing abort checkpoints below (never new control
+    // flow, purely observational): first time signal?.aborted is observed true, and first time the SDK's
+    // async iterator resolves with anything at all (regardless of whether it carries text).
+    let signalAbortedMarked = false
+    function markSignalAbortedOnce() {
+      if (!signalAbortedMarked) { signalAbortedMarked = true; onMilestone?.('signalAbortedAt', performance.now()) }
+    }
+    let firstRawChunkMarked = false
+
     const iterator = stream[Symbol.asyncIterator]()
     let pendingNext = iterator.next()
     let gracePromise = null
@@ -258,7 +309,7 @@ async function* askGeminiConditionalStream(session, signal = null, onMilestone =
         if (hardMaxRecheckPromise) racers.push(hardMaxRecheckPromise.then(() => ({ kind: 'hardMaxRecheck' })))
         const winner = await Promise.race(racers)
 
-        if (signal?.aborted) { clearHardMaxRecheckTimer(); sendDone(); return }
+        if (signal?.aborted) { markSignalAbortedOnce(); clearHardMaxRecheckTimer(); sendDone(); return }
 
         if (winner.kind === 'grace') {
           gracePromise = null
@@ -281,11 +332,16 @@ async function* askGeminiConditionalStream(session, signal = null, onMilestone =
           continue
         }
 
+        // Track 2 — reaching this line means the SDK's async iterator resolved with SOMETHING (the grace/
+        // hardMaxRecheck branches above both `continue` before ever reaching here) — mark once regardless
+        // of whether it's the final `done:true` sentinel or carries no text, since the point is "the
+        // iterator moved at all" as distinct from "it produced usable text" (geminiFirstTextAt, below).
+        if (!firstRawChunkMarked) { firstRawChunkMarked = true; onMilestone?.('firstRawChunkAt', performance.now()) }
         const { value: chunk, done } = winner.r
         if (done) break
         pendingNext = iterator.next()
 
-        if (signal?.aborted) { clearHardMaxRecheckTimer(); sendDone(); return }
+        if (signal?.aborted) { markSignalAbortedOnce(); clearHardMaxRecheckTimer(); sendDone(); return }
 
         // No cacheUsage milestone here — Gemini's caching semantics (implicit/explicit context caching) are
         // not the same concept as Anthropic's cache_creation_input_tokens/cache_read_input_tokens, and this
@@ -336,7 +392,7 @@ async function* askGeminiConditionalStream(session, signal = null, onMilestone =
       clearNumericProtectionTimer()
       clearGraceTimer()
       clearHardMaxRecheckTimer()
-      if (signal?.aborted) { sendDone(); return }
+      if (signal?.aborted) { markSignalAbortedOnce(); sendDone(); return }
 
       const fullAt = performance.now()
       onMilestone?.('fullAt', fullAt)
@@ -365,8 +421,13 @@ async function* askGeminiConditionalStream(session, signal = null, onMilestone =
       clearNumericProtectionTimer()
       clearGraceTimer()
       clearHardMaxRecheckTimer()
+      // Track 2 — this branch is the ACTUAL real-world abort shape the RCA traced (an abort-driven SDK/
+      // iterator rejection, e.g. iterator.next() itself rejecting — not merely signal?.aborted being true
+      // after a successful race resolution, which the checkpoints above already cover). Mark here too, or
+      // this specific shape (proven to be the one production actually hits) would never get a
+      // signalAbortedAt timestamp at all.
       if (!signal?.aborted) push({ type: 'error', err })
-      else sendDone()
+      else { markSignalAbortedOnce(); sendDone() }
     }
   })()
 
@@ -380,6 +441,13 @@ async function* askGeminiConditionalStream(session, signal = null, onMilestone =
     }
   } finally {
     await driver.catch(() => {})
+    // Track 2 — pairs with incrementActiveAttempts() above. Always reached exactly once for any attempt
+    // that got this far (stream created successfully) regardless of how the generator ends — normal
+    // completion, barge-in abort, or the consumption loop throwing a genuine provider error — since this
+    // outer try/finally spans the generator's entire post-stream-creation lifetime. Mutually exclusive
+    // with the decrementActiveAttempts() call in the generateContentStream() catch block above (that one
+    // only fires when this finally is never reached at all).
+    decrementActiveAttempts(callSid)
   }
 }
 

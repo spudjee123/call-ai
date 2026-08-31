@@ -2,6 +2,7 @@ const twilio = require('twilio')
 const callSessions = require('../utils/callSessions')
 const { askClaude } = require('./claude')
 const { resolveExplicitProvider } = require('./conversationAI')
+const { resolveSttProvider } = require('./sttRouter')
 const { synthesizeSpeech } = require('./tts')
 const { sheetsService } = require('./googleSheets')
 const healthMonitor = require('../utils/healthMonitor')
@@ -30,6 +31,10 @@ async function makeOutboundCall(contact, campaign, onCallCreated) {
   // per call" invariant if the campaign is edited while this call is still in progress. null means no
   // explicit choice — existing rollout routing (legacyEarlyTts, etc.) stays completely untouched.
   const explicitProvider = resolveExplicitProvider(campaign)
+  // Dual STT Provider (design frozen 2026-08-31) — same freeze-once invariant as explicitProvider above.
+  // null means no explicit choice — createTranscribeStream() (sttRouter.js) treats that as Google, its
+  // existing default routing.
+  const explicitSttProvider = resolveSttProvider(campaign)
 
   const session = {
     callSid: null,
@@ -43,6 +48,8 @@ async function makeOutboundCall(contact, campaign, onCallCreated) {
     twilioNumber,
     llmProvider: explicitProvider?.provider || null,
     llmModel: explicitProvider?.model || null,
+    sttProvider: explicitSttProvider?.provider || null,
+    sttModel: explicitSttProvider?.model || null,
   }
 
   // Pre-generate greeting ขณะรอสายต่อ (~3-4s) เพื่อลด silence

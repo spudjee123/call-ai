@@ -1,5 +1,5 @@
 const callSessions = require('../utils/callSessions')
-const { transcribeStream } = require('../services/googleSTT')
+const { createTranscribeStream } = require('../services/sttRouter')
 const { askClaude, askClaudeStream, askClaudeObservedFullResponse } = require('../services/claude')
 const { askConversationConditionalStream } = require('../services/conversationAI')
 const { synthesizeSpeechStream } = require('../services/tts')
@@ -1047,6 +1047,13 @@ function registerWebSocket(fastify) {
         const effectiveLlmProvider = providerOverrideActive ? session.llmProvider : 'claude'
         console.log(`[LLMRoute] callSid=${callSid} source=${providerOverrideActive ? 'CAMPAIGN_EXPLICIT' : 'DEFAULT'} provider=${effectiveLlmProvider} model=${session.llmModel || 'claude-sonnet-5'} route=${conversationRoute} providerOverride=${providerOverrideActive} rolloutChunked=${rollout.useChunkedStreaming} legacyObserved=${legacyObserved} legacyEarlyTts=${legacyEarlyTts}`)
 
+        // Dual STT Provider (design frozen 2026-08-31) — mirrors [LLMRoute] exactly, same
+        // source=CAMPAIGN_EXPLICIT|DEFAULT convention, so both routing decisions are queryable from log the
+        // same way for any given call.
+        const sttProviderOverrideActive = !!session.sttProvider
+        const effectiveSttProvider = sttProviderOverrideActive ? session.sttProvider : 'google'
+        console.log(`[STTRoute] callSid=${callSid} source=${sttProviderOverrideActive ? 'CAMPAIGN_EXPLICIT' : 'DEFAULT'} provider=${effectiveSttProvider} model=${session.sttModel || 'latest_short'}`)
+
         // L1a: ต้องคำนวณหลัง rollout freeze แล้วเท่านั้น (ดูหมายเหตุที่ค่าคงที่ด้านบนไฟล์)
         const interimFinalizeMs = rollout.useChunkedStreaming ? STT_INTERIM_FINALIZE_MS_CHUNKED : 900
 
@@ -1599,6 +1606,14 @@ function registerWebSocket(fastify) {
                         firstDeltaAt: 'legacyEarlyTtsFirstDeltaAt',
                         firstSafeAt: 'legacyEarlyTtsFirstSafeAt',
                         fullAt: 'legacyEarlyTtsFullAt',
+                        // Track 2 (Gemini Lifecycle Diagnostics, Implementation Gate 2026-08-31) — only ever
+                        // emitted by askGeminiConditionalStream (claude.js never calls onMilestone with these
+                        // keys), so these fields stay null for every Claude turn automatically, matching the
+                        // rest of this fieldMap's existing null-by-omission convention.
+                        streamCreatedAt: 'geminiStreamCreatedAt',
+                        firstRawChunkAt: 'geminiFirstRawChunkAt',
+                        activeGeminiAttemptCountAtStart: 'activeGeminiAttemptCountAtStart',
+                        signalAbortedAt: 'geminiSignalAbortedAt',
                       }
                       const field = fieldMap[key]
                       if (field && turnMetrics[field] == null) turnMetrics[field] = value
@@ -1685,18 +1700,34 @@ function registerWebSocket(fastify) {
                       if (key === 'firstDeltaAt' && !t3Marked) { markOnce(turnMetrics, 't3'); t3Marked = true }
                       if (key === 'firstSafeAt' && !t4Marked) { markOnce(turnMetrics, 't4'); t4Marked = true }
                     }
-                    for await (const chunk of askConversationConditionalStream(currentSession, childSignal, wrappedMilestone)) {
-                      const ttsPromise = speakFixedText({
-                        text: chunk, signal, socket, streamSid,
-                        voiceId: currentSession.campaign.voice_id,
-                        turnMetrics, turnState, callState, generationId,
-                        startingSentCount: totalSent,
-                        onChunkAudioStart: (t) => noteActiveSpokenChunk(pipelineId, t),
-                      })
-                      inFlightTtsPromise = ttsPromise
-                      const result = await ttsPromise
-                      inFlightTtsPromise = null
-                      totalSent += result.sentCount
+                    // Track 1 fix (Gemini Abort Fix + Lifecycle Diagnostics + Controlled Harness, 2026-08-31) —
+                    // normalize barge-in/watchdog-driven cancellation the same way the CONTROL/L2a run() above
+                    // already does (askClaudeStream's try/catch, :1838-1846): if childSignal is already
+                    // aborted when this loop throws, that's the EXPECTED shape of a canceled in-flight request
+                    // (barge-in), not a genuine provider/TTS failure — must resolve gracefully instead of
+                    // throwing, or runAttemptWithWatchdog (attemptWithWatchdog.js:88-95, which never checks
+                    // child.signal.aborted in its catch branch) classifies it as outcome:'error' instead of
+                    // 'aborted'. That misclassification is exactly what RCA (2026-08-30, confirmed again
+                    // 2026-08-31) traced as the "[AI/TTS error] (L2b precommit) This operation was aborted"
+                    // log line firing on every ordinary barge-in — a normal cancellation logged and
+                    // healthMonitor-reported as if it were a real error.
+                    try {
+                      for await (const chunk of askConversationConditionalStream(currentSession, childSignal, wrappedMilestone)) {
+                        const ttsPromise = speakFixedText({
+                          text: chunk, signal, socket, streamSid,
+                          voiceId: currentSession.campaign.voice_id,
+                          turnMetrics, turnState, callState, generationId,
+                          startingSentCount: totalSent,
+                          onChunkAudioStart: (t) => noteActiveSpokenChunk(pipelineId, t),
+                        })
+                        inFlightTtsPromise = ttsPromise
+                        const result = await ttsPromise
+                        inFlightTtsPromise = null
+                        totalSent += result.sentCount
+                      }
+                    } catch (err) {
+                      if (childSignal.aborted) return { canonicalFinalText, endCallRequestedResult }
+                      throw err // genuine error (not abort-driven) — must still propagate so outcome:'error' fires as before
                     }
                     return { canonicalFinalText, endCallRequestedResult }
                   },
@@ -2118,6 +2149,11 @@ function registerWebSocket(fastify) {
           try {
             console.log(`[STT_DIAG] ${JSON.stringify({
               callSid,
+              // Dual STT Provider (design frozen 2026-08-31) — sttRouter.js injects these onto every
+              // sttMeta object for both providers (additive, see that file's comment on why Google's
+              // shape isn't otherwise restructured) so [STT_DIAG] is queryable by provider either way.
+              provider: sttMeta.provider,
+              model: sttMeta.model,
               streamId: sttMeta.streamId,
               utteranceId: sttMeta.utteranceId,
               source: sttMeta.source,
@@ -2155,8 +2191,12 @@ function registerWebSocket(fastify) {
           }
         }
 
-        // เริ่ม STT stream
-        sttStream = transcribeStream(async (transcript, sttMeta) => {
+        // เริ่ม STT stream — Dual STT Provider (design frozen 2026-08-31): createTranscribeStream()
+        // dispatches on session.sttProvider (frozen once at session creation, twilio.js/webhook.js) —
+        // for the default/blank/google case this calls googleSTT.js's transcribeStream() completely
+        // unchanged, so this 1-line integration point is the ONLY thing that changed in this file for
+        // the Google path.
+        sttStream = createTranscribeStream(session, async (transcript, sttMeta) => {
           if (!transcript || !callActive) return
           if (pendingEndCall) return
           if (socket.readyState !== socket.OPEN) return

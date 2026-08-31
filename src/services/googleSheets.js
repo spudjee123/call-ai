@@ -263,6 +263,18 @@ const sheetsService = {
     return getRows(SHEETS.CAMPAIGNS)
   },
 
+  // Dual STT Provider (design frozen 2026-08-31, Lock 3) — active validation helper: campaign.js calls
+  // this BEFORE accepting a save that sets a field whose column might not exist yet in the real Sheet
+  // (e.g. stt_provider on an installation that hasn't added that column). Distinct from
+  // warnMissingCriticalHeaders() above, which only WARNS passively on read for a small fixed set of
+  // structurally-required columns (id/status/phone/etc.) — this is a targeted, on-demand check for an
+  // OPTIONAL feature column, called only when that feature is actually being used, so installations that
+  // never touch Deepgram never see any warning about it.
+  async hasCampaignColumn(columnName) {
+    const { headers } = await getSheetData(SHEETS.CAMPAIGNS)
+    return headers.includes(columnName)
+  },
+
   async addCampaign(fields) {
     await appendRowByFields(SHEETS.CAMPAIGNS, { status: 'active', type: 'outbound', ...fields })
   },

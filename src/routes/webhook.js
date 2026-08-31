@@ -2,6 +2,7 @@ const twilio = require('twilio')
 const { v4: uuidv4 } = require('uuid')
 const { sheetsService } = require('../services/googleSheets')
 const { resolveExplicitProvider } = require('../services/conversationAI')
+const { resolveSttProvider } = require('../services/sttRouter')
 const callSessions = require('../utils/callSessions')
 const { synthesizeSpeechWavThai } = require('../services/googleTTS')
 const { twilioSignatureGuard } = require('../utils/twilioSignature')
@@ -88,6 +89,7 @@ module.exports = async function webhookRoutes(fastify) {
     // twilio.js's makeOutboundCall(). See that call site's comment for why this can't be re-read from
     // session.campaign later.
     const explicitProvider = resolveExplicitProvider(campaign)
+    const explicitSttProvider = resolveSttProvider(campaign)
 
     callSessions.set(callSid, {
       callSid,
@@ -100,6 +102,8 @@ module.exports = async function webhookRoutes(fastify) {
       twilioNumber: to,
       llmProvider: explicitProvider?.provider || null,
       llmModel: explicitProvider?.model || null,
+      sttProvider: explicitSttProvider?.provider || null,
+      sttModel: explicitSttProvider?.model || null,
     })
 
     const wsUrl = `${process.env.BASE_URL.replace(/^http/, 'ws')}/stream?callSid=${callSid}`
