@@ -46,6 +46,38 @@
 // isCurrentConnection() FIRST, before touching anything else — a stale/superseded connection's late
 // events are silently dropped, never forwarded, never allowed to change state, matching the identity-
 // scoped pattern googleSTT.js already uses for its own shadow/EOS-recovery (same principle, new lifecycle).
+//
+// Socket readiness (Implementation Gate "Deepgram Live Socket Readiness + Handshake Diagnostics",
+// 2026-08-31) — production proved a real gap: `currentSocket = socket` becomes truthy the instant
+// `client.listen.v1.connect()` resolves, but that only means a V1Socket OBJECT exists, not that the
+// underlying WebSocket has finished its handshake. write() was calling sendMedia() on a socket that could
+// still be CONNECTING, producing a continuous "Socket is not open." error on every Twilio frame with zero
+// transcript ever produced (confirmed live: callSid CA29e95e15e63c8c3944d2d6334278d490, 2026-08-31, 1000+
+// consecutive write errors over ~19s with no open/error/close event ever observed in between).
+//
+// A hypothesis raised during triage — that this adapter needed to additionally call the V1Socket instance
+// method `.connect()` (which internally calls `.reconnect()`) because `client.listen.v1.connect()` never
+// starts a real attempt on its own — was checked against the actual installed source and is FALSE for this
+// SDK version: `V1Client.connect()` (Client.js:102-114) constructs a `new core.ReconnectingWebSocket(...)`,
+// and that class's OWN constructor calls `this._connect()` unconditionally at the end (ws.js:179) unless
+// `options.startClosed` is passed (it isn't, here) — the handshake already starts automatically. Calling
+// the V1Socket's separate `.connect()` method on top of that would call `.reconnect()` (ws.js:271-282),
+// which ABORTS whatever attempt is already in flight and restarts from scratch — actively harmful, not a
+// fix. Do not add that call.
+//
+// `waitForOpen()` (Socket.js:127-142) was evaluated too: it's confirmed passive/side-effect-free (just
+// reads current readyState, else registers one-shot 'open'/'error' listeners on the underlying socket) —
+// but it is a ONE-SHOT promise. A single connectionId here can span several of the SDK's OWN internal
+// reconnect attempts (see the retryCount-advance guard below); if the FIRST attempt errors, waitForOpen()'s
+// promise already rejects and settles — a LATER successful internal retry resolves nothing anyone is still
+// awaiting. `socket.on('open', ...)` (registered once, like message/error/close below) is a persistent
+// listener that correctly fires on whichever internal attempt actually succeeds, so that — plus a
+// synchronous readyState snapshot immediately after connect() resolves, for the race where OPEN already
+// happened before any listener could be registered — is what marks a connection ready below, not
+// waitForOpen(). Still unresolved: why open/error/close were all silent for ~19s straight on the affected
+// production call despite the exact same key/params opening in well under 1s when tested directly from
+// outside Render — the diagnostics added below (connectionId-scoped open/timeout/retryCount logging) are
+// meant to answer that from the next real call's logs, not from absence-of-evidence guessing again.
 
 const { DeepgramClient } = require('@deepgram/sdk')
 
@@ -59,6 +91,43 @@ const DEEPGRAM_LANGUAGE = 'th'
 // connection itself. A value chosen for a live phone call, not validated against real production Deepgram
 // outages yet (flagged for the production smoke test).
 const DEEPGRAM_RECONNECT_ATTEMPTS = 5
+
+// SDK-internal retryCount RESET point (Review-identified, 2026-09-01, verified against ws.js's
+// ReconnectingWebSocket): _handleOpen() arms `setTimeout(() => this._acceptOpen(), minUptime)`, and
+// _acceptOpen() sets `this._retryCount = 0` — silently, no event fired. DEFAULT_OPTIONS.minUptime is 5000ms
+// and V1Client.connect() does NOT override it (only debug/maxRetries/connectionTimeout are set), so this is
+// the real value in effect here. This matters for the retryCount-advance guard below: a `lastCloseRetryCount`
+// recorded BEFORE a stable-enough open is stale once that reset has silently happened, and comparing a
+// fresh post-reset retryCount against it produces a false "unchanged = exhausted" reading purely by numeric
+// coincidence, even though the SDK is actually retrying normally again after a brand new drop.
+const DEEPGRAM_SDK_MIN_UPTIME_MS = 5000
+
+// Twilio Media Streams sends 8-bit μ-law @ 8000 Hz mono — 1 byte/sample, so bytes/ms = sample rate / 1000.
+// Named here so the pre-open buffer cap below is derived from the same real audio-rate math the adapter
+// already sends to Deepgram (sample_rate below), not a made-up byte count.
+const SAMPLE_RATE_HZ = 8000
+const BYTES_PER_MS = SAMPLE_RATE_HZ / 1000 // 8
+
+// Bounded pre-open audio buffer (locked design) — the handshake window is normally sub-second, but
+// production proved it can stall far longer. Buffering the customer's speech during that window (instead
+// of write()'s old behavior of throwing it away silently on every frame) avoids reintroducing the exact
+// short-utterance-loss failure mode this whole investigation started from. Capped so a genuinely stuck
+// connection can't grow this unbounded in memory for the rest of the call.
+const PRE_OPEN_BUFFER_MS = 1500
+const PRE_OPEN_BUFFER_MAX_BYTES = PRE_OPEN_BUFFER_MS * BYTES_PER_MS // 12000 bytes
+
+// Application-level readiness DIAGNOSTIC boundary only — locked design explicitly forbids using this to
+// drop buffered audio a second time or to spin up a parallel connection (that stays owned by the SDK's own
+// reconnect plus this file's existing retryCount-advance guard below, which already race-safely decides
+// when a replacement connection is warranted). This exists purely so a stuck handshake produces a clear,
+// searchable log line instead of the silence production just proved is possible even with the SDK's own
+// internal connectionTimeout (4000ms, DEFAULT_OPTIONS in ws.js) which apparently did not fire audibly.
+const DEEPGRAM_READINESS_TIMEOUT_MS = 6000
+
+// Verified against the installed SDK (ws.js:477-487): ReconnectingWebSocket.ReadyState.OPEN === 1, the
+// standard WebSocket readyState value. Not re-exported from the package's public surface, so used here as
+// a documented literal rather than reaching into an internal module path.
+const WS_READY_STATE_OPEN = 1
 
 let cachedClient = null
 function getClient() {
@@ -106,11 +175,74 @@ function transcribeStream(onTranscript, onInterim, { interimFinalizeMs } = {}) {
   let firstInterimAt = null
   let lastInterimAt = null
 
+  // Readiness/buffer state — scoped per connection (reset at the top of every createConnection() call, same
+  // as resetUtteranceState()) so a replacement connection never inherits a stale connection's buffered audio
+  // or ready flag.
+  let socketReady = false
+  let audioBuffer = []
+  let audioBufferBytes = 0
+  // Overflow policy (Review-requested clarification, locked): drop NEWEST, keep OLDEST — once the cap is
+  // hit, further incoming frames are rejected outright rather than evicting already-buffered audio. This
+  // preserves the start of whatever the customer already said (the earliest audio is what a late-opening
+  // socket needs most) at the cost of losing only the tail beyond ~1.5s of stall, which is itself already a
+  // degraded scenario. Counters below make the actual loss visible in the diagnostics rather than leaving
+  // "dropping frame" as a vague, uncounted warning.
+  let droppedFrameCount = 0
+  let droppedBytes = 0
+  let hasLoggedBufferingStart = false
+  let currentReadinessTimeout = null
+  let currentConnectionStartedAt = null // set at the top of createConnection(), read by markSocketReady() for elapsedMs
+
   function resetUtteranceState() {
     interimCount = 0
     firstInterimAt = null
     lastInterimAt = null
     currentUtteranceId = null
+  }
+
+  function resetConnectionBufferState() {
+    socketReady = false
+    audioBuffer = []
+    audioBufferBytes = 0
+    droppedFrameCount = 0
+    droppedBytes = 0
+    hasLoggedBufferingStart = false
+    // Timer hygiene: a connection that gets superseded (close handler creates a replacement) while its own
+    // readiness timeout is still pending never reaches markSocketReady() or end() — nothing else would ever
+    // clear that dangling timer otherwise. isCurrentConnection() already makes it a behavioral no-op if left
+    // to fire on its own, but explicitly clearing it here (at the start of every new connection, which is
+    // exactly when a previous one's timer would go stale) avoids accumulating orphaned timers across a call
+    // with several reconnects.
+    if (currentReadinessTimeout) { clearTimeout(currentReadinessTimeout); currentReadinessTimeout = null }
+  }
+
+  // Marks the connectionId's socket ready-to-send and flushes whatever audio accumulated during the
+  // handshake window, in arrival order, exactly once. Safe to call from either the synchronous
+  // already-open snapshot or the persistent 'open' listener — idempotent per connection, and a stale
+  // connectionId (superseded, or destroyed via end()) is a silent no-op via isCurrentConnection() — this is
+  // also what guarantees a stale connection's late 'open' can never flush a buffer, clear the CURRENT
+  // connection's readiness timer, or mutate socketReady/audioBuffer belonging to whichever connection is
+  // actually current: every one of those four things happens only past the isCurrentConnection() check
+  // below, never before it. A readiness timeout having already fired for this SAME (still current)
+  // connectionId does not "poison" it either — the timeout is diagnostic-only (see
+  // DEEPGRAM_READINESS_TIMEOUT_MS above) and never sets any flag this function checks; a late, genuinely
+  // successful open still marks ready and flushes normally.
+  function markSocketReady(connectionId, source) {
+    if (!isCurrentConnection(connectionId)) return
+    if (socketReady) return
+    socketReady = true
+    if (currentReadinessTimeout) { clearTimeout(currentReadinessTimeout); currentReadinessTimeout = null }
+    const toFlush = audioBuffer
+    const flushedBytes = audioBufferBytes
+    const droppedFramesTotal = droppedFrameCount
+    const droppedBytesTotal = droppedBytes
+    const elapsedMs = currentConnectionStartedAt !== null ? Date.now() - currentConnectionStartedAt : null
+    audioBuffer = []
+    audioBufferBytes = 0
+    console.log(`[Deepgram] socket ready connectionId=${connectionId} source=${source} elapsedMs=${elapsedMs} bufferedFrames=${toFlush.length} bufferedBytes=${flushedBytes} droppedFrames=${droppedFramesTotal} droppedBytes=${droppedBytesTotal}`)
+    for (const buf of toFlush) {
+      try { currentSocket.sendMedia(buf) } catch (e) { console.error(`[Deepgram] flush write error connectionId=${connectionId}:`, e.message) }
+    }
   }
 
   function isCurrentConnection(connectionId) {
@@ -185,6 +317,8 @@ function transcribeStream(onTranscript, onInterim, { interimFinalizeMs } = {}) {
     const connectionId = ++connectionIdCounter
     currentConnectionId = connectionId
     resetUtteranceState()
+    resetConnectionBufferState()
+    currentConnectionStartedAt = Date.now()
 
     let socket
     try {
@@ -192,7 +326,7 @@ function transcribeStream(onTranscript, onInterim, { interimFinalizeMs } = {}) {
         model: DEEPGRAM_MODEL,
         language: DEEPGRAM_LANGUAGE,
         encoding: 'mulaw',
-        sample_rate: 8000,
+        sample_rate: SAMPLE_RATE_HZ,
         channels: 1,
         interim_results: true,
         punctuate: true,
@@ -202,10 +336,10 @@ function transcribeStream(onTranscript, onInterim, { interimFinalizeMs } = {}) {
     } catch (err) {
       if (!isCurrentConnection(connectionId)) return // superseded while connecting — this failure is moot
       if (err.code === 'DEEPGRAM_MISSING_API_KEY') {
-        console.error('[Deepgram] fatal config error, not retrying:', err.message)
+        console.error(`[Deepgram] fatal config error connectionId=${connectionId}, not retrying:`, err.message)
         return // retrying can never fix a missing key — one clear log line, not an infinite retry-storm
       }
-      console.error('[Deepgram] connect error, retrying:', err.message)
+      console.error(`[Deepgram] connect error connectionId=${connectionId}, retrying:`, err.message)
       setTimeout(() => { if (isCurrentConnection(connectionId)) createConnection() }, 200)
       return
     }
@@ -214,12 +348,72 @@ function transcribeStream(onTranscript, onInterim, { interimFinalizeMs } = {}) {
 
     currentSocket = socket
 
+    // retryCount-tracking state (see the reconnect-race-guard comment at the close handler below for the
+    // ADVANCE-detection logic, and DEEPGRAM_SDK_MIN_UPTIME_MS above for the reset-timer mirror) — declared
+    // here, before anything can fire 'open' or 'close', so both handlers close over the same per-connection
+    // state consistently.
+    let lastCloseRetryCount // undefined = "no close observed yet on this connection"
+    // Review-identified race (2026-09-02): a wall-clock `Date.now()` diff cannot tell "minUptime elapsed AND
+    // the SDK's _acceptOpen() actually ran" apart from "minUptime elapsed, but _handleClose()'s
+    // _clearTimeouts() cancelled the SDK's _uptimeTimeout before it ever got to fire" — those look identical
+    // to a timestamp read, but only the first one means the SDK's retryCount was really reset. Mirroring the
+    // SDK's OWN timer with our own setTimeout (armed moments after the SDK arms its, inside the same 'open'
+    // handling) sidesteps this: our mirror timer is subject to the exact same event-loop scheduling behavior
+    // the SDK's timer is, so "our callback actually fired" is real evidence the SDK's earlier-registered
+    // timer fired too — not a guess. If a close arrives before our mirror timer's callback runs (including
+    // via the identical clear-before-fire race), retryBudgetResetExpected correctly stays false, matching
+    // the SDK's own true (not-yet-reset) state — erring toward preserving exhaustion detection, never toward
+    // a false "reset" that would abandon a genuinely exhausted connection.
+    let retryBudgetResetExpected = false
+    let minUptimeMirrorTimer = null
+
+    // Readiness (see file header) — snapshot readyState synchronously FIRST: OPEN can legitimately happen
+    // before this line runs (fast network, or a fake/test socket), and absence of a later 'open' event is
+    // not proof it never opened. The persistent 'open' listener below then covers every other case,
+    // including the SDK completing one of its OWN internal retries after this connectionId's first attempt.
+    const initialReadyState = socket.readyState
+    console.log(`[Deepgram] connection object created connectionId=${connectionId} readyState=${initialReadyState}`)
+
     socket.on('message', (message) => handleMessage(connectionId, message))
+
+    socket.on('open', () => {
+      // Re-arm the mirror timer on every open (including internal-SDK-retry re-opens), mirroring the SDK's
+      // own _handleOpen() re-arming _uptimeTimeout every time. Not needed for the very first open of a
+      // connectionId (lastCloseRetryCount is still undefined then, so the invalidation check below is moot
+      // regardless) but arming it unconditionally here is simplest and harmless.
+      retryBudgetResetExpected = false
+      if (minUptimeMirrorTimer) clearTimeout(minUptimeMirrorTimer)
+      minUptimeMirrorTimer = setTimeout(() => {
+        if (!isCurrentConnection(connectionId)) return
+        retryBudgetResetExpected = true
+      }, DEEPGRAM_SDK_MIN_UPTIME_MS)
+      markSocketReady(connectionId, 'open-event')
+    })
 
     socket.on('error', (err) => {
       if (!isCurrentConnection(connectionId)) return
-      console.error('[Deepgram error]', err.message)
+      console.error(`[Deepgram error] connectionId=${connectionId}`, err.message)
     })
+
+    if (initialReadyState === WS_READY_STATE_OPEN) {
+      // No mirror timer armed here deliberately: this is always the FIRST open of a fresh connectionId
+      // (this branch only runs once, synchronously, at the top of createConnection()), where
+      // lastCloseRetryCount is still undefined — the invalidation check below is a no-op regardless of
+      // reset state until at least one close has been observed. By the time a second open could matter (via
+      // an SDK-internal retry after a drop), it always goes through the persistent 'open' handler above,
+      // which does arm the mirror timer. Arming one here too would start it from an unknown offset (we don't
+      // know how long the socket was already open before this synchronous check ran), which would make it
+      // less accurate, not more.
+      markSocketReady(connectionId, 'synchronous-snapshot')
+    } else {
+      // Diagnostic-only boundary (locked design — see DEEPGRAM_READINESS_TIMEOUT_MS above): never drops the
+      // buffer, never spins up a replacement connection on its own. Cleared by markSocketReady() the moment
+      // this connectionId actually becomes ready.
+      currentReadinessTimeout = setTimeout(() => {
+        if (!isCurrentConnection(connectionId) || socketReady) return
+        console.warn(`[Deepgram] readiness timeout connectionId=${connectionId} elapsedMs=${Date.now() - currentConnectionStartedAt} readyState=${currentSocket?.readyState} retryCount=${currentSocket?.socket?.retryCount} bufferedBytes=${audioBufferBytes}`)
+      }, DEEPGRAM_READINESS_TIMEOUT_MS)
+    }
 
     // SDK-internal-reconnect race guard (see file header) — SECOND finding from a Review challenge on the
     // exact retry-counting semantics: ReconnectingWebSocket's `_retryCount` starts at -1 (verified in
@@ -236,29 +430,66 @@ function transcribeStream(onTranscript, onInterim, { interimFinalizeMs } = {}) {
     // launched a new attempt (trust it); staying the same means this _connect() call was blocked (truly
     // exhausted, replace now). This needs no knowledge of the exact ceiling value to make the call — the
     // ceiling is still passed to the SDK (reconnectAttempts, above) purely to bound worst-case retry time.
-    let lastCloseRetryCount // undefined = "no close observed yet on this connection"
     socket.on('close', () => {
       if (!isCurrentConnection(connectionId)) return // already superseded — expected, not a failure
       if (destroyed) return
+
+      // Mirror the SDK's own _handleClose() → _clearTimeouts() ordering: cancel our mirror timer FIRST,
+      // before reading/using its flag, so a connection that's about to transition never leaves a dangling
+      // timer that could set retryBudgetResetExpected on a stale connectionId later (isCurrentConnection()
+      // inside the timer callback already guards that, but clearing here matches the timer-hygiene pattern
+      // used elsewhere in this file and avoids an unnecessary pending timer).
+      if (minUptimeMirrorTimer) { clearTimeout(minUptimeMirrorTimer); minUptimeMirrorTimer = null }
 
       const rawRetryCount = socket.socket?.retryCount
       if (typeof rawRetryCount !== 'number') {
         // Can't observe the SDK's internal retry state at all (unexpected shape/older SDK version) — don't
         // trust an internal retry we can't verify is happening; replace immediately (fail safe toward
         // replacing rather than silently going deaf for an unbounded time).
-        console.warn('[Deepgram] connection closed, retry state unreadable — creating replacement immediately (fail-safe)')
+        console.warn(`[Deepgram] connection closed connectionId=${connectionId}, retry state unreadable — creating replacement immediately (fail-safe)`)
         currentSocket = null
         createConnection()
         return
       }
 
+      // Review-identified guard (2026-09-01, refined 2026-09-02): if our mirror timer's callback has
+      // actually fired since the most recent open on this connectionId, that's real evidence the SDK's own
+      // _acceptOpen() (ws.js) fired too and silently reset its internal retryCount to 0 — see the
+      // retryBudgetResetExpected declaration above for why this is timer-completion-based, not a wall-clock
+      // comparison. A lastCloseRetryCount recorded before that reset is stale — comparing it against a fresh
+      // post-reset value would read as "unchanged" by sheer numeric coincidence, not because the SDK is
+      // actually blocked, wrongly triggering exhaustion and abandoning a healthy internal retry. A
+      // connection that never actually opened (still failing its very first handshake attempts) never has
+      // retryBudgetResetExpected set true — entirely unaffected, matching existing exhaustion-detection
+      // behavior for that case exactly.
+      if (retryBudgetResetExpected) {
+        lastCloseRetryCount = undefined
+      }
+      retryBudgetResetExpected = false
+
       if (lastCloseRetryCount !== rawRetryCount) {
         lastCloseRetryCount = rawRetryCount
-        console.warn(`[Deepgram] connection dropped, SDK retrying internally (retryCount=${rawRetryCount}) — not creating a replacement`)
+        console.warn(`[Deepgram] connection dropped connectionId=${connectionId}, SDK retrying internally (retryCount=${rawRetryCount}) — not creating a replacement`)
+        // Review-identified gap: this branch keeps the SAME connectionId/V1Socket (the SDK is retrying
+        // internally on it), but the underlying transport genuinely went back to not-open. socketReady must
+        // track that, or write() keeps taking the direct sendMedia() path into a socket that just dropped —
+        // the exact same failure mode this whole fix started from, just mid-call instead of at handshake.
+        // Only fires on the ready→not-ready transition (guarded by `if (socketReady)`) so a connection that
+        // was never ready in the first place (still on its original handshake attempt) is unaffected — its
+        // original readiness timeout from createConnection() is still the one ticking.
+        if (socketReady) {
+          socketReady = false
+          hasLoggedBufferingStart = false
+          console.warn(`[Deepgram] connection dropped connectionId=${connectionId} while already ready — audio buffers again until the SDK's internal retry re-opens it`)
+          currentReadinessTimeout = setTimeout(() => {
+            if (!isCurrentConnection(connectionId) || socketReady) return
+            console.warn(`[Deepgram] readiness timeout (post-drop) connectionId=${connectionId} elapsedMs=${Date.now() - currentConnectionStartedAt} readyState=${currentSocket?.readyState} retryCount=${currentSocket?.socket?.retryCount} bufferedBytes=${audioBufferBytes}`)
+          }, DEEPGRAM_READINESS_TIMEOUT_MS)
+        }
         return
       }
 
-      console.warn(`[Deepgram] SDK internal reconnect attempts exhausted (retryCount=${rawRetryCount} unchanged since last close) — creating replacement connection`)
+      console.warn(`[Deepgram] SDK internal reconnect attempts exhausted connectionId=${connectionId} (retryCount=${rawRetryCount} unchanged since last close) — creating replacement connection`)
       currentSocket = null
       createConnection()
     })
@@ -269,10 +500,32 @@ function transcribeStream(onTranscript, onInterim, { interimFinalizeMs } = {}) {
   return {
     write(mulawBuffer) {
       if (destroyed || !currentSocket) return // dropped during (re)connect window — same accepted trade-off googleSTT.js already makes during its own cold-mute/rotation windows
+      if (!socketReady) {
+        // Bounded pre-open buffer (locked design) — hold the audio instead of throwing it away, so a slow
+        // (but eventually successful) handshake doesn't silently lose the customer's first utterance.
+        // Overflow policy: drop NEWEST, keep OLDEST (see droppedFrameCount comment above) — once full, this
+        // frame is rejected outright, never evicts what's already buffered.
+        if (audioBufferBytes + mulawBuffer.length <= PRE_OPEN_BUFFER_MAX_BYTES) {
+          if (!hasLoggedBufferingStart) {
+            // One-time marker per connection (not per-frame — a frame arrives every ~20ms, logging every one
+            // would be 50 lines/sec of noise) so a smoke-test log reader can see buffering genuinely started
+            // during the handshake window, distinct from silence.
+            hasLoggedBufferingStart = true
+            console.log(`[Deepgram] pre-open buffering started connectionId=${currentConnectionId}`)
+          }
+          audioBuffer.push(mulawBuffer)
+          audioBufferBytes += mulawBuffer.length
+        } else {
+          droppedFrameCount++
+          droppedBytes += mulawBuffer.length
+          console.warn(`[Deepgram] pre-open buffer full connectionId=${currentConnectionId} capBytes=${PRE_OPEN_BUFFER_MAX_BYTES} — dropping frame #${droppedFrameCount} (${mulawBuffer.length} bytes, ${droppedBytes} bytes dropped total this connection)`)
+        }
+        return
+      }
       try {
         currentSocket.sendMedia(mulawBuffer)
       } catch (e) {
-        console.error('[Deepgram] write error:', e.message)
+        console.error(`[Deepgram] write error connectionId=${currentConnectionId}:`, e.message)
       }
     },
     end() {
@@ -286,6 +539,7 @@ function transcribeStream(onTranscript, onInterim, { interimFinalizeMs } = {}) {
       // connection after end() was already called.
       destroyed = true
       currentConnectionId = null
+      if (currentReadinessTimeout) { clearTimeout(currentReadinessTimeout); currentReadinessTimeout = null }
       try { currentSocket?.close() } catch (_) {}
       currentSocket = null
     },

@@ -7,7 +7,11 @@ const assert = require('node:assert/strict')
 
 const state = { connectAttempts: [], sockets: [], connectImpl: null }
 
-function makeFakeSocket({ retryCount, reentrantClose } = {}) {
+// WebSocket readyState constants (standard values, verified against the installed SDK's ws.js:477-487).
+const WS_CONNECTING = 0
+const WS_OPEN = 1
+
+function makeFakeSocket({ retryCount, reentrantClose, readyState = WS_OPEN } = {}) {
   const handlers = {}
   const socket = {
     on: (event, cb) => { handlers[event] = cb },
@@ -19,6 +23,11 @@ function makeFakeSocket({ retryCount, reentrantClose } = {}) {
     close: () => { socket.closed = true; if (reentrantClose) handlers.close?.({ code: 1000 }) },
     sentMedia: [],
     closed: false,
+    // Defaults to OPEN so every EXISTING test (message parsing, ownership invariants, reconnect logic) that
+    // doesn't care about the connect handshake itself keeps working unchanged — the adapter's synchronous
+    // readyState snapshot marks the connection ready immediately in that case, matching pre-readiness-fix
+    // behavior. Readiness-lifecycle tests below pass WS_CONNECTING explicitly and drive it via _emit('open').
+    readyState,
     // V1Socket exposes the underlying ReconnectingWebSocket as a public `.socket` field (verified against
     // the installed SDK's actual ws.js source) — retryCount is a real public getter on it. Only set on the
     // fake when a test explicitly passes one, so tests that don't care exercise the adapter's fail-safe
@@ -429,4 +438,332 @@ test('utteranceId เพิ่มขึ้นทีละ 1 ต่อ utterance 
   assert.equal(receivedMetas[0].utteranceId, 1)
   assert.equal(receivedMetas[1].utteranceId, 2)
   stream.end()
+})
+
+// ===== Socket readiness + pre-open buffer (Implementation Gate "Deepgram Live Socket Readiness +
+// Handshake Diagnostics", 2026-08-31) — production proved `currentSocket !== null` was being used as a
+// stand-in for "ready to send," which is false: a V1Socket object exists the instant connect() resolves,
+// long before the underlying WebSocket handshake actually completes. Test labels A-H below map to the
+// scenarios locked in the Implementation Gate; D is covered by the pre-existing "write(mulawBuffer) ส่ง
+// buffer ตรงๆ..." test above (default readyState=OPEN already exercises "audio after OPEN sent
+// immediately"), so it isn't duplicated here. H is the pre-existing LIFECYCLE INVARIANT test above,
+// confirmed unaffected by this change via the full suite run, not a new test.
+
+test('Readiness A: connect() resolves ให้ V1Socket แต่ readyState ยังเป็น CONNECTING → write() ต้องไม่เรียก sendMedia() เลย', async () => {
+  state.connectImpl = async () => {
+    const socket = makeFakeSocket({ readyState: WS_CONNECTING })
+    state.sockets.push(socket)
+    return socket
+  }
+  const stream = transcribeStream(() => {}, () => {})
+  await flushMicrotasks()
+  stream.write(Buffer.from([1, 2, 3]))
+  assert.equal(state.sockets[0].sentMedia.length, 0, 'ยังไม่ OPEN ต้องไม่ sendMedia เลยแม้แต่ครั้งเดียว')
+  stream.end()
+})
+
+test('Readiness B: audio ที่มาก่อน OPEN ต้องถูก buffer ไว้ (ไม่ใช่ทิ้งเงียบๆ เหมือนพฤติกรรมเดิมก่อนแก้)', async () => {
+  state.connectImpl = async () => {
+    const socket = makeFakeSocket({ readyState: WS_CONNECTING })
+    state.sockets.push(socket)
+    return socket
+  }
+  const stream = transcribeStream(() => {}, () => {})
+  await flushMicrotasks()
+  stream.write(Buffer.from([1, 2]))
+  stream.write(Buffer.from([3, 4]))
+  assert.equal(state.sockets[0].sentMedia.length, 0)
+  // ยืนยันทางอ้อมว่า buffer เก็บไว้จริง (ไม่ใช่ทิ้ง) โดยเปิดแล้วดูว่า flush ออกมา — proof เต็มอยู่ใน Readiness C
+  state.sockets[0]._emit('open')
+  assert.equal(state.sockets[0].sentMedia.length, 2, 'audio ที่ buffer ไว้ก่อนหน้าต้องออกมาครบหลัง open')
+  stream.end()
+})
+
+test('Readiness C: หลัง open event → buffered audio ถูก flush ครบ เรียงตามลำดับเดิม และครั้งเดียวเท่านั้นแม้ open ยิงซ้ำ', async () => {
+  state.connectImpl = async () => {
+    const socket = makeFakeSocket({ readyState: WS_CONNECTING })
+    state.sockets.push(socket)
+    return socket
+  }
+  const stream = transcribeStream(() => {}, () => {})
+  await flushMicrotasks()
+  const frame1 = Buffer.from([1])
+  const frame2 = Buffer.from([2])
+  const frame3 = Buffer.from([3])
+  stream.write(frame1)
+  stream.write(frame2)
+  state.sockets[0]._emit('open')
+  stream.write(frame3) // มาหลัง open แล้ว — ต้องส่งทันที ไม่ผ่าน buffer อีก
+  assert.deepEqual(state.sockets[0].sentMedia, [frame1, frame2, frame3], 'ต้องเรียงตามลำดับเดิมเป๊ะ ทั้งส่วนที่ flush และส่วนที่ส่งสด')
+  state.sockets[0]._emit('open') // จำลอง open ยิงซ้ำ (ไม่ควรเกิดจริง แต่ต้องปลอดภัยถ้าเกิด)
+  assert.equal(state.sockets[0].sentMedia.length, 3, 'flush ต้องเกิดครั้งเดียวเท่านั้น ห้าม flush ซ้ำแม้ open event จะยิงซ้ำ')
+  stream.end()
+})
+
+test('Readiness E: ครบ readiness timeout แล้วยังไม่ OPEN → ยังไม่ sendMedia, มี diagnostic log ชัดเจน, และไม่สร้าง connection ใหม่เอง (หน้าที่นั้นเป็นของ SDK reconnect + close-handler เดิม)', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const warnCalls = []
+  const originalWarn = console.warn
+  console.warn = (...args) => { warnCalls.push(args.join(' ')) }
+  try {
+    state.connectImpl = async () => {
+      const socket = makeFakeSocket({ readyState: WS_CONNECTING })
+      state.sockets.push(socket)
+      return socket
+    }
+    const stream = transcribeStream(() => {}, () => {})
+    await flushMicrotasks()
+    stream.write(Buffer.from([1]))
+    t.mock.timers.tick(6000)
+    assert.equal(state.sockets[0].sentMedia.length, 0, 'ยัง CONNECTING ต้องไม่ sendMedia แม้ timeout ผ่านไปแล้ว')
+    assert.equal(state.sockets.length, 1, 'readiness timeout ต้องไม่สร้าง parallel connection เอง')
+    assert.ok(warnCalls.some(m => m.includes('readiness timeout') && m.includes('connectionId=')), 'ต้องมี diagnostic log ที่ระบุ connectionId ชัดเจนเมื่อ timeout')
+
+    // Review focus #1: timeout ต้องเป็น diagnostic-only จริง — connection เดิม (connectionId เดิม) ต้อง "ไม่ถูก
+    // poison" ถ้า SDK เปิดสำเร็จช้าๆ ทีหลัง (เช่นวินาทีที่ 7) open handler ต้องยัง set ready + flush ได้ตามปกติ
+    state.sockets[0]._emit('open')
+    assert.equal(state.sockets[0].sentMedia.length, 1, 'open ที่มาช้าหลัง readiness timeout ต้องยัง flush buffer เดิมได้ตามปกติ ไม่ถูก poison')
+    assert.deepEqual(state.sockets[0].sentMedia[0], Buffer.from([1]))
+    stream.end()
+  } finally {
+    console.warn = originalWarn
+  }
+})
+
+test('Readiness F: stale connection ที่ถูกแทนที่ไปแล้ว ยิง open event มาช้า → ต้องไม่ flush buffer เก่าของมันเอง, ไม่ reset readiness, ไม่ cancel timer, และไม่กระทบ connection ปัจจุบันแม้แต่นิดเดียว', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const warnCalls = []
+  const logCalls = []
+  const originalWarn = console.warn
+  const originalLog = console.log
+  console.warn = (...args) => { warnCalls.push(args.join(' ')) }
+  console.log = (...args) => { logCalls.push(args.join(' ')) }
+  try {
+    state.connectImpl = async () => {
+      const socket = makeFakeSocket({ readyState: WS_CONNECTING })
+      state.sockets.push(socket)
+      return socket
+    }
+    const stream = transcribeStream(() => {}, () => {})
+    await flushMicrotasks()
+    const staleSocket = state.sockets[0]
+    stream.write(Buffer.from([1])) // buffer บน connection #1 (ยังไม่ open) — #1's readiness timer (T1) เริ่มนับ
+
+    staleSocket._emit('close') // retry state อ่านไม่ได้ (ไม่มี .socket) → fail-safe สร้าง replacement ทันที
+    await flushMicrotasks()
+    assert.equal(state.sockets.length, 2, 'ต้องมี replacement connection (#2) แล้ว')
+    const currentSocketFake = state.sockets[1] // #2's readiness timer (T2) เริ่มนับใหม่จากตอนนี้
+
+    // connectionIdCounter เป็น module-level state ที่ไม่ reset ระหว่าง test — ดึง connectionId จริงของ #2 จาก
+    // log แทนการเดาเลข แทนที่จะ hardcode
+    const createdLines = logCalls.filter(m => m.includes('connection object created'))
+    const currentConnectionIdMatch = createdLines[createdLines.length - 1]?.match(/connectionId=(\d+)/)
+    assert.ok(currentConnectionIdMatch, 'ต้องอ่าน connectionId จริงของ #2 จาก log ได้')
+    const currentConnectionIdStr = currentConnectionIdMatch[1]
+
+    staleSocket._emit('open') // #1 (stale) เพิ่ง open ช้าๆ ตามหลังมา — ไม่ควรมีผลอะไรอีกแล้ว
+
+    assert.equal(staleSocket.sentMedia.length, 0, 'stale connection ต้องไม่ flush buffer เก่าของมันเองเลย')
+    assert.equal(currentSocketFake.sentMedia.length, 0, 'current connection (#2) ต้องไม่ได้รับผลกระทบจาก late open ของตัวเก่าเลย — ยังไม่ ready ด้วยตัวมันเอง')
+
+    // Review focus #3: stale open ของ #1 ต้องไม่ cancel timer ของ #2 (T2) — เดินเวลาไปจนครบ readiness timeout
+    // ของ #2 เอง (ไม่ใช่ของ #1) แล้ว T2 ต้องยังยิงปกติ ไม่ใช่ถูกเคลียร์ทิ้งไปแล้วโดยไม่ได้ตั้งใจจาก markSocketReady
+    // ที่ควรจะ bail ก่อนแตะ currentReadinessTimeout เลยสำหรับ connectionId ที่ไม่ใช่ current
+    t.mock.timers.tick(6000)
+    assert.ok(warnCalls.some(m => m.includes('readiness timeout') && m.includes(`connectionId=${currentConnectionIdStr}`)), 'timer ของ connection ปัจจุบัน (#2) ต้องยังยิงตามปกติ ไม่ถูก cancel โดย stale open ของ #1')
+
+    currentSocketFake._emit('open') // #2 open ของจริง ด้วยตัวมันเอง
+    stream.write(Buffer.from([2]))
+    assert.deepEqual(currentSocketFake.sentMedia, [Buffer.from([2])], 'audio ใหม่ต้องไปหา connection ปัจจุบันเท่านั้น ไม่ปนกับตัวเก่า')
+    stream.end()
+  } finally {
+    console.warn = originalWarn
+    console.log = originalLog
+  }
+})
+
+test('Readiness G: end() ระหว่างรอ OPEN แล้ว open event มาช้าทีหลัง (late resolve) → zero side effect เด็ดขาด', async () => {
+  state.connectImpl = async () => {
+    const socket = makeFakeSocket({ readyState: WS_CONNECTING })
+    state.sockets.push(socket)
+    return socket
+  }
+  const stream = transcribeStream(() => {}, () => {})
+  await flushMicrotasks()
+  stream.write(Buffer.from([1, 2, 3])) // buffered, ยังไม่ ready
+
+  stream.end()
+  assert.equal(state.sockets[0].closed, true)
+
+  assert.doesNotThrow(() => state.sockets[0]._emit('open'), 'open event ที่มาช้าหลัง end() ต้องไม่ throw')
+  assert.equal(state.sockets[0].sentMedia.length, 0, 'end() แล้ว ห้าม flush buffer ที่ค้างอยู่ออกไปเด็ดขาด ไม่ว่า open จะยิงมาช้าแค่ไหนก็ตาม')
+})
+
+test('Readiness (Review focus, 2026-09-01): OPEN → SDK internal reconnect บน connectionId เดิม (retryCount ขยับ, ไม่มี replacement connection) → socketReady ต้อง reset, audio ระหว่างนั้นต้องเข้า buffer ไม่ throw ไม่ sendMedia ทับ, แล้ว flush ครบเมื่อ open อีกครั้ง', async () => {
+  const fakeInner = { retryCount: 0 }
+  state.connectImpl = async () => {
+    const socket = makeFakeSocket({ readyState: WS_OPEN }) // เปิดสำเร็จตั้งแต่แรก (synchronous-snapshot)
+    socket.socket = fakeInner
+    state.sockets.push(socket)
+    return socket
+  }
+  const stream = transcribeStream(() => {}, () => {})
+  await flushMicrotasks()
+  const socket = state.sockets[0]
+
+  const preDropFrame = Buffer.from([1])
+  stream.write(preDropFrame)
+  assert.deepEqual(socket.sentMedia, [preDropFrame], 'ตอน OPEN อยู่ปกติ ต้องส่งตรงทันที ไม่ผ่าน buffer')
+
+  // จำลอง transport drop กลาง call — SDK retry เองภายใน (retryCount 0→1) connectionId เดิม ไม่สร้าง replacement
+  fakeInner.retryCount = 1
+  socket._emit('close')
+  await flushMicrotasks()
+  assert.equal(state.sockets.length, 1, 'retryCount ขยับ (0→1) ต้องไม่สร้าง replacement connection ใหม่ — connectionId เดิมยังคงอยู่')
+
+  // ระหว่างที่ SDK กำลัง retry อยู่ (ยังไม่ open ใหม่) audio ที่เข้ามาต้อง buffer ไว้ ไม่ throw ไม่ sendMedia ทับ socket
+  // ที่หลุดไปแล้ว (นี่คือ gap ที่ระบุตรงๆ: ก่อนแก้ socketReady จะยังเป็น true ค้างอยู่ ทำให้ write() พยายาม sendMedia
+  // ต่อไปเรื่อยๆ ระหว่าง drop เหมือน bug เดิมที่ production เจอ เพียงแต่เกิดกลางสายแทนที่จะเป็นตอน handshake)
+  const duringDropFrame = Buffer.from([2])
+  assert.doesNotThrow(() => stream.write(duringDropFrame))
+  assert.deepEqual(socket.sentMedia, [preDropFrame], 'ระหว่าง drop ต้องไม่มี sendMedia ใหม่เกิดขึ้นเลย — audio ต้องเข้า buffer แทน')
+
+  // SDK retry สำเร็จ — 'open' ยิงอีกครั้งบน V1Socket ตัวเดิม (connectionId เดิม, persistent listener)
+  socket._emit('open')
+  assert.deepEqual(socket.sentMedia, [preDropFrame, duringDropFrame], 'audio ที่ buffer ไว้ระหว่าง drop ต้องถูก flush ทันทีที่ open อีกครั้ง เรียงลำดับเดิม')
+
+  const afterReopenFrame = Buffer.from([3])
+  stream.write(afterReopenFrame)
+  assert.deepEqual(socket.sentMedia, [preDropFrame, duringDropFrame, afterReopenFrame], 'หลัง reopen แล้ว audio ใหม่ต้องส่งตรงทันทีอีกครั้ง ไม่ค้างอยู่ใน buffer')
+  stream.end()
+})
+
+test('Reconnect (Review focus, 2026-09-01): OPEN เสถียรเกิน minUptime (5000ms) → SDK reset retryCount ภายใน (invisible) → drop รอบสองที่ raw ซ้ำค่าเดิมโดยบังเอิญ ต้องไม่ถูกเข้าใจผิดว่า exhausted', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] })
+  const fakeInner = { retryCount: 0 }
+  state.connectImpl = async () => {
+    const socket = makeFakeSocket({ readyState: WS_OPEN })
+    socket.socket = fakeInner
+    state.sockets.push(socket)
+    return socket
+  }
+  const stream = transcribeStream(() => {}, () => {})
+  await flushMicrotasks()
+  const socket = state.sockets[0]
+
+  // Drop #1: SDK retry เอง (retryCount 0→1) — adapter เห็นครั้งแรกบน connectionId นี้ ต้อง trust ว่า retrying
+  fakeInner.retryCount = 1
+  socket._emit('close')
+  await flushMicrotasks()
+  assert.equal(state.sockets.length, 1, 'drop แรก ต้อง trust SDK retry ไม่สร้าง replacement')
+
+  // Retry สำเร็จ — open อีกครั้งบน connectionId เดิม (persistent listener)
+  socket._emit('open')
+
+  // เดินเวลาผ่าน minUptime (5000ms) — ในโลกจริง SDK's _acceptOpen() จะรีเซ็ต retryCount ภายในเป็น 0 ตรงนี้เอง
+  // (invisible ต่อ adapter โดยสิ้นเชิง ไม่มี event ใดๆ ยิงออกมาบอก)
+  t.mock.timers.tick(6000)
+
+  // Drop #2: SDK retry เองอีกครั้งหลัง reset (retryCount 0→1) — บังเอิญได้ raw=1 ซ้ำกับ observation แรกเป๊ะ
+  fakeInner.retryCount = 1
+  socket._emit('close')
+  await flushMicrotasks()
+  assert.equal(state.sockets.length, 1, 'raw ซ้ำกันเพราะ SDK reset ไปแล้วจริง (เสถียรเกิน minUptime) ไม่ใช่เพราะ exhausted — ยังต้องไม่สร้าง replacement ใหม่ (นี่คือ bug ที่ระบุตรงๆ: ถ้าไม่แก้ elapsed-time reset assertion นี้จะ fail เพราะ code เดิมจะเข้าใจผิดว่า exhausted)')
+  stream.end()
+})
+
+test('Reconnect (Review focus, 2026-09-01): final allowed attempt เปิดสำเร็จสั้นๆ ก่อน minUptime แล้วหลุดอีกครั้ง (retryCount ที่ ceiling ไม่เปลี่ยนจริง) → ต้องยังตรวจจับ exhaustion ได้ถูกต้อง ไม่ถูกกลบด้วย fix ของ minUptime-reset', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] })
+  const fakeInner = { retryCount: 5 } // observation แรก: SDK เพิ่ง launch attempt สุดท้ายที่อนุญาต (retryCount 4→5)
+  state.connectImpl = async () => {
+    const socket = makeFakeSocket({ readyState: WS_CONNECTING }) // ยังไม่เคย open เลยตอนเริ่ม
+    socket.socket = fakeInner
+    state.sockets.push(socket)
+    return socket
+  }
+  const stream = transcribeStream(() => {}, () => {})
+  await flushMicrotasks()
+  const socket = state.sockets[0]
+
+  // observation แรกที่ raw=5 — connection นี้ยังไม่เคย open เลยสักครั้ง (mirror timer ยังไม่เคยถูก arm) ต้อง trust
+  // ว่า attempt สุดท้ายเพิ่ง launch อยู่ ไม่ใช่ exhausted
+  socket._emit('close')
+  await flushMicrotasks()
+  assert.equal(state.sockets.length, 1, 'observation แรกที่ raw=5 ต้อง trust ว่ายัง retry อยู่ (attempt สุดท้ายเพิ่ง launch)')
+
+  // attempt สุดท้ายเปิดสำเร็จ — แต่สั้นมาก (ไม่ถึง minUptime) แล้วหลุดอีกครั้งก่อนที่ mirror timer (และ SDK's
+  // uptime timer จริง) จะทันยิง callback เลย
+  socket._emit('open')
+  t.mock.timers.tick(500) // ผ่านไปแค่ 500ms — mirror timer callback ยังไม่ทันทำงาน (armed ไว้ 5000ms)
+  // fakeInner.retryCount ยังเป็น 5 เหมือนเดิม (attempt ถัดไปถูก SDK บล็อกเอง เพราะ retryCount(5) >= maxRetries(5))
+  socket._emit('close')
+  await flushMicrotasks()
+  assert.equal(state.sockets.length, 2, 'raw ซ้ำที่ 5 หลัง open สั้นๆ ก่อน mirror timer ยิง คือ exhausted จริง (ไม่ใช่ reset) — ต้องสร้าง replacement ให้ถูกต้อง ไม่ถูกกลบด้วย fix ของ timer-mirror')
+  stream.end()
+})
+
+test('Reconnect (Review focus, 2026-09-02): boundary ที่ขอบ minUptime พอดี (4999ms, ขาดไป 1ms) → mirror timer ต้องยังไม่ยิง callback เลย, exhaustion ยังตรวจจับได้ถูกต้องแม้ใกล้ threshold มาก', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] })
+  const fakeInner = { retryCount: 5 }
+  state.connectImpl = async () => {
+    const socket = makeFakeSocket({ readyState: WS_CONNECTING })
+    socket.socket = fakeInner
+    state.sockets.push(socket)
+    return socket
+  }
+  const stream = transcribeStream(() => {}, () => {})
+  await flushMicrotasks()
+  const socket = state.sockets[0]
+
+  socket._emit('close') // observation แรกที่ raw=5 — trust ว่ายัง retry อยู่
+  await flushMicrotasks()
+  assert.equal(state.sockets.length, 1)
+
+  socket._emit('open')
+  t.mock.timers.tick(4999) // ขาดไปแค่ 1ms จาก DEEPGRAM_SDK_MIN_UPTIME_MS (5000) — setTimeout ต้องยังไม่ยิง callback
+  socket._emit('close') // raw=5 ซ้ำเดิม — mirror timer ยังไม่เคยยิง (ตรวจสอบด้วยพฤติกรรม ไม่ใช่การอ่านค่า internal ตรงๆ)
+  await flushMicrotasks()
+  assert.equal(state.sockets.length, 2, 'ที่ 4999ms (ขาดไป 1ms พอดี) mirror timer ต้องยังไม่ยิง callback เลย — exhaustion ต้องยังตรวจจับได้ถูกต้อง ไม่ถูกกลบด้วย fix')
+  stream.end()
+})
+
+test('Readiness: pre-open buffer มีเพดานชัดเจน (คำนวณจาก byte/ms ของ 8kHz mulaw จริง) — เกิน cap แล้ว frame ใหม่ถูกทิ้ง (นโยบาย: drop newest, keep oldest) พร้อม log ที่ระบุจำนวน bytes/frames ที่ทิ้งจริง ไม่ใช่แค่คำเตือนกว้างๆ', async () => {
+  const warnCalls = []
+  const logCalls = []
+  const originalWarn = console.warn
+  const originalLog = console.log
+  console.warn = (...args) => { warnCalls.push(args.join(' ')) }
+  console.log = (...args) => { logCalls.push(args.join(' ')) }
+  try {
+    state.connectImpl = async () => {
+      const socket = makeFakeSocket({ readyState: WS_CONNECTING })
+      state.sockets.push(socket)
+      return socket
+    }
+    const stream = transcribeStream(() => {}, () => {})
+    await flushMicrotasks()
+    const capFillingFrame = Buffer.alloc(12000, 7) // เท่ากับ cap พอดี (1500ms × 8 bytes/ms)
+    const overflowFrame1 = Buffer.from([9, 9]) // เกิน cap — ถูกทิ้ง (2 bytes)
+    const overflowFrame2 = Buffer.from([8, 8, 8]) // เกิน cap อีกครั้ง — ถูกทิ้งด้วย (3 bytes)
+    stream.write(capFillingFrame)
+    stream.write(overflowFrame1)
+    stream.write(overflowFrame2)
+    state.sockets[0]._emit('open')
+
+    // นโยบาย "drop newest, keep oldest" — frame แรกที่เข้ามาก่อน cap เต็มต้องรอดและถูก flush, ของที่มาทีหลัง
+    // (เกิน cap) ต้องหายไปจริง ไม่ปน ไม่แทนที่ของเดิม
+    assert.equal(state.sockets[0].sentMedia.length, 1, 'เฉพาะ frame ที่อยู่ใน cap (ตัวแรก) เท่านั้นที่ถูก flush')
+    assert.equal(state.sockets[0].sentMedia[0], capFillingFrame, 'ต้องเป็น frame ที่มาก่อน (oldest) ไม่ใช่ตัวที่มาทีหลัง')
+
+    // log ตอนทิ้งแต่ละ frame ต้องระบุจำนวน bytes ของ frame นั้นเอง และยอดสะสมของ connection นี้ ไม่ใช่แค่ "dropping frame" ลอยๆ
+    assert.ok(warnCalls.some(m => m.includes('pre-open buffer full') && m.includes('frame #1') && m.includes('2 bytes') && m.includes('2 bytes dropped total')), 'log แรกต้องระบุ frame #1, ขนาด 2 bytes, ยอดสะสม 2 bytes')
+    assert.ok(warnCalls.some(m => m.includes('pre-open buffer full') && m.includes('frame #2') && m.includes('3 bytes') && m.includes('5 bytes dropped total')), 'log ที่สองต้องระบุ frame #2, ขนาด 3 bytes, ยอดสะสม 5 bytes (2+3)')
+
+    // log ตอน flush (socket ready) ต้องสรุปยอด dropped ทั้งหมดของ connection นี้ไว้ด้วย ไม่ใช่หายไปเงียบๆ
+    assert.ok(logCalls.some(m => m.includes('socket ready') && m.includes('droppedFrames=2') && m.includes('droppedBytes=5')), 'flush log ต้องสรุปยอด dropped รวมของ connection นี้ (2 frames, 5 bytes) ให้เห็นชัดว่ามีการสูญเสียจริงเท่าไหร่')
+    stream.end()
+  } finally {
+    console.warn = originalWarn
+    console.log = originalLog
+  }
 })
