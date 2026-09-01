@@ -10,8 +10,9 @@ const state = { connectAttempts: [], sockets: [], connectImpl: null }
 // WebSocket readyState constants (standard values, verified against the installed SDK's ws.js:477-487).
 const WS_CONNECTING = 0
 const WS_OPEN = 1
+const WS_CLOSED = 3
 
-function makeFakeSocket({ retryCount, reentrantClose, readyState = WS_OPEN } = {}) {
+function makeFakeSocket({ retryCount, reentrantClose, readyState = WS_OPEN, onConnect, connectThrows } = {}) {
   const handlers = {}
   const socket = {
     on: (event, cb) => { handlers[event] = cb },
@@ -21,12 +22,28 @@ function makeFakeSocket({ retryCount, reentrantClose, readyState = WS_OPEN } = {
     // itself, in the same call — not just via a later async event). Off by default so tests that don't
     // care about this specific ordering keep the simpler "close() just marks closed" fake.
     close: () => { socket.closed = true; if (reentrantClose) handlers.close?.({ code: 1000 }) },
+    // Explicit startup (locked design, 2026-09-02) — mirrors the REAL public DeepgramClient contract
+    // (verified in CustomClient.js: client.listen.v1.connect() returns a socket constructed with
+    // startClosed:true; nothing starts until socket.connect() is called). Defaults to a harmless no-op that
+    // just counts calls and leaves readyState exactly as configured — this is what keeps every EXISTING
+    // test (default readyState=WS_OPEN, never caring about the handshake itself) passing unchanged: the
+    // adapter's post-startup snapshot reads whatever readyState already was, same as before this fix.
+    // Startup-lifecycle tests below pass readyState:WS_CLOSED plus an explicit onConnect callback to drive
+    // the CLOSED→CONNECTING/OPEN transition the same way the real wrapper's connect() would.
+    connect: () => {
+      socket.connectCallCount++
+      if (connectThrows) throw (connectThrows instanceof Error ? connectThrows : new Error(String(connectThrows)))
+      onConnect?.(socket, handlers)
+      return socket
+    },
+    connectCallCount: 0,
     sentMedia: [],
     closed: false,
     // Defaults to OPEN so every EXISTING test (message parsing, ownership invariants, reconnect logic) that
-    // doesn't care about the connect handshake itself keeps working unchanged — the adapter's synchronous
+    // doesn't care about the connect handshake itself keeps working unchanged — the adapter's post-startup
     // readyState snapshot marks the connection ready immediately in that case, matching pre-readiness-fix
-    // behavior. Readiness-lifecycle tests below pass WS_CONNECTING explicitly and drive it via _emit('open').
+    // behavior. Readiness-lifecycle tests below pass WS_CONNECTING/WS_CLOSED explicitly and drive it via
+    // _emit('open') or onConnect.
     readyState,
     // V1Socket exposes the underlying ReconnectingWebSocket as a public `.socket` field (verified against
     // the installed SDK's actual ws.js source) — retryCount is a real public getter on it. Only set on the
@@ -440,6 +457,121 @@ test('utteranceId เพิ่มขึ้นทีละ 1 ต่อ utterance 
   stream.end()
 })
 
+// ===== Explicit socket startup (Implementation Gate "Deepgram CustomClient Explicit Socket Startup +
+// Diagnostic Log Throttling", 2026-09-02) — production proved the readiness fix above closed the bug it was
+// built for but exposed the REAL root cause: `require('@deepgram/sdk').DeepgramClient` resolves to
+// `CustomDeepgramClient` (dist/cjs/index.js:50), not the generated client this file's own header comment
+// originally (and incorrectly) verified `.connect()` auto-starts. CustomClient.js's
+// `WrappedListenV1Client.connect()` builds the underlying transport with `startClosed: true` — object
+// creation is NOT connection initiation on this runtime path. Confirmed live: callSid
+// CAac0792417318fa71504aaf8b736f8cd5, readyState=3(CLOSED)/retryCount=0 unchanged for the entire ~28s call,
+// zero open/error/close ever observed. Test labels A/B/C/E below map to the Implementation Gate's scenario
+// list; D (audio after OPEN sent immediately) is covered by the pre-existing "write(mulawBuffer) ส่ง
+// buffer ตรงๆ..." test above (default readyState=OPEN + no-op default connect() already exercises it), and
+// F (existing invariants unaffected) is the rest of this file's suite passing unchanged, not a new test.
+
+test('Explicit startup A: listen.v1.connect() คืน socket ที่ CLOSED (startClosed:true ตาม runtime contract จริงของ public DeepgramClient) → adapter ต้องเรียก socket.connect() เองพอดี 1 ครั้ง', async () => {
+  state.connectImpl = async () => {
+    const socket = makeFakeSocket({ readyState: WS_CLOSED })
+    state.sockets.push(socket)
+    return socket
+  }
+  const stream = transcribeStream(() => {}, () => {})
+  await flushMicrotasks()
+  assert.equal(state.sockets[0].connectCallCount, 1, 'ต้องเรียก socket.connect() เองพอดีครั้งเดียว ไม่มากไม่น้อยกว่านั้น')
+  stream.end()
+})
+
+test('Explicit startup B: handler (message/open/error/close) ต้อง register ก่อน socket.connect() เสมอ — ถ้า connect() emit open แบบ synchronous ต้องจับได้ ไม่พลาด และไม่ arm/flush ซ้ำ', async () => {
+  const logCalls = []
+  const originalLog = console.log
+  console.log = (...args) => { logCalls.push(args.join(' ')) }
+  try {
+    let openHandlerWasRegisteredBeforeConnect = false
+    state.connectImpl = async () => {
+      const socket = makeFakeSocket({
+        readyState: WS_CLOSED,
+        onConnect: (sock, handlers) => {
+          // ถ้า handler ยังไม่ถูก register ตอนนี้ synchronous open จะหายไปเงียบๆ — พิสูจน์ ordering ตรงๆ ไม่ใช่แค่สมมติ
+          openHandlerWasRegisteredBeforeConnect = typeof handlers.open === 'function'
+          sock.readyState = WS_OPEN
+          handlers.open?.()
+        },
+      })
+      state.sockets.push(socket)
+      return socket
+    }
+    const stream = transcribeStream(() => {}, () => {})
+    await flushMicrotasks()
+    assert.ok(openHandlerWasRegisteredBeforeConnect, 'open handler ต้องถูก register ไว้แล้วก่อน connect() ถูกเรียก')
+
+    const frame = Buffer.from([9])
+    stream.write(frame)
+    assert.deepEqual(state.sockets[0].sentMedia, [frame], 'socketReady ต้องเป็น true แล้วจาก synchronous open — ส่งตรงทันที ไม่ผ่าน buffer')
+
+    const readyLogs = logCalls.filter(m => m.includes('socket ready'))
+    assert.equal(readyLogs.length, 1, 'ต้อง mark ready แค่ครั้งเดียว — open handler กับ post-startup snapshot ต้องไม่ arm/flush ซ้ำกันแม้ทั้งคู่จะเห็นว่า OPEN แล้ว')
+    stream.end()
+  } finally {
+    console.log = originalLog
+  }
+})
+
+test('Explicit startup C: async ปกติ — CLOSED ก่อน connect(), หลัง connect() เป็น CONNECTING (ไม่ใช่ OPEN ทันที), audio ที่มาระหว่างนั้น buffer ไว้, พอ open จริง flush ครบตามลำดับครั้งเดียว, หลังจากนั้นส่งตรงทันที', async () => {
+  state.connectImpl = async () => {
+    const socket = makeFakeSocket({
+      readyState: WS_CLOSED,
+      onConnect: (sock) => { sock.readyState = WS_CONNECTING }, // เหมือนของจริง: connect() ทำให้เป็น CONNECTING ไม่ใช่ OPEN ทันที
+    })
+    state.sockets.push(socket)
+    return socket
+  }
+  const stream = transcribeStream(() => {}, () => {})
+  await flushMicrotasks()
+  const socket = state.sockets[0]
+  assert.equal(socket.connectCallCount, 1)
+  assert.equal(socket.readyState, WS_CONNECTING)
+
+  const frame1 = Buffer.from([1])
+  const frame2 = Buffer.from([2])
+  stream.write(frame1)
+  stream.write(frame2)
+  assert.equal(socket.sentMedia.length, 0, 'ยัง CONNECTING ต้อง buffer ไว้ ไม่ sendMedia')
+
+  socket._emit('open') // handshake จริงเสร็จภายหลัง แบบ async
+  assert.deepEqual(socket.sentMedia, [frame1, frame2], 'flush ครบตามลำดับเดิม ครั้งเดียว')
+
+  const frame3 = Buffer.from([3])
+  stream.write(frame3)
+  assert.deepEqual(socket.sentMedia, [frame1, frame2, frame3], 'หลัง OPEN แล้ว audio ใหม่ต้องส่งตรงทันที ไม่ผ่าน buffer อีก')
+  stream.end()
+})
+
+test('Explicit startup E: socket.connect() throw แบบ synchronous → ต้องไม่หลุดเป็น uncaught exception, มี diagnostic log ที่ระบุ connectionId ชัดเจน, และไม่ sendMedia เข้า socket ที่ตายไปแล้ว', async () => {
+  const errorCalls = []
+  const originalError = console.error
+  console.error = (...args) => { errorCalls.push(args.join(' ')) }
+  try {
+    state.connectImpl = async () => {
+      const socket = makeFakeSocket({ readyState: WS_CLOSED, connectThrows: 'synchronous startup failure จำลอง' })
+      state.sockets.push(socket)
+      return socket
+    }
+    let stream
+    assert.doesNotThrow(() => { stream = transcribeStream(() => {}, () => {}) })
+    await flushMicrotasks()
+    assert.ok(
+      errorCalls.some(m => m.includes('socket.connect()') && m.includes('connectionId=') && m.includes('synchronous startup failure จำลอง')),
+      'ต้องมี diagnostic log ที่ระบุ connectionId ชัดเจนเมื่อ socket.connect() throw'
+    )
+    assert.doesNotThrow(() => stream.write(Buffer.from([1])))
+    assert.equal(state.sockets[0].sentMedia.length, 0, 'ห้าม sendMedia เข้า socket ที่ connect() throw ไปแล้วเด็ดขาด')
+    stream.end()
+  } finally {
+    console.error = originalError
+  }
+})
+
 // ===== Socket readiness + pre-open buffer (Implementation Gate "Deepgram Live Socket Readiness +
 // Handshake Diagnostics", 2026-08-31) — production proved `currentSocket !== null` was being used as a
 // stand-in for "ready to send," which is false: a V1Socket object exists the instant connect() resolves,
@@ -727,7 +859,7 @@ test('Reconnect (Review focus, 2026-09-02): boundary ที่ขอบ minUptim
   stream.end()
 })
 
-test('Readiness: pre-open buffer มีเพดานชัดเจน (คำนวณจาก byte/ms ของ 8kHz mulaw จริง) — เกิน cap แล้ว frame ใหม่ถูกทิ้ง (นโยบาย: drop newest, keep oldest) พร้อม log ที่ระบุจำนวน bytes/frames ที่ทิ้งจริง ไม่ใช่แค่คำเตือนกว้างๆ', async () => {
+test('Readiness: pre-open buffer มีเพดานชัดเจน (คำนวณจาก byte/ms ของ 8kHz mulaw จริง) — เกิน cap แล้ว frame ใหม่ถูกทิ้ง (นโยบาย: drop newest, keep oldest) โดย counter ยังนับทุก frame ถูกต้องเสมอ', async () => {
   const warnCalls = []
   const logCalls = []
   const originalWarn = console.warn
@@ -755,15 +887,114 @@ test('Readiness: pre-open buffer มีเพดานชัดเจน (คำ
     assert.equal(state.sockets[0].sentMedia.length, 1, 'เฉพาะ frame ที่อยู่ใน cap (ตัวแรก) เท่านั้นที่ถูก flush')
     assert.equal(state.sockets[0].sentMedia[0], capFillingFrame, 'ต้องเป็น frame ที่มาก่อน (oldest) ไม่ใช่ตัวที่มาทีหลัง')
 
-    // log ตอนทิ้งแต่ละ frame ต้องระบุจำนวน bytes ของ frame นั้นเอง และยอดสะสมของ connection นี้ ไม่ใช่แค่ "dropping frame" ลอยๆ
+    // log ตอนทิ้ง frame แรกต้องระบุจำนวน bytes ของ frame นั้นเอง และยอดสะสมของ connection นี้ ไม่ใช่แค่ "dropping frame" ลอยๆ
     assert.ok(warnCalls.some(m => m.includes('pre-open buffer full') && m.includes('frame #1') && m.includes('2 bytes') && m.includes('2 bytes dropped total')), 'log แรกต้องระบุ frame #1, ขนาด 2 bytes, ยอดสะสม 2 bytes')
-    assert.ok(warnCalls.some(m => m.includes('pre-open buffer full') && m.includes('frame #2') && m.includes('3 bytes') && m.includes('5 bytes dropped total')), 'log ที่สองต้องระบุ frame #2, ขนาด 3 bytes, ยอดสะสม 5 bytes (2+3)')
 
-    // log ตอน flush (socket ready) ต้องสรุปยอด dropped ทั้งหมดของ connection นี้ไว้ด้วย ไม่ใช่หายไปเงียบๆ
+    // log ตอน flush (socket ready) ต้องสรุปยอด dropped ทั้งหมดของ connection นี้ไว้ด้วย ไม่ใช่หายไปเงียบๆ — counter
+    // ยังนับ frame #2 ถูกต้องแม้ log ของมันจะถูก throttle ไป (ดู test log-throttling แยกต่างหากด้านล่าง)
     assert.ok(logCalls.some(m => m.includes('socket ready') && m.includes('droppedFrames=2') && m.includes('droppedBytes=5')), 'flush log ต้องสรุปยอด dropped รวมของ connection นี้ (2 frames, 5 bytes) ให้เห็นชัดว่ามีการสูญเสียจริงเท่าไหร่')
     stream.end()
   } finally {
     console.warn = originalWarn
     console.log = originalLog
+  }
+})
+
+test('Readiness (Review focus, 2026-09-02): log-throttling ของ pre-open buffer-full warning — drop #1 log ทันที, ระหว่างนั้นเงียบ, ทุก DROP_LOG_INTERVAL_FRAMES (50) log aggregate อีกครั้ง, แต่ counter สะสม (droppedFrames/droppedBytes) ต้อง accurate ทุก frame เสมอไม่ว่าจะ log หรือไม่', async () => {
+  const warnCalls = []
+  const logCalls = []
+  const originalWarn = console.warn
+  const originalLog = console.log
+  console.warn = (...args) => { warnCalls.push(args.join(' ')) }
+  console.log = (...args) => { logCalls.push(args.join(' ')) }
+  try {
+    state.connectImpl = async () => {
+      const socket = makeFakeSocket({ readyState: WS_CONNECTING })
+      state.sockets.push(socket)
+      return socket
+    }
+    const stream = transcribeStream(() => {}, () => {})
+    await flushMicrotasks()
+    stream.write(Buffer.alloc(12000, 7)) // เติม buffer จนเต็มพอดี
+    for (let i = 0; i < 50; i++) stream.write(Buffer.from([9, 9])) // 50 frame ที่เกิน cap ทั้งหมด (2 bytes/frame)
+    state.sockets[0]._emit('open')
+
+    const dropLogs = warnCalls.filter(m => m.includes('pre-open buffer full'))
+    assert.equal(dropLogs.length, 2, 'จาก 50 frame ที่ถูกทิ้งจริง ต้อง log แค่ 2 ครั้งเท่านั้น (frame #1 กับ frame #50) ไม่ใช่ log ทุก frame — production เจอ ~50 log/sec จากบั๊กนี้จริง')
+    assert.ok(dropLogs[0].includes('frame #1') && dropLogs[0].includes('2 bytes dropped total'), 'log แรกต้องเป็น frame #1 ทันที')
+    assert.ok(dropLogs[1].includes('frame #50') && dropLogs[1].includes('100 bytes dropped total'), 'log ที่สองต้องเป็น frame #50 (aggregate ตัวถัดไป) พร้อมยอดสะสมถูกต้อง (50×2=100 bytes)')
+
+    assert.ok(logCalls.some(m => m.includes('socket ready') && m.includes('droppedFrames=50') && m.includes('droppedBytes=100')), 'flush summary ต้องถูกต้องครบ 50 frames/100 bytes แม้ log ระหว่างทางจะถูก throttle ไปเกือบหมด — พิสูจน์ว่า counter ไม่เคยพลาดแม้แต่ frame เดียว')
+    stream.end()
+  } finally {
+    console.warn = originalWarn
+    console.log = originalLog
+  }
+})
+
+test('Readiness (Review focus, 2026-09-02): end() ขณะที่ connection ไม่เคย ready เลย และมี audio ถูกทิ้งไปแล้ว → ต้องมี final summary log เดียวสรุปยอดความเสียหายจริง ไม่ใช่หายไปเงียบๆ (ต่างจาก markSocketReady() ที่ไม่มีวันถูกเรียกในเคสนี้)', async () => {
+  const warnCalls = []
+  const originalWarn = console.warn
+  console.warn = (...args) => { warnCalls.push(args.join(' ')) }
+  try {
+    state.connectImpl = async () => {
+      const socket = makeFakeSocket({ readyState: WS_CLOSED }) // ไม่มี onConnect — ไม่เคย OPEN เลยตลอด
+      state.sockets.push(socket)
+      return socket
+    }
+    const stream = transcribeStream(() => {}, () => {})
+    await flushMicrotasks()
+    stream.write(Buffer.alloc(12000, 7))
+    stream.write(Buffer.from([1, 1])) // เกิน cap — ถูกทิ้ง
+
+    stream.end() // จบสายทั้งที่ connection ไม่เคย ready เลย — markSocketReady() ไม่เคยถูกเรียก ไม่มี summary จากทางนั้น
+    assert.ok(
+      warnCalls.some(m => m.includes('connection ended while not ready') && m.includes('droppedFrames=1') && m.includes('droppedBytes=2')),
+      'ต้องมี final summary log ตอน end() ที่ระบุยอด dropped จริง (1 frame, 2 bytes) แม้ connection จะไม่เคย ready เลยตลอดทั้งสาย'
+    )
+  } finally {
+    console.warn = originalWarn
+  }
+})
+
+test('Readiness (Review focus IR-1, 2026-09-02): end() หลังจาก connection เคย OPEN สำเร็จ ใช้งานจริง แล้วหลุดกลางสาย (mid-call reconnect ทำให้ socketReady=false อีกครั้ง) → summary log ต้องไม่โกหกว่า "never ready" เพราะ !socketReady ไม่ได้แปลว่าไม่เคย ready มาก่อน', async () => {
+  const warnCalls = []
+  const originalWarn = console.warn
+  console.warn = (...args) => { warnCalls.push(args.join(' ')) }
+  try {
+    const fakeInner = { retryCount: 0 }
+    state.connectImpl = async () => {
+      const socket = makeFakeSocket({ readyState: WS_OPEN }) // OPEN สำเร็จตั้งแต่แรก (synchronous-snapshot)
+      socket.socket = fakeInner
+      state.sockets.push(socket)
+      return socket
+    }
+    const stream = transcribeStream(() => {}, () => {})
+    await flushMicrotasks()
+    const socket = state.sockets[0]
+
+    stream.write(Buffer.from([1])) // ใช้งานจริงตอน OPEN — ส่งตรงทันที ไม่ผ่าน buffer
+    assert.deepEqual(socket.sentMedia, [Buffer.from([1])], 'connection นี้เคย ready และใช้งานจริงไปแล้วก่อนหลุด')
+
+    // จำลอง transport drop กลางสาย — SDK retry เองภายใน (retryCount 0→1) ไม่สร้าง replacement — mid-call
+    // reconnect fix (Review focus 2026-09-01) reset socketReady กลับเป็น false ตรงนี้
+    fakeInner.retryCount = 1
+    socket._emit('close')
+    await flushMicrotasks()
+    assert.equal(state.sockets.length, 1, 'connectionId เดิม ไม่ใช่ replacement ใหม่')
+
+    // ระหว่างรอ SDK reconnect audio ใหม่เข้า buffer จนล้น cap
+    stream.write(Buffer.alloc(12000, 7))
+    stream.write(Buffer.from([2, 2])) // เกิน cap — ถูกทิ้ง
+
+    stream.end() // ลูกค้าวางสายก่อน SDK จะ reconnect สำเร็จ
+
+    const summaryLogs = warnCalls.filter(m => m.includes('connection ended while'))
+    assert.equal(summaryLogs.length, 1, 'ต้องมี summary log เดียว')
+    assert.ok(summaryLogs[0].includes('connection ended while not ready'), 'ต้องใช้คำว่า "not ready" (สถานะปัจจุบัน) เท่านั้น')
+    assert.ok(!summaryLogs[0].includes('never ready'), 'ห้ามใช้คำว่า "never ready" เด็ดขาด — connection นี้เคย ready และใช้งานจริงมาก่อนแล้ว ไม่ใช่ startup ที่ไม่เคยต่อติดเลย')
+    assert.ok(summaryLogs[0].includes('droppedFrames=1') && summaryLogs[0].includes('droppedBytes=2'), 'ยอด dropped ต้องยังถูกต้อง (เฉพาะช่วง mid-call drop เท่านั้น ไม่รวมตอนที่ยังใช้งานได้ปกติ)')
+  } finally {
+    console.warn = originalWarn
   }
 })

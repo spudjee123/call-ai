@@ -65,19 +65,51 @@
 // which ABORTS whatever attempt is already in flight and restarts from scratch — actively harmful, not a
 // fix. Do not add that call.
 //
+// SUPERSEDED 2026-09-02 — the paragraph above is real, verified analysis, but of the WRONG class: it
+// traces the SDK's GENERATED `V1Client` (api/resources/listen/resources/v1/client/Client.js), which this
+// adapter does NOT actually use. `require('@deepgram/sdk')` re-exports its public `DeepgramClient` as
+// `CustomClient.js`'s `CustomDeepgramClient` (verified directly: dist/cjs/index.js:50 —
+// `Object.defineProperty(exports, "DeepgramClient", { get: () => CustomClient_js_1.CustomDeepgramClient })`
+// — the generated client is separately exported there as `DefaultDeepgramClient`, not what this file
+// imports). `CustomDeepgramClient.listen.v1` returns a `WrappedListenV1Client` (also in CustomClient.js),
+// whose OWN `connect()` override calls `createWebSocketConnection()` with `startClosed: true` explicitly
+// (CustomClient.js:912,928) — on THIS runtime path, `client.listen.v1.connect()` deliberately returns an
+// UNSTARTED socket; the SDK's own JSDoc on the sibling `createConnection()` method says so outright:
+// "the returned socket is not connected until you call socket.connect()". This is not a contradiction of
+// the paragraph above — `startClosed: true` is exactly the condition that paragraph already identified as
+// the one case where auto-connect does NOT happen; the miss was not checking which class this app's own
+// `require()` actually resolves to before concluding "it isn't, here" for that option.
+//
+// `startClosed: true` makes `ReconnectingWebSocket`'s constructor set `_shouldReconnect = false`, so the
+// unconditional `this._connect()` call at its end returns immediately on `!this._shouldReconnect` without
+// creating `_ws`, without incrementing `_retryCount` (stays at its initial -1 forever). This fully explains
+// every piece of live evidence with no residual gap: `readyState` reads 3/CLOSED (the getter's fallback
+// path when `_ws` doesn't exist and `startClosed` is true — ws.js's readyState getter); the public
+// `retryCount` getter is `Math.max(this._retryCount, 0)`, so the log line `retryCount=0` is that -1 clamped
+// to zero, not "one attempt happened"; and no open/error/close ever fires because nothing downstream of
+// `_ws` can fire without `_ws` existing. Confirmed live: callSid CAac0792417318fa71504aaf8b736f8cd5,
+// 2026-09-01, `readyState=3 retryCount=0` unchanged for the entire ~28s call, zero open/error/close.
+//
+// Fix: the wrapper ships its own `WrappedListenV1Socket.connect()` (CustomClient.js:1096-1111) — a public
+// method, not a private/internal one, and specifically NOT the same call this file's superseded analysis
+// above warned against (that was `V1Socket.connect()` on the GENERATED socket, calling `.reconnect()` on an
+// ALREADY-auto-connecting transport — actively harmful for that class; here it's the ONLY thing that ever
+// flips `_shouldReconnect` back to true via `this.socket.reconnect()`, which is required exactly once,
+// since nothing else on this runtime path ever will). Called exactly once per connectionId, immediately
+// after all of message/open/error/close are registered (see createConnection() below) — a synchronous
+// `open` during `.connect()` (real in the wrapper: it calls `super.connect()` → `V1Socket.connect()` →
+// `this.socket.reconnect()` → `_connect()`, none of which are guaranteed async by this file's own reading)
+// must never be missed.
+//
 // `waitForOpen()` (Socket.js:127-142) was evaluated too: it's confirmed passive/side-effect-free (just
 // reads current readyState, else registers one-shot 'open'/'error' listeners on the underlying socket) —
 // but it is a ONE-SHOT promise. A single connectionId here can span several of the SDK's OWN internal
 // reconnect attempts (see the retryCount-advance guard below); if the FIRST attempt errors, waitForOpen()'s
 // promise already rejects and settles — a LATER successful internal retry resolves nothing anyone is still
 // awaiting. `socket.on('open', ...)` (registered once, like message/error/close below) is a persistent
-// listener that correctly fires on whichever internal attempt actually succeeds, so that — plus a
-// synchronous readyState snapshot immediately after connect() resolves, for the race where OPEN already
-// happened before any listener could be registered — is what marks a connection ready below, not
-// waitForOpen(). Still unresolved: why open/error/close were all silent for ~19s straight on the affected
-// production call despite the exact same key/params opening in well under 1s when tested directly from
-// outside Render — the diagnostics added below (connectionId-scoped open/timeout/retryCount logging) are
-// meant to answer that from the next real call's logs, not from absence-of-evidence guessing again.
+// listener that correctly fires on whichever internal attempt actually succeeds, so that — plus a readyState
+// snapshot taken immediately AFTER calling socket.connect() (not before — before that call, on this runtime
+// path, readyState is unconditionally CLOSED and tells us nothing) — is what marks a connection ready below.
 
 const { DeepgramClient } = require('@deepgram/sdk')
 
@@ -115,6 +147,13 @@ const BYTES_PER_MS = SAMPLE_RATE_HZ / 1000 // 8
 // connection can't grow this unbounded in memory for the rest of the call.
 const PRE_OPEN_BUFFER_MS = 1500
 const PRE_OPEN_BUFFER_MAX_BYTES = PRE_OPEN_BUFFER_MS * BYTES_PER_MS // 12000 bytes
+
+// Log-throttling rate for the pre-open-buffer-full warning (Review-identified secondary issue, 2026-09-02)
+// — a stuck connection drops on every Twilio frame (~50/sec), so logging every drop reproduces the exact
+// per-frame log storm this whole fix removed from write()'s old direct-sendMedia() path. Frame #1 always
+// logs immediately; after that, only every Nth. Counters (droppedFrameCount/droppedBytes) still advance on
+// every dropped frame regardless — only the console.warn call itself is rate-limited.
+const DROP_LOG_INTERVAL_FRAMES = 50
 
 // Application-level readiness DIAGNOSTIC boundary only — locked design explicitly forbids using this to
 // drop buffered audio a second time or to spin up a parallel connection (that stays owned by the SDK's own
@@ -367,12 +406,12 @@ function transcribeStream(onTranscript, onInterim, { interimFinalizeMs } = {}) {
     let retryBudgetResetExpected = false
     let minUptimeMirrorTimer = null
 
-    // Readiness (see file header) — snapshot readyState synchronously FIRST: OPEN can legitimately happen
-    // before this line runs (fast network, or a fake/test socket), and absence of a later 'open' event is
-    // not proof it never opened. The persistent 'open' listener below then covers every other case,
-    // including the SDK completing one of its OWN internal retries after this connectionId's first attempt.
-    const initialReadyState = socket.readyState
-    console.log(`[Deepgram] connection object created connectionId=${connectionId} readyState=${initialReadyState}`)
+    // Diagnostic (see file header, "Explicit socket startup" 2026-09-02): on this SDK's public
+    // DeepgramClient (CustomDeepgramClient), the socket returned here is ALWAYS startClosed — readyState=3
+    // and retryCount=0 at this exact point are the expected, unstarted state, not evidence of a problem.
+    // Logged separately from the post-startup snapshot below so a log reader can tell "not started yet"
+    // apart from "started but still connecting/stuck".
+    console.log(`[Deepgram] connection object created connectionId=${connectionId} readyState=${socket.readyState} retryCount=${socket.socket?.retryCount}`)
 
     socket.on('message', (message) => handleMessage(connectionId, message))
 
@@ -394,26 +433,6 @@ function transcribeStream(onTranscript, onInterim, { interimFinalizeMs } = {}) {
       if (!isCurrentConnection(connectionId)) return
       console.error(`[Deepgram error] connectionId=${connectionId}`, err.message)
     })
-
-    if (initialReadyState === WS_READY_STATE_OPEN) {
-      // No mirror timer armed here deliberately: this is always the FIRST open of a fresh connectionId
-      // (this branch only runs once, synchronously, at the top of createConnection()), where
-      // lastCloseRetryCount is still undefined — the invalidation check below is a no-op regardless of
-      // reset state until at least one close has been observed. By the time a second open could matter (via
-      // an SDK-internal retry after a drop), it always goes through the persistent 'open' handler above,
-      // which does arm the mirror timer. Arming one here too would start it from an unknown offset (we don't
-      // know how long the socket was already open before this synchronous check ran), which would make it
-      // less accurate, not more.
-      markSocketReady(connectionId, 'synchronous-snapshot')
-    } else {
-      // Diagnostic-only boundary (locked design — see DEEPGRAM_READINESS_TIMEOUT_MS above): never drops the
-      // buffer, never spins up a replacement connection on its own. Cleared by markSocketReady() the moment
-      // this connectionId actually becomes ready.
-      currentReadinessTimeout = setTimeout(() => {
-        if (!isCurrentConnection(connectionId) || socketReady) return
-        console.warn(`[Deepgram] readiness timeout connectionId=${connectionId} elapsedMs=${Date.now() - currentConnectionStartedAt} readyState=${currentSocket?.readyState} retryCount=${currentSocket?.socket?.retryCount} bufferedBytes=${audioBufferBytes}`)
-      }, DEEPGRAM_READINESS_TIMEOUT_MS)
-    }
 
     // SDK-internal-reconnect race guard (see file header) — SECOND finding from a Review challenge on the
     // exact retry-counting semantics: ReconnectingWebSocket's `_retryCount` starts at -1 (verified in
@@ -493,6 +512,45 @@ function transcribeStream(onTranscript, onInterim, { interimFinalizeMs } = {}) {
       currentSocket = null
       createConnection()
     })
+
+    // Explicit socket startup (locked design, 2026-09-02 — see "SUPERSEDED" file header note for the full
+    // trace). All of message/open/error/close are registered above BEFORE this call, deliberately — a
+    // synchronous 'open' during socket.connect() (real risk here: the wrapper's connect() calls
+    // super.connect() → this.socket.reconnect() → _connect(), none of which this file's own reading found
+    // guaranteed to defer to a later tick) must never be missed. Called exactly once per connectionId; the
+    // SDK's own internal retry (the reconnect-race guard above) owns every attempt after this one.
+    try {
+      socket.connect()
+    } catch (err) {
+      if (!isCurrentConnection(connectionId)) return
+      // A synchronous throw here is a startup/config-level failure (bad URL, invalid WebSocket
+      // implementation, etc.), not a transient network blip — retrying the exact same call would very
+      // likely throw again. Log once and stop, matching the missing-API-key precedent above: one clear
+      // diagnostic line, not a synchronous throw-loop from immediately calling createConnection() again.
+      console.error(`[Deepgram] socket.connect() threw synchronously connectionId=${connectionId}, not retrying:`, err.message)
+      return
+    }
+
+    // Snapshot AFTER startup, not before: pre-startup readyState is unconditionally CLOSED on this runtime
+    // path (see the "connection object created" log above) and tells us nothing about this specific
+    // attempt. This is the race-safe check — OPEN can legitimately already be true by the time this line
+    // runs (fast network, or a synchronous-open fake/test socket), and markSocketReady() is idempotent
+    // (`if (socketReady) return`) so a synchronous 'open' during connect() calling it once via the listener
+    // above, then again here, is a safe no-op — no double-arm of the readiness timeout, no double-flush.
+    const postStartReadyState = socket.readyState
+    console.log(`[Deepgram] socket startup invoked connectionId=${connectionId} postStartReadyState=${postStartReadyState}`)
+
+    if (postStartReadyState === WS_READY_STATE_OPEN) {
+      markSocketReady(connectionId, 'synchronous-snapshot')
+    } else {
+      // Diagnostic-only boundary (locked design — see DEEPGRAM_READINESS_TIMEOUT_MS above): never drops the
+      // buffer, never spins up a replacement connection on its own. Cleared by markSocketReady() the moment
+      // this connectionId actually becomes ready.
+      currentReadinessTimeout = setTimeout(() => {
+        if (!isCurrentConnection(connectionId) || socketReady) return
+        console.warn(`[Deepgram] readiness timeout connectionId=${connectionId} elapsedMs=${Date.now() - currentConnectionStartedAt} readyState=${currentSocket?.readyState} retryCount=${currentSocket?.socket?.retryCount} bufferedBytes=${audioBufferBytes}`)
+      }, DEEPGRAM_READINESS_TIMEOUT_MS)
+    }
   }
 
   createConnection()
@@ -518,7 +576,16 @@ function transcribeStream(onTranscript, onInterim, { interimFinalizeMs } = {}) {
         } else {
           droppedFrameCount++
           droppedBytes += mulawBuffer.length
-          console.warn(`[Deepgram] pre-open buffer full connectionId=${currentConnectionId} capBytes=${PRE_OPEN_BUFFER_MAX_BYTES} — dropping frame #${droppedFrameCount} (${mulawBuffer.length} bytes, ${droppedBytes} bytes dropped total this connection)`)
+          // Log throttling (Review-identified secondary issue, 2026-09-02): production proved a genuinely
+          // stuck connection generates a drop on every Twilio frame (~50/sec) for the rest of the call —
+          // logging every one turned the exact storm this fix removed from write() into a new one here.
+          // The counters above still advance on EVERY frame regardless (accuracy never suffers); only the
+          // logging is rate-limited — first drop always logs (so a smoke-test reader sees it start
+          // immediately), then every DROP_LOG_INTERVAL_FRAMES-th after that. The running total in each
+          // logged line still reflects the true cumulative count, not just the frames since the last log.
+          if (droppedFrameCount === 1 || droppedFrameCount % DROP_LOG_INTERVAL_FRAMES === 0) {
+            console.warn(`[Deepgram] pre-open buffer full connectionId=${currentConnectionId} capBytes=${PRE_OPEN_BUFFER_MAX_BYTES} — dropping frame #${droppedFrameCount} (${mulawBuffer.length} bytes, ${droppedBytes} bytes dropped total this connection)`)
+          }
         }
         return
       }
@@ -530,6 +597,19 @@ function transcribeStream(onTranscript, onInterim, { interimFinalizeMs } = {}) {
     },
     end() {
       if (destroyed) return
+      // Final drop summary (Review-identified secondary issue, 2026-09-02; wording corrected 2026-09-02
+      // after a second Review pass) — markSocketReady() already logs a droppedFrames/droppedBytes summary
+      // when a connection DOES become ready, but ending while `!socketReady` never reaches that log line —
+      // the only trace would otherwise be the throttled per-frame warnings above, easy to miss in a long
+      // log. One line here closes that gap unconditionally. IMPORTANT: `!socketReady` here does NOT mean
+      // "this connectionId never opened" — the mid-call reconnect branch above (see the close handler's
+      // `if (socketReady) { socketReady = false; ... }`) resets this exact same flag back to false after a
+      // connection that WAS open drops mid-call and starts re-buffering while the SDK retries internally.
+      // So this branch covers BOTH "never opened at all" and "was open, dropped, still reconnecting when
+      // end() was called" — the log wording must not claim it's the former specifically.
+      if (!socketReady && droppedFrameCount > 0) {
+        console.warn(`[Deepgram] connection ended while not ready connectionId=${currentConnectionId} droppedFrames=${droppedFrameCount} droppedBytes=${droppedBytes} bufferedBytes=${audioBufferBytes}`)
+      }
       // LIFECYCLE INVARIANT (Review-confirmed, not incidental ordering — do not reorder these two
       // statements): `destroyed = true` MUST be set BEFORE calling `currentSocket.close()`. V1Socket's own
       // close() (Socket.js) invokes this adapter's registered 'close' handler SYNCHRONOUSLY and
