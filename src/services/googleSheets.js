@@ -323,6 +323,108 @@ const sheetsService = {
     return updateRowByKey(SHEETS.CONTACTS, 'phone', phone, { status })
   },
 
+  // Bulk soft-delete (Design Freeze "Contacts Bulk Soft-Delete + Row-Safe Undo", 2026-09-02) — replaces N
+  // sequential updateContact() calls (each its own full-sheet GET + single-row write, serialized through
+  // withSheetLock — measured ~126 Sheets API operations for 63 phones) with exactly ONE Contacts read and
+  // ONE values.batchUpdate touching only the status cell of every matching row, still under the same
+  // withSheetLock so it correctly serializes against any other Contacts write in flight.
+  //
+  // Locked semantics: phone is the unit — deleting a phone deletes EVERY row with that phone (duplicate
+  // phones are a known, accepted possibility this track does not forbid or dedupe at write time, only
+  // handles correctly at delete time — findRowIndex()'s first-match-only behavior, used by updateContact(),
+  // is exactly the bug this exists to route around for the bulk path). Rows already status=deleted are left
+  // untouched — no write, no undo entry — so re-running a bulk-delete over a mixed selection never
+  // re-writes or re-reports something that didn't actually change this time.
+  //
+  // deletedPhones counts every REQUESTED phone found in the sheet at all (whether a row needed writing or
+  // was already deleted) so requestedPhones === deletedPhones + notFoundPhones.length always holds;
+  // deletedRows/alreadyDeletedRows are the row-level detail underneath that (can exceed deletedPhones when
+  // duplicates exist).
+  async bulkDeleteContacts(phones) {
+    return withSheetLock(SHEETS.CONTACTS, async () => {
+      const { headers, rows } = await getSheetData(SHEETS.CONTACTS)
+      const phoneIdx = headers.indexOf('phone')
+      const statusIdx = headers.indexOf('status')
+      if (phoneIdx === -1 || statusIdx === -1) throw new Error(`Column 'phone' or 'status' not found in ${SHEETS.CONTACTS}`)
+      const statusCol = String.fromCharCode(65 + statusIdx)
+
+      const requestedPhones = [...new Set(phones)]
+      const phoneSet = new Set(requestedPhones)
+      const matchedPhones = new Set()
+      const data = []
+      const undo = []
+      let alreadyDeletedRows = 0
+
+      rows.forEach((row, rowIdx) => {
+        const phone = row[phoneIdx]
+        if (!phoneSet.has(phone)) return
+        matchedPhones.add(phone)
+        const previousStatus = row[statusIdx] || ''
+        if (previousStatus === 'deleted') { alreadyDeletedRows++; return }
+        const rowNumber = rowIdx + 2 // +1 for the header row, +1 to make it 1-indexed
+        data.push({ range: `${SHEETS.CONTACTS}!${statusCol}${rowNumber}`, values: [['deleted']] })
+        undo.push({ rowNumber, phone, previousStatus })
+      })
+
+      if (data.length) {
+        const client = await getClient()
+        await withRetry(() => client.spreadsheets.values.batchUpdate({
+          spreadsheetId: SPREADSHEET_ID,
+          requestBody: { valueInputOption: 'RAW', data },
+        }))
+      }
+
+      return {
+        requestedPhones: requestedPhones.length,
+        deletedPhones: matchedPhones.size,
+        deletedRows: undo.length,
+        alreadyDeletedRows,
+        notFoundPhones: requestedPhones.filter(p => !matchedPhones.has(p)),
+        undo,
+      }
+    })
+  },
+
+  // Undo for bulkDeleteContacts() above — verifies EACH entry independently against the CURRENT sheet
+  // state (same rowNumber still holds the same phone, and its status is still exactly 'deleted') before
+  // restoring, so a sheet edited some other way between delete and undo (by hand, or by an unrelated write
+  // that happened to land on the same row) is never silently overwritten — it's reported as a conflict
+  // instead of guessed past. Per-row previousStatus (not per-phone) is what makes this correct when
+  // duplicate phones had different statuses before the delete.
+  async bulkRestoreContacts(undoEntries) {
+    return withSheetLock(SHEETS.CONTACTS, async () => {
+      const { headers, rows } = await getSheetData(SHEETS.CONTACTS)
+      const phoneIdx = headers.indexOf('phone')
+      const statusIdx = headers.indexOf('status')
+      if (phoneIdx === -1 || statusIdx === -1) throw new Error(`Column 'phone' or 'status' not found in ${SHEETS.CONTACTS}`)
+      const statusCol = String.fromCharCode(65 + statusIdx)
+
+      const data = []
+      const conflicts = []
+
+      for (const entry of undoEntries) {
+        const row = rows[entry.rowNumber - 2] // reverse of rowNumber = rowIdx + 2 above
+        const currentPhone = row?.[phoneIdx]
+        const currentStatus = row?.[statusIdx] || ''
+        if (!row || currentPhone !== entry.phone || currentStatus !== 'deleted') {
+          conflicts.push(entry)
+          continue
+        }
+        data.push({ range: `${SHEETS.CONTACTS}!${statusCol}${entry.rowNumber}`, values: [[entry.previousStatus]] })
+      }
+
+      if (data.length) {
+        const client = await getClient()
+        await withRetry(() => client.spreadsheets.values.batchUpdate({
+          spreadsheetId: SPREADSHEET_ID,
+          requestBody: { valueInputOption: 'RAW', data },
+        }))
+      }
+
+      return { restoredRows: data.length, conflicts }
+    })
+  },
+
   async getBlocklist() {
     return getBlocklistRows()
   },

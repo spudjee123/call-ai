@@ -2394,19 +2394,44 @@ function bulkDeleteContacts(){
     message: 'เบอร์ทั้งหมดที่เลือกจะถูกทำเครื่องหมายว่าลบแล้ว',
     confirmLabel: 'ลบทั้งหมด',
     onConfirm: async () => {
-      // เก็บสถานะเดิมไว้ก่อนลบเสมอ — เผื่อกด "เลิกทำ" จะได้คืนค่าสถานะเดิมเป๊ะๆ (เช่น retry_pending) ไม่ใช่เดาว่าเป็น pending เสมอไป
-      const previous = phones.map(phone => ({ phone, status: contactsCache.find(c => c.phone === phone)?.status || 'pending' }))
-      await Promise.all(phones.map(phone => apiFetch(`/api/contacts/${encodeURIComponent(phone)}`, { method: 'DELETE' })))
+      // Design Freeze "Contacts Bulk Soft-Delete + Row-Safe Undo" (2026-09-02) — 1 request แทน N สาย
+      // DELETE เดิม (Promise.all ที่ยิงทีละเบอร์ ไม่เช็ค res.ok เลย) ต้องเช็คผลจริงก่อนประกาศสำเร็จ/เคลียร์
+      // selection — ถ้า request พังทั้งก้อน (เช่น Sheets API ล่ม) ต้องไม่บอกผู้ใช้ว่าลบแล้วทั้งที่ยังไม่ได้ลบ
+      let res, data
+      try {
+        res = await apiFetch('/api/contacts/bulk-delete', { method: 'POST', body: { phones } })
+        data = await res.json()
+      } catch (err) {
+        toast('ลบเบอร์ไม่สำเร็จ: ' + err.message, 'danger')
+        return
+      }
+      if (!res.ok) {
+        toast(data?.error || 'ลบเบอร์ไม่สำเร็จ', 'danger')
+        return // selection ยังอยู่ครบ — ให้ผู้ใช้ retry ได้
+      }
+
       selectedContacts.clear()
       loadContacts()
-      toast(`ลบ ${phones.length} เบอร์แล้ว`, 'danger', {
+
+      // รายงานตามตัวเลขจริงที่ server คืนมา — ไม่ใช่ประกาศว่า phones.length สำเร็จเสมอเหมือนเดิม
+      const parts = [`ลบสำเร็จ ${data.deletedPhones}/${data.requestedPhones} เบอร์`]
+      if (data.deletedRows > data.deletedPhones) parts.push(`(${data.deletedRows} รายการ — มีเบอร์ซ้ำ campaign)`)
+      if (data.notFoundPhones?.length) parts.push(`ไม่พบ ${data.notFoundPhones.length} เบอร์`)
+      const undoEntries = data.undo || []
+
+      toast(parts.join(' '), 'danger', undoEntries.length ? {
         label: 'เลิกทำ',
         onClick: async () => {
-          await Promise.all(previous.map(({phone, status}) => apiFetch(`/api/contacts/${encodeURIComponent(phone)}`, { method: 'PATCH', body: { status } })))
-          toast(`เลิกทำแล้ว — คืนค่า ${previous.length} เบอร์`)
+          const undoRes = await apiFetch('/api/contacts/bulk-restore', { method: 'POST', body: { undo: undoEntries } })
+          const undoData = await undoRes.json()
+          if (!undoRes.ok) { toast(undoData?.error || 'เลิกทำไม่สำเร็จ', 'danger'); return }
+          const msg = undoData.conflicts?.length
+            ? `เลิกทำแล้ว ${undoData.restoredRows} รายการ (ติด conflict ${undoData.conflicts.length} รายการ — ถูกแก้ไปแล้วระหว่างนี้)`
+            : `เลิกทำแล้ว — คืนค่า ${undoData.restoredRows} รายการ`
+          toast(msg)
           loadContacts()
         }
-      })
+      } : undefined)
     }
   })
 }

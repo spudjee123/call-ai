@@ -24,6 +24,10 @@ const fakeClient = {
       },
       update: async (params) => { state.calls.push({ method: 'update', ...params }); return {} },
       append: async (params) => { state.calls.push({ method: 'append', ...params }); return {} },
+      // ชื่อ method log แยกจาก spreadsheets.batchUpdate (deleteDimension) ด้านล่างตั้งใจ — คนละ endpoint จริง
+      // ของ Sheets API (values.batchUpdate เขียนหลาย cell/range พร้อมกัน, spreadsheets.batchUpdate ทำ
+      // structural change เช่นลบแถว) ใช้ชื่อเดียวกันจะทำให้ lastCall() แยกไม่ออกว่า test เจาะจงตัวไหน
+      batchUpdate: async (params) => { state.calls.push({ method: 'valuesBatchUpdate', ...params }); return {} },
     },
     get: async () => ({ data: { sheets: [] } }),
     batchUpdate: async (params) => { state.calls.push({ method: 'batchUpdate', ...params }); return {} },
@@ -339,4 +343,140 @@ test('getStats: แยกจำนวนสายตามชั่วโมง/
   assert.equal(stats.byHour[1].interested, 1)
   assert.equal(stats.byDayOfWeek[1].calls, 1, 'ต้องนับเป็นวันจันทร์ (index 1) ไม่ใช่วันอาทิตย์ตาม UTC ดิบ (index 0)')
   assert.equal(stats.byDayOfWeek[0].calls, 0, 'ต้องไม่ค้างอยู่ที่วันอาทิตย์ตาม UTC ดิบ')
+})
+
+// ===== Contacts Bulk Soft-Delete + Row-Safe Undo (Design Freeze 2026-09-02) — replaces N sequential
+// updateContact() calls (each its own full-sheet read) with 1 read + 1 values.batchUpdate, and fixes the
+// separate structural bug found during Review: findRowIndex()'s first-match-only findIndex(), combined
+// with no phone-uniqueness enforcement anywhere in this file, meant a duplicate-phone contact could never
+// be fully deleted via the old single-delete path — deterministically, not intermittently. Semantics locked
+// as "A": phone is the unit, deleting a phone deletes EVERY row with that phone. =====
+
+test('bulkDeleteContacts: N unique phones → เพียง 1 Sheets GET + 1 values.batchUpdate เท่านั้น ไม่ว่าจะกี่เบอร์ (แก้บั๊กเดิม ~126 operations สำหรับ 63 เบอร์)', async () => {
+  const N = 63
+  state.data['Contacts'] = [
+    ['Phone', 'Name', 'Campaign', 'Status'],
+    ...Array.from({ length: N }, (_, i) => [`08${String(i).padStart(8, '0')}`, `name${i}`, 'camp1', 'pending']),
+  ]
+  const phones = Array.from({ length: N }, (_, i) => `08${String(i).padStart(8, '0')}`)
+  const result = await sheetsService.bulkDeleteContacts(phones)
+
+  const getCalls = state.calls.filter(c => c.method === 'get' && c.range === 'Contacts')
+  const batchCalls = state.calls.filter(c => c.method === 'valuesBatchUpdate')
+  assert.equal(getCalls.length, 1, 'ต้องอ่านชีตแค่ครั้งเดียวไม่ว่าจะลบกี่เบอร์')
+  assert.equal(batchCalls.length, 1, 'ต้องเขียนกลับแค่ครั้งเดียว (1 batchUpdate call รวมทุก cell)')
+  assert.equal(batchCalls[0].requestBody.data.length, N, 'batch request ต้องมี N ranges (1 ต่อแถว)')
+  assert.equal(result.requestedPhones, N)
+  assert.equal(result.deletedPhones, N)
+  assert.equal(result.deletedRows, N)
+  assert.equal(result.notFoundPhones.length, 0)
+})
+
+test('bulkDeleteContacts: เบอร์เดียวกันซ้ำ 3 แถว (คนละ campaign, คนละ status) → ทุกแถวถูกลบ ไม่ใช่แค่แถวแรก (แก้บั๊ก findIndex เดิม) และ undo เก็บ previousStatus แยกตาม row ถูกต้อง', async () => {
+  state.data['Contacts'] = [
+    ['Phone', 'Name', 'Campaign', 'Status'],
+    ['0812345678', 'a', 'campA', 'pending'],
+    ['0812345678', 'b', 'campB', 'retry_pending'],
+    ['0812345678', 'c', 'campC', 'pending'],
+  ]
+  const result = await sheetsService.bulkDeleteContacts(['0812345678'])
+
+  assert.equal(result.deletedPhones, 1, 'นับเป็น 1 เบอร์ที่ขอ')
+  assert.equal(result.deletedRows, 3, 'แต่เปลี่ยนจริง 3 แถว')
+
+  const batchCall = state.calls.find(c => c.method === 'valuesBatchUpdate')
+  assert.equal(batchCall.requestBody.data.length, 3)
+  assert.deepEqual(batchCall.requestBody.data.map(d => d.range).sort(), ['Contacts!D2', 'Contacts!D3', 'Contacts!D4'])
+  batchCall.requestBody.data.forEach(d => assert.deepEqual(d.values, [['deleted']]))
+
+  assert.equal(result.undo.length, 3)
+  result.undo.forEach(u => assert.equal(u.phone, '0812345678'))
+  const byRow = Object.fromEntries(result.undo.map(u => [u.rowNumber, u.previousStatus]))
+  assert.deepEqual(byRow, { 2: 'pending', 3: 'retry_pending', 4: 'pending' }, 'undo ต้องเก็บ status เดิมของแต่ละแถวแยกกัน ไม่ใช่ค่าเดียวใช้ร่วม')
+})
+
+test('bulkDeleteContacts: แถวที่ status=deleted อยู่แล้ว → ไม่ถูกเขียนซ้ำ ไม่เข้า undo แต่นับใน alreadyDeletedRows', async () => {
+  state.data['Contacts'] = [
+    ['Phone', 'Name', 'Campaign', 'Status'],
+    ['0812345678', 'a', 'campA', 'deleted'],
+    ['0812345678', 'b', 'campB', 'pending'],
+  ]
+  const result = await sheetsService.bulkDeleteContacts(['0812345678'])
+  assert.equal(result.alreadyDeletedRows, 1)
+  assert.equal(result.deletedRows, 1, 'เขียนแค่แถวที่ยังไม่ deleted')
+  assert.equal(result.undo.length, 1)
+  assert.equal(result.undo[0].rowNumber, 3, 'undo ต้องมีแค่แถวที่ยังไม่ deleted (แถวที่ 2 deleted อยู่แล้ว ต้องไม่เข้า undo)')
+  const batchCall = state.calls.find(c => c.method === 'valuesBatchUpdate')
+  assert.equal(batchCall.requestBody.data.length, 1)
+})
+
+test('bulkDeleteContacts: เบอร์ที่ไม่มีในชีตเลย → อยู่ใน notFoundPhones ไม่นับใน deletedPhones', async () => {
+  state.data['Contacts'] = [
+    ['Phone', 'Name', 'Campaign', 'Status'],
+    ['0812345678', 'a', 'campA', 'pending'],
+  ]
+  const result = await sheetsService.bulkDeleteContacts(['0812345678', '0899999999'])
+  assert.equal(result.requestedPhones, 2)
+  assert.equal(result.deletedPhones, 1)
+  assert.deepEqual(result.notFoundPhones, ['0899999999'])
+  assert.equal(result.requestedPhones, result.deletedPhones + result.notFoundPhones.length, 'arithmetic ต้องลงตัวเสมอ: requested = deleted + notFound')
+})
+
+test('bulkDeleteContacts: เบอร์เดียวกันซ้ำใน request array เอง → dedupe ก่อนนับ requestedPhones', async () => {
+  state.data['Contacts'] = [
+    ['Phone', 'Name', 'Campaign', 'Status'],
+    ['0812345678', 'a', 'campA', 'pending'],
+  ]
+  const result = await sheetsService.bulkDeleteContacts(['0812345678', '0812345678', '0812345678'])
+  assert.equal(result.requestedPhones, 1, 'array ที่ส่งมามีเบอร์ซ้ำกัน 3 ครั้ง ต้อง dedupe เหลือ 1 ก่อนนับ')
+})
+
+test('bulkRestoreContacts: undo entries ถูกต้องครบ → restore previousStatus แยกตาม row ถูกต้อง แม้เบอร์ซ้ำกันมีสถานะต่างกัน — ด้วย 1 GET + 1 batchUpdate', async () => {
+  state.data['Contacts'] = [
+    ['Phone', 'Name', 'Campaign', 'Status'],
+    ['0812345678', 'a', 'campA', 'deleted'],
+    ['0812345678', 'b', 'campB', 'deleted'],
+  ]
+  const result = await sheetsService.bulkRestoreContacts([
+    { rowNumber: 2, phone: '0812345678', previousStatus: 'pending' },
+    { rowNumber: 3, phone: '0812345678', previousStatus: 'retry_pending' },
+  ])
+  assert.equal(result.restoredRows, 2)
+  assert.equal(result.conflicts.length, 0)
+
+  const getCalls = state.calls.filter(c => c.method === 'get' && c.range === 'Contacts')
+  const batchCalls = state.calls.filter(c => c.method === 'valuesBatchUpdate')
+  assert.equal(getCalls.length, 1)
+  assert.equal(batchCalls.length, 1)
+  const byRange = Object.fromEntries(batchCalls[0].requestBody.data.map(d => [d.range, d.values[0][0]]))
+  assert.deepEqual(byRange, { 'Contacts!D2': 'pending', 'Contacts!D3': 'retry_pending' })
+})
+
+test('bulkRestoreContacts: rowNumber ตรงแต่ phone ไม่ตรง (แถวถูกแก้ไปแล้วระหว่าง delete กับ undo) → conflict ไม่ restore ทับ', async () => {
+  state.data['Contacts'] = [
+    ['Phone', 'Name', 'Campaign', 'Status'],
+    ['0899999999', 'other', 'campX', 'deleted'], // เบอร์ที่ row 2 เปลี่ยนไปแล้วจาก undo entry เดิม
+  ]
+  const result = await sheetsService.bulkRestoreContacts([
+    { rowNumber: 2, phone: '0812345678', previousStatus: 'pending' },
+  ])
+  assert.equal(result.restoredRows, 0)
+  assert.equal(result.conflicts.length, 1)
+  assert.equal(state.calls.some(c => c.method === 'valuesBatchUpdate'), false, 'ไม่มีอะไรให้เขียนเลย ต้องไม่ยิง batchUpdate เปล่าๆ')
+  const rows = await sheetsService.getContacts()
+  assert.equal(rows[0].status, 'deleted', 'ต้องไม่ถูกแก้ status ของแถวที่ mismatch')
+})
+
+test('bulkRestoreContacts: current status ไม่ใช่ deleted แล้ว (ถูกแก้เป็นอย่างอื่นระหว่างนั้น) → conflict ไม่ restore ทับของใหม่', async () => {
+  state.data['Contacts'] = [
+    ['Phone', 'Name', 'Campaign', 'Status'],
+    ['0812345678', 'a', 'campA', 'retry_pending'], // ไม่ใช่ deleted แล้ว — เช่นถูกกด PATCH สถานะใหม่ระหว่างที่ toast undo ยังค้างอยู่
+  ]
+  const result = await sheetsService.bulkRestoreContacts([
+    { rowNumber: 2, phone: '0812345678', previousStatus: 'pending' },
+  ])
+  assert.equal(result.restoredRows, 0)
+  assert.equal(result.conflicts.length, 1)
+  const rows = await sheetsService.getContacts()
+  assert.equal(rows[0].status, 'retry_pending', 'ต้องไม่ถูกเขียนทับค่าที่เปลี่ยนไปแล้วระหว่างนั้น')
 })

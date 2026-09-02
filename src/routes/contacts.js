@@ -117,4 +117,28 @@ module.exports = async function contactsRoutes(fastify) {
     if (!updated) return reply.code(404).send({ error: 'Contact not found' })
     return reply.send({ message: 'Contact deleted' })
   })
+
+  // Bulk soft-delete (Design Freeze "Contacts Bulk Soft-Delete + Row-Safe Undo", 2026-09-02) — 1 request
+  // instead of N sequential DELETEs (ทีละเบอร์ทำให้ 63 เบอร์ = ~126 Sheets API operations เรียงคิวกัน + client
+  // เดิม (Promise.all ที่ไม่เช็ค res.ok) ไม่มีทางรู้เลยว่าเบอร์ไหนลบไม่สำเร็จจริง) — response ด้านล่างรายงานผลจริง
+  // ให้ frontend เช็ค res.ok + ตัวเลขที่คืนมาก่อนประกาศสำเร็จ แทนที่จะสมมติว่าสำเร็จเสมอ
+  fastify.post('/api/contacts/bulk-delete', async (req, reply) => {
+    const phones = Array.isArray(req.body?.phones)
+      ? [...new Set(req.body.phones.map(normalizePhone).filter(Boolean))]
+      : []
+    if (!phones.length) return reply.code(400).send({ error: 'phones[] required' })
+    const result = await sheetsService.bulkDeleteContacts(phones)
+    return reply.send(result)
+  })
+
+  // Undo สำหรับ bulk-delete ด้านบน — body คือ undo array ที่ endpoint ด้านบนคืนมาตรงๆ (แต่ละ entry มี
+  // rowNumber/phone/previousStatus) sheetsService.bulkRestoreContacts จะ verify ทีละ entry ก่อน restore จริง
+  fastify.post('/api/contacts/bulk-restore', async (req, reply) => {
+    const undo = Array.isArray(req.body?.undo)
+      ? req.body.undo.filter(e => e && Number.isInteger(e.rowNumber) && typeof e.phone === 'string')
+      : []
+    if (!undo.length) return reply.code(400).send({ error: 'undo[] required' })
+    const result = await sheetsService.bulkRestoreContacts(undo)
+    return reply.send(result)
+  })
 }
