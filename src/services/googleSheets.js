@@ -242,6 +242,27 @@ async function getTwilioNumberRows() {
   }
 }
 
+// Dashboard ต้องยึด "วัน" ตามเวลาไทย (Asia/Bangkok, UTC+7 คงที่ ไม่มี DST) ไม่ใช่ UTC ดิบ — ไม่งั้นสายที่โทร
+// 00:00-06:59 น. เวลาไทยจะถูกนับเป็นของ "เมื่อวาน" เพราะ timestamp ที่เก็บเป็น UTC ยังเป็นวันก่อนหน้าอยู่
+const BANGKOK_OFFSET_MS = 7 * 60 * 60 * 1000
+
+// timestamp (ISO UTC) → YYYY-MM-DD ของวันตามเวลาไทย, '' ถ้า timestamp ว่าง/parse ไม่ได้ (ไม่ throw — ผู้เรียกกรอง
+// แถวนั้นทิ้งเองแบบเงียบๆ เหมือนพฤติกรรมเดิมตอนใช้ .slice(0,10) กับค่าว่าง)
+function bangkokDateKey(timestamp) {
+  if (!timestamp) return ''
+  const d = new Date(timestamp)
+  if (Number.isNaN(d.getTime())) return ''
+  return new Date(d.getTime() + BANGKOK_OFFSET_MS).toISOString().slice(0, 10)
+}
+
+// เลื่อน date key (YYYY-MM-DD) ไปกี่วัน คำนวณบน calendar key ตรงๆ ไม่ผ่าน Date ของเครื่อง — deterministic
+// ไม่ว่า server จะรันอยู่ timezone ไหน
+function shiftDateKey(dateKey, deltaDays) {
+  const d = new Date(dateKey + 'T00:00:00Z')
+  d.setUTCDate(d.getUTCDate() + deltaDays)
+  return d.toISOString().slice(0, 10)
+}
+
 const sheetsService = {
   async getCampaign(campaignId) {
     const rows = await getRows(SHEETS.CAMPAIGNS)
@@ -548,7 +569,7 @@ const sheetsService = {
   // dateFrom/dateTo: ช่วงวันที่กำหนดเองแบบ absolute (YYYY-MM-DD) — ใช้แทน days ถ้าระบุมาทั้งคู่ (เลือกวันที่จากปฏิทินในหน้า Dashboard)
   async getStats({ days = 7, allTime = false, dateFrom, dateTo } = {}) {
     const rows = await getRows(SHEETS.RESULTS)
-    const today = new Date().toISOString().slice(0, 10)
+    const today = bangkokDateKey(new Date())
 
     let filteredRows, dayBuckets
 
@@ -563,7 +584,7 @@ const sheetsService = {
       const cappedDateTo = new Date(dateTo + 'T00:00:00Z') > maxEnd ? maxEnd.toISOString().slice(0, 10) : dateTo
 
       filteredRows = rows.filter(r => {
-        const day = (r.timestamp || '').slice(0, 10)
+        const day = bangkokDateKey(r.timestamp)
         return day >= dateFrom && day <= cappedDateTo
       })
       dayBuckets = []
@@ -574,13 +595,18 @@ const sheetsService = {
         cursor.setUTCDate(cursor.getUTCDate() + 1)
       }
     } else {
-      const cutoff = new Date(Date.now() - (days - 1) * 86400000).toISOString().slice(0, 10)
+      const cutoff = shiftDateKey(today, -(days - 1))
       // total/outcomes/byCampaign/avgDuration/conversionRate ผูกกับช่วงวันที่เลือกจริง (เดิมไม่ผูก ทำให้ตัวเลขไม่ตรงกับกราฟที่กรองอยู่)
-      filteredRows = allTime ? rows : rows.filter(r => (r.timestamp || '').slice(0, 10) >= cutoff)
+      // ต้องมี upper bound (<= today) ด้วย ไม่ใช่แค่ >= cutoff — ไม่งั้นแถวที่ผิดเวลา/timestamp ล้ำอนาคตไปกว่า Bangkok
+      // today จะหลุดเข้า total/byCampaign แต่ไม่มี bucket ใน dayBuckets ให้ตก (dayBuckets มีแค่ today-6..today) ทำให้
+      // total กับผลรวมของ dailyTrend ไม่ตรงกัน ขัดกับ invariant เดียวกับที่ dateFrom/dateTo path บังคับไว้แล้วด้านบน
+      filteredRows = allTime ? rows : rows.filter(r => {
+        const day = bangkokDateKey(r.timestamp)
+        return day >= cutoff && day <= today
+      })
       dayBuckets = []
       for (let i = days - 1; i >= 0; i--) {
-        const key = new Date(Date.now() - i * 86400000).toISOString().slice(0, 10)
-        dayBuckets.push({ key, calls: 0, interested: 0 })
+        dayBuckets.push({ key: shiftDateKey(today, -i), calls: 0, interested: 0 })
       }
     }
 
@@ -588,6 +614,8 @@ const sheetsService = {
     const outcomes = {}
     const byCampaign = {}
     const interestedByCampaign = {}
+    const answeredByCampaign = {}
+    const callbackByCampaign = {}
     const byTwilioNumber = {}
     const interestedByTwilioNumber = {}
     let durationSum = 0
@@ -606,6 +634,10 @@ const sheetsService = {
       if (r.campaign_id) {
         byCampaign[r.campaign_id] = (byCampaign[r.campaign_id] || 0) + 1
         if (r.outcome === 'interested') interestedByCampaign[r.campaign_id] = (interestedByCampaign[r.campaign_id] || 0) + 1
+        // call_status (เชื่อมสายได้ไหม ระดับ Twilio) ≠ outcome (ผลลัพธ์ธุรกิจ) — "รับสาย" ต้องดูจาก call_status
+        // ไม่งั้นจะไปชนกับ outcome:'no_answer' (การจัดประเภทบทสนทนาของ Claude เวลาสายที่เชื่อมได้แล้ว) โดยไม่ตั้งใจ
+        if (r.call_status === 'completed') answeredByCampaign[r.campaign_id] = (answeredByCampaign[r.campaign_id] || 0) + 1
+        if (r.outcome === 'callback') callbackByCampaign[r.campaign_id] = (callbackByCampaign[r.campaign_id] || 0) + 1
       }
       // แยกสถิติตามเบอร์ Twilio ที่ใช้โทรจริง — สำหรับ Dashboard สลับมุมมองระหว่าง "ต่อ Campaign" / "ต่อเบอร์"
       if (r.twilio_number) {
@@ -634,8 +666,9 @@ const sheetsService = {
 
     // callsToday และกราฟรายวัน อิงจากข้อมูลทั้งหมดเสมอ ไม่ขึ้นกับตัวกรองช่วงวัน (bucket ของกราฟกรองตัวเองอยู่แล้วผ่าน dayBuckets)
     rows.forEach(r => {
-      if ((r.timestamp || '').startsWith(today)) callsToday++
-      const bucket = bucketMap.get((r.timestamp || '').slice(0, 10))
+      const rowDateKey = bangkokDateKey(r.timestamp)
+      if (rowDateKey === today) callsToday++
+      const bucket = bucketMap.get(rowDateKey)
       if (bucket) {
         bucket.calls++
         if (r.outcome === 'interested') bucket.interested++
@@ -648,7 +681,7 @@ const sheetsService = {
     const smsDeliveryRate = smsAttempted ? Math.round((smsStats.delivered / smsAttempted) * 1000) / 10 : 0
 
     return {
-      total, outcomes, byCampaign, interestedByCampaign, byTwilioNumber, interestedByTwilioNumber, avgDuration, callsToday, conversionRate,
+      total, outcomes, byCampaign, interestedByCampaign, answeredByCampaign, callbackByCampaign, byTwilioNumber, interestedByTwilioNumber, avgDuration, callsToday, conversionRate,
       smsStats: { ...smsStats, attempted: smsAttempted, deliveryRate: smsDeliveryRate },
       byHour, byDayOfWeek,
       dailyTrend: {

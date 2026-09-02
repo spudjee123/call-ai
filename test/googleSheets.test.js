@@ -286,7 +286,7 @@ test('getStats: ช่วงวันที่กำหนดเองต้อ�
   state.data['Call Results'] = [
     ['Call SID', 'Phone', 'Campaign ID', 'Outcome', 'Duration', 'Timestamp'],
     ['CA1', '081', 'camp1', 'interested', '30', '2026-03-01T10:00:00.000Z'],
-    ['CA2', '082', 'camp1', 'interested', '30', '2026-03-03T23:59:00.000Z'],
+    ['CA2', '082', 'camp1', 'interested', '30', '2026-03-03T12:00:00.000Z'], // Bangkok 2026-03-03 19:00 — อยู่ในช่วงชัดเจน ไม่ใกล้ขอบเขตวันตาม Bangkok (เดิมใช้ 23:59:00Z ซึ่งจริงๆ คือ Bangkok 2026-03-04 06:59 — เข้าใจผิดเป็นวันที่ 3 ตอนยังใช้ UTC ดิบ)
   ]
   const stats = await sheetsService.getStats({ dateFrom: '2026-03-01', dateTo: '2026-03-03' })
   assert.deepEqual(stats.dailyTrend.labels, ['2026-03-01', '2026-03-02', '2026-03-03'])
@@ -343,6 +343,105 @@ test('getStats: แยกจำนวนสายตามชั่วโมง/
   assert.equal(stats.byHour[1].interested, 1)
   assert.equal(stats.byDayOfWeek[1].calls, 1, 'ต้องนับเป็นวันจันทร์ (index 1) ไม่ใช่วันอาทิตย์ตาม UTC ดิบ (index 0)')
   assert.equal(stats.byDayOfWeek[0].calls, 0, 'ต้องไม่ค้างอยู่ที่วันอาทิตย์ตาม UTC ดิบ')
+})
+
+// ===== Dashboard Daily Active Campaigns + Exact Bangkok Date Boundaries (Design Freeze 2026-09-02) — ก่อนหน้านี้
+// dateFrom/dateTo, days=N, callsToday, dailyTrend อ่านวันจาก timestamp UTC ดิบด้วย .slice(0,10) ตรงๆ ต่างจาก
+// byHour/byDayOfWeek ในฟังก์ชันเดียวกันที่แปลงเป็นเวลาไทยถูกต้องอยู่แล้ว — ทำให้สายช่วง 00:00-06:59 น. เวลาไทย
+// ถูกนับเป็นของ "เมื่อวาน" แทนที่จะเป็นวันนี้ =====
+
+test('getStats: ขอบเขตวันตาม Bangkok (UTC+7) ต้องตัดที่ 17:00 UTC ไม่ใช่เที่ยงคืน UTC (บั๊กเดิม: dateFrom/dateTo กรองด้วย .slice(0,10) ของ UTC ดิบ)', async () => {
+  state.data['Call Results'] = [
+    ['Call SID', 'Phone', 'Campaign ID', 'Outcome', 'Duration', 'Timestamp'],
+    ['CA1', '081', 'campA', 'interested', '30', '2026-09-01T16:59:59.999Z'], // Bangkok 2026-09-01 23:59:59.999 → exclude
+    ['CA2', '082', 'campB', 'interested', '30', '2026-09-01T17:00:00.000Z'], // Bangkok 2026-09-02 00:00:00.000 → include
+    ['CA3', '083', 'campC', 'interested', '30', '2026-09-02T16:59:59.999Z'], // Bangkok 2026-09-02 23:59:59.999 → include
+    ['CA4', '084', 'campD', 'interested', '30', '2026-09-02T17:00:00.000Z'], // Bangkok 2026-09-03 00:00:00.000 → exclude
+  ]
+  const stats = await sheetsService.getStats({ dateFrom: '2026-09-02', dateTo: '2026-09-02' })
+  assert.equal(stats.total, 2)
+  assert.deepEqual(Object.keys(stats.byCampaign).sort(), ['campB', 'campC'])
+})
+
+test('getStats: per-campaign metrics ใหม่ — answeredByCampaign ดูจาก call_status (เชื่อมสายได้ไหม) แยกจาก outcome (ผลลัพธ์ธุรกิจ) และ byCampaign นับทุก attempt ไม่ว่าผลจะเป็นอะไร', async () => {
+  state.data['Call Results'] = [
+    ['Call SID', 'Phone', 'Campaign ID', 'Call Status', 'Outcome', 'Duration', 'Timestamp'],
+    ['CA1', '081', 'campA', 'completed', 'interested', '30', '2026-09-02T10:00:00.000Z'],
+    ['CA2', '082', 'campA', 'completed', 'callback', '30', '2026-09-02T10:00:00.000Z'],
+    ['CA3', '083', 'campA', 'no-answer', 'no-answer', '0', '2026-09-02T10:00:00.000Z'],
+    ['CA4', '084', 'campA', 'busy', 'busy', '0', '2026-09-02T10:00:00.000Z'],
+    ['CA5', '085', 'campA', 'failed', 'failed', '0', '2026-09-02T10:00:00.000Z'],
+  ]
+  const stats = await sheetsService.getStats({ dateFrom: '2026-09-02', dateTo: '2026-09-02' })
+  assert.equal(stats.byCampaign.campA, 5, 'ต้องนับทุก attempt รวม no-answer/busy/failed ไม่ใช่แค่ completed')
+  assert.equal(stats.answeredByCampaign.campA, 2, 'รับสาย = call_status===completed เท่านั้น')
+  assert.equal(stats.interestedByCampaign.campA, 1)
+  assert.equal(stats.callbackByCampaign.campA, 1)
+})
+
+test('getStats: dailyTrend bucket ต้องกรุ๊ปตามวันไทยวันเดียวกับที่ total/byCampaign ใช้ (แถวเดียวกันต้องไม่ตกคนละวันระหว่าง field ในผลลัพธ์เดียวกัน)', async () => {
+  state.data['Call Results'] = [
+    ['Call SID', 'Phone', 'Campaign ID', 'Outcome', 'Duration', 'Timestamp'],
+    ['CA1', '081', 'campA', 'interested', '30', '2026-09-01T17:30:00.000Z'], // Bangkok 2026-09-02 00:30
+  ]
+  const stats = await sheetsService.getStats({ dateFrom: '2026-09-02', dateTo: '2026-09-02' })
+  assert.equal(stats.total, 1)
+  const idx = stats.dailyTrend.labels.indexOf('2026-09-02')
+  assert.notEqual(idx, -1)
+  assert.equal(stats.dailyTrend.calls[idx], 1, 'bucket ของกราฟต้องนับแถวนี้เป็นวันที่ 2026-09-02 ตามเวลาไทย ไม่ใช่ 2026-09-01 ตาม UTC ดิบ')
+})
+
+test('getStats: callsToday ต้องใช้ Bangkok today จริง ไม่ใช่ UTC — freeze "now" ที่ขอบเขต 17:00 UTC เพื่อพิสูจน์ (เวอร์ชันก่อนหน้าที่ใช้ new Date().toISOString() ตรงๆ เป็น timestamp ผ่านได้แม้ implementation ยังเป็น UTC ดิบ เพราะ row timestamp กับ "now" เป็น instant เดียวกันเสมอ ไม่ discriminate อะไรเลย — IR finding)', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'] })
+  t.mock.timers.setTime(new Date('2026-09-01T17:30:00.000Z').getTime()) // Bangkok "ตอนนี้" = 2026-09-02 00:30
+  state.data['Call Results'] = [
+    ['Call SID', 'Phone', 'Campaign ID', 'Outcome', 'Duration', 'Timestamp'],
+    ['CA1', '081', 'campA', 'interested', '30', '2026-09-01T16:59:59.999Z'], // Bangkok 2026-09-01 23:59:59.999 → เมื่อวาน ไม่นับ
+    ['CA2', '082', 'campA', 'interested', '30', '2026-09-01T17:00:00.000Z'], // Bangkok 2026-09-02 00:00:00.000 → วันนี้ นับ
+    ['CA3', '083', 'campA', 'interested', '30', '2026-09-02T16:59:59.999Z'], // Bangkok 2026-09-02 23:59:59.999 → วันนี้ นับ
+    ['CA4', '084', 'campA', 'interested', '30', '2026-09-02T17:00:00.000Z'], // Bangkok 2026-09-03 00:00:00.000 → พรุ่งนี้ ไม่นับ
+  ]
+  const stats = await sheetsService.getStats({ allTime: true })
+  assert.equal(stats.callsToday, 2, 'ต้องนับเฉพาะ 2 แถวที่ Bangkok date ตรงกับ "วันนี้" (2026-09-02) ตาม freeze time ที่ตั้งไว้')
+})
+
+test('getStats: days=N ต้องนับเป็น Bangkok calendar days ปิดทั้งสองด้าน (today-N+1..today) — สายเมื่อ 10 วันก่อนไม่ถูกนับใน days=7 (ใช้ margin 10 วันกัน edge case ใกล้ขอบเขต ไม่ผูกกับเวลาจริงตอนรันเทส)', async () => {
+  state.data['Call Results'] = [
+    ['Call SID', 'Phone', 'Campaign ID', 'Outcome', 'Duration', 'Timestamp'],
+    ['CA1', '081', 'campA', 'interested', '30', new Date().toISOString()],
+    ['CA2', '082', 'campB', 'interested', '30', new Date(Date.now() - 10 * 86400000).toISOString()],
+  ]
+  const stats = await sheetsService.getStats({ days: 7 })
+  assert.equal(stats.total, 1)
+  assert.deepEqual(stats.byCampaign, { campA: 1 })
+})
+
+test('getStats: days=N ต้องมี upper bound ด้วย — แถวที่ Bangkok date ล้ำไปกว่า "today" (เช่น timestamp ผิดปกติ/นาฬิกาเครื่องคลาดเคลื่อน) ต้องไม่หลุดเข้า total/byCampaign ทั้งที่ไม่มี bucket ใน dailyTrend รองรับ (IR finding: เดิมมีแค่ lower-bound filter ทำให้ total กับผลรวม dailyTrend ไม่ตรงกันได้)', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'] })
+  t.mock.timers.setTime(new Date('2026-09-02T10:00:00.000Z').getTime()) // Bangkok "วันนี้" = 2026-09-02
+  state.data['Call Results'] = [
+    ['Call SID', 'Phone', 'Campaign ID', 'Outcome', 'Duration', 'Timestamp'],
+    ['CA1', '081', 'campA', 'interested', '30', '2026-09-02T10:00:00.000Z'], // Bangkok 2026-09-02 (วันนี้) → include
+    ['CA2', '082', 'campB', 'interested', '30', '2026-09-02T17:00:00.000Z'], // Bangkok 2026-09-03 (ล้ำอนาคตไปกว่า today) → exclude
+  ]
+  const stats = await sheetsService.getStats({ days: 7 })
+  assert.equal(stats.total, 1)
+  assert.deepEqual(stats.byCampaign, { campA: 1 })
+  const sumFromChart = stats.dailyTrend.calls.reduce((a, b) => a + b, 0)
+  assert.equal(stats.total, sumFromChart, 'total ต้องเท่ากับผลรวมของ dailyTrend เสมอ (invariant เดียวกับที่ dateFrom/dateTo path บังคับไว้)')
+})
+
+test('getStats: timestamp ว่าง/parse ไม่ได้ ต้องไม่ crash และถูกกรองทิ้งจาก dateFrom/dateTo path แต่ allTime ยังนับรวมเหมือนพฤติกรรมเดิม', async () => {
+  state.data['Call Results'] = [
+    ['Call SID', 'Phone', 'Campaign ID', 'Outcome', 'Duration', 'Timestamp'],
+    ['CA1', '081', 'campA', 'interested', '30', ''],
+    ['CA2', '082', 'campA', 'interested', '30', 'not-a-real-date'],
+    ['CA3', '083', 'campA', 'interested', '30', '2026-09-02T10:00:00.000Z'],
+  ]
+  const rangedStats = await sheetsService.getStats({ dateFrom: '2026-09-02', dateTo: '2026-09-02' })
+  assert.equal(rangedStats.total, 1, 'timestamp ว่าง/พังต้องถูกกรองทิ้งจากช่วงวันที่ระบุ ไม่ใช่ crash หรือหลุดเข้ามานับผิด')
+  const allTimeStats = await sheetsService.getStats({ allTime: true })
+  assert.equal(allTimeStats.total, 3, 'allTime ไม่กรองตามวัน ต้องยังนับครบทุกแถวเหมือนพฤติกรรมเดิม แม้ timestamp จะพังก็ตาม')
 })
 
 // ===== Contacts Bulk Soft-Delete + Row-Safe Undo (Design Freeze 2026-09-02) — replaces N sequential

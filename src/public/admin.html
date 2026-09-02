@@ -263,10 +263,14 @@
   .gcard .pill { background: rgba(255,255,255,.24); color: #fff; }
   .gcard .name { font-size: 15px; font-weight: 650; z-index: 1; position: relative; margin: 14px 0 8px; }
   .gcard .stats { display: flex; gap: 18px; z-index: 1; position: relative; margin-bottom: 10px; }
+  .gcard .stats.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 16px; }
   .gcard .stats .n { font-size: 19px; font-weight: 700; }
   .gcard .stats .l { font-size: 10.5px; opacity: .8; text-transform: uppercase; letter-spacing: .04em; }
   .gcard .progress { height: 5px; border-radius: 999px; background: rgba(255,255,255,.25); overflow: hidden; z-index: 1; position: relative; }
   .gcard .progress-fill { height: 100%; background: rgba(255,255,255,.85); border-radius: 999px; }
+  .gcard .conv-line { font-size: 11px; opacity: .85; z-index: 1; position: relative; }
+  .campaign-strip-empty { padding: 28px 20px; text-align: center; color: var(--text-3); font-size: 13px; }
+  .campaign-strip-empty .btn { margin-top: 10px; }
 
   /* ---------- glow hero ---------- */
   .glow-hero {
@@ -831,7 +835,7 @@ const TEMPLATES = {
     <div id="heroSlot"></div>
     <div class="stats-grid" id="statsGrid"><div class="empty">กำลังโหลด...</div></div>
     <div class="row" style="justify-content:space-between; align-items:center; margin-bottom:10px; flex-wrap:wrap; gap:10px">
-      <h2 style="font-size:15px; font-weight:650">สถิติแยกตาม</h2>
+      <h2 style="font-size:15px; font-weight:650" id="campaignStripTitle">สถิติแยกตาม</h2>
       <div class="segmented" id="dashStripToggle">
         <button data-mode="campaign" class="active" onclick="setDashboardStripMode('campaign')">Campaign</button>
         <button data-mode="number" onclick="setDashboardStripMode('number')">เบอร์ Twilio</button>
@@ -1135,9 +1139,8 @@ const INIT = {
   dashboard: async () => {
     initDashboardDateRange()
     await loadCampaigns()
-    // ต้องโหลด contacts ให้เสร็จก่อน loadStats() เสมอ — renderStatsStrip() (เรียกจากใน loadStats) อ่าน contactsCache
-    // ทันทีตอน render การ์ด "เบอร์ทั้งหมด" ต่อ Campaign ถ้ายังไม่เคยเปิดหน้าเบอร์ติดต่อมาก่อนในเซสชันนี้ contactsCache จะว่างเปล่า
-    // ทำให้ตัวเลขโชว์ 0 ผิดๆ ทั้งที่มีเบอร์จริงอยู่ — ต้องรอ loadContacts() เสร็จก่อนเสมอ ไม่ใช่ปล่อยให้แข่งกันแบบสุ่ม
+    // เผื่อไว้ล่วงหน้าให้ contactsCache พร้อมใช้ทันทีถ้าผู้ใช้กดไปหน้า "เบอร์ติดต่อ" ต่อจากนี้ — renderStatsStrip()
+    // เองไม่ได้อ่าน contactsCache แล้ว (การ์ด Campaign ใช้ statsCache ล้วนๆ) แต่ยังคุ้มที่จะโหลดคู่กันไปเลย
     await Promise.all([loadTwilioNumbers(), loadContacts()])
     await Promise.all([loadStats(), refreshActiveGlobal(true)])
   },
@@ -1943,19 +1946,66 @@ function buildMonthOptions(){
 }
 
 /* ==================== dashboard ==================== */
+// Dashboard ต้องยึดวันตามเวลาไทย (Asia/Bangkok) เสมอ ไม่ว่า browser ของแอดมินจะเปิดจาก timezone ไหน — ต่างจาก
+// localDateStr()/computePresetRange()/computeMonthRange()/buildMonthOptions() ด้านบน ซึ่งใช้เวลา browser local
+// และหน้า "ประวัติการโทร" ก็เรียกใช้ฟังก์ชันชุดนั้นร่วมอยู่ด้วย (applyHistoryTimePreset/applyHistoryMonth) — ห้ามแก้
+// ชุดนั้นในรอบนี้ เพราะจะเปลี่ยน semantics ของหน้า History ไปด้วยโดยไม่ได้ตั้งใจ จึงแยกชุด Bangkok-specific มาต่างหาก
+function bangkokDateKeyFrontend(date){
+  return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Bangkok', year: 'numeric', month: '2-digit', day: '2-digit' }).format(date)
+}
+// เลื่อน date key (YYYY-MM-DD) ไปกี่วัน คำนวณบน calendar key ตรงๆ (เหมือน backend bangkokDateKey/shiftDateKey ใน
+// googleSheets.js) ไม่ผ่าน Date ของ browser ในโหมด local เพื่อไม่ให้ผลลัพธ์ขึ้นกับ timezone ของเครื่องที่เปิดอยู่
+function shiftDateKeyFrontend(dateKey, deltaDays){
+  const d = new Date(dateKey + 'T00:00:00Z')
+  d.setUTCDate(d.getUTCDate() + deltaDays)
+  return d.toISOString().slice(0, 10)
+}
+function computeDashboardPresetRange(value){
+  const today = bangkokDateKeyFrontend(new Date())
+  if (value === 'yesterday') { const y = shiftDateKeyFrontend(today, -1); return { from: y, to: y } }
+  if (value === '7d') return { from: shiftDateKeyFrontend(today, -6), to: today }
+  if (value === '30d') return { from: shiftDateKeyFrontend(today, -29), to: today }
+  if (value === 'quarter') return { from: shiftDateKeyFrontend(today, -89), to: today }
+  return { from: today, to: today } // 'today'
+}
+// เดือนปัจจุบัน (เทียบด้วย Bangkok today) ใช้วันนี้แทนวันสุดท้ายของเดือน กันเลือกวันที่ในอนาคต
+function computeDashboardMonthRange(value){
+  const [y, m] = value.split('-').map(Number)
+  const todayKey = bangkokDateKeyFrontend(new Date())
+  const [ty, tm] = todayKey.split('-').map(Number)
+  const first = `${y}-${String(m).padStart(2, '0')}-01`
+  if (y === ty && m === tm) return { from: first, to: todayKey }
+  // day 0 ของเดือนถัดไป = วันสุดท้ายของเดือนนี้ (คำนวณบน UTC field ล้วนๆ ไม่ผ่าน local — deterministic)
+  const last = new Date(Date.UTC(y, m, 0)).toISOString().slice(0, 10)
+  return { from: first, to: last }
+}
+// สร้าง <option> ของ dropdown "เลือกเดือน" ของ Dashboard ย้อนหลัง 12 เดือนจาก Bangkok today (แยกจาก buildMonthOptions()
+// ที่หน้า History ยังใช้อยู่)
+function buildDashboardMonthOptions(){
+  const todayKey = bangkokDateKeyFrontend(new Date())
+  const [ty, tm] = todayKey.split('-').map(Number)
+  const opts = ['<option value="">เลือกเดือน</option>']
+  for (let i = 0; i < 12; i++) {
+    const d = new Date(Date.UTC(ty, tm - 1 - i, 1))
+    const value = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`
+    const label = new Intl.DateTimeFormat('th-TH', { year: 'numeric', month: 'long', timeZone: 'UTC' }).format(d)
+    opts.push(`<option value="${escAttr(value)}">${esc(label)}</option>`)
+  }
+  return opts.join('')
+}
 // ตั้งค่าเริ่มต้นช่องวันที่เป็นวันนี้จริงๆ (ไม่ปล่อยว่าง) + สร้างตัวเลือกใน dropdown "เลือกเดือน"
 function initDashboardDateRange(){
-  const today = localDateStr(new Date())
+  const today = bangkokDateKeyFrontend(new Date())
   const fromEl = document.getElementById('dashDateFrom')
   const toEl = document.getElementById('dashDateTo')
   if (fromEl) fromEl.value = today
   if (toEl) toEl.value = today
   const monthSel = document.getElementById('dashMonthPicker')
-  if (monthSel) monthSel.innerHTML = buildMonthOptions()
+  if (monthSel) monthSel.innerHTML = buildDashboardMonthOptions()
 }
 // dropdown "เวลา" — ปรับช่องจาก/ถึงวันที่ให้ตรงกับตัวเลือกด่วน แล้วค้นหาให้เลย
 function applyDashboardTimePreset(value){
-  const { from, to } = computePresetRange(value)
+  const { from, to } = computeDashboardPresetRange(value)
   document.getElementById('dashDateFrom').value = from
   document.getElementById('dashDateTo').value = to
   document.getElementById('dashMonthPicker').value = ''
@@ -1964,7 +2014,7 @@ function applyDashboardTimePreset(value){
 // dropdown "เลือกเดือน"
 function applyDashboardMonth(value){
   if (!value) return
-  const { from, to } = computeMonthRange(value)
+  const { from, to } = computeDashboardMonthRange(value)
   document.getElementById('dashDateFrom').value = from
   document.getElementById('dashDateTo').value = to
   loadStats()
@@ -2071,12 +2121,25 @@ function renderTimePattern(){
     </div>`
   }).join('')
 }
+// ข้อความหัวข้อ/empty-state ต้องสะท้อนช่วงวันที่ Dashboard กำลังดูอยู่จริง ห้าม hardcode "วันนี้" เวลาผู้ใช้เลือก
+// วันย้อนหลังหรือช่วงวันที่ — เทียบด้วย Bangkok today เดียวกับที่ initDashboardDateRange() ตั้งค่าเริ่มต้นไว้
+function dashboardPeriodLabel(){
+  const from = document.getElementById('dashDateFrom')?.value || ''
+  const to = document.getElementById('dashDateTo')?.value || ''
+  if (!from || !to) return { heading: 'Campaign ที่มีการโทร', empty: 'ยังไม่มี Campaign ที่มีการโทรในช่วงที่เลือก' }
+  const todayKey = bangkokDateKeyFrontend(new Date())
+  if (from === to && from === todayKey) return { heading: 'Campaign ที่โทรวันนี้', empty: 'ยังไม่มี Campaign ที่เริ่มโทรวันนี้ — เมื่อเริ่มโทร Campaign ข้อมูลจะปรากฏที่นี่อัตโนมัติ' }
+  if (from === to) return { heading: 'Campaign ที่มีการโทรในวันที่เลือก', empty: 'ยังไม่มี Campaign ที่มีการโทรในวันที่เลือก' }
+  return { heading: 'Campaign ที่มีการโทรในช่วงที่เลือก', empty: 'ยังไม่มี Campaign ที่มีการโทรในช่วงวันที่นี้' }
+}
 function renderStatsStrip(){
   const el = document.getElementById('campaignStrip')
   if (!el) return
   const grads = ['g0','g1','g2','g3']
+  const titleEl = document.getElementById('campaignStripTitle')
 
   if (dashboardStripMode === 'number') {
+    if (titleEl) titleEl.textContent = 'สถิติแยกตามเบอร์ Twilio'
     if (!twilioNumbersCache.length) { el.innerHTML = '<div class="empty">ยังไม่มีเบอร์ในระบบ — ไปเพิ่มที่หน้า "จัดการเบอร์"</div>'; return }
     el.innerHTML = twilioNumbersCache.map((n,i) => {
       const calls = (statsCache && statsCache.byTwilioNumber && statsCache.byTwilioNumber[n.phone_number]) || 0
@@ -2101,10 +2164,23 @@ function renderStatsStrip(){
     return
   }
 
-  el.innerHTML = campaignsCache.map((c,i) => {
-    const totalContacts = contactsCache.filter(x => x.campaign === c.id && x.status !== 'deleted').length
-    const called = (statsCache && statsCache.byCampaign && statsCache.byCampaign[c.id]) || 0
-    const pct = totalContacts ? Math.min(100, Math.round(called / totalContacts * 100)) : 0
+  // Campaign mode — โชว์เฉพาะ Campaign ที่มี call attempt จริงในช่วงวันที่กำลังดูอยู่ (ไม่ใช่ campaign.status, ไม่ใช่
+  // จำนวน contact) — source of truth คือ statsCache.byCampaign ที่ /api/stats กรองตามช่วงวันมาให้แล้วฝั่ง backend
+  const { heading, empty } = dashboardPeriodLabel()
+  const activeCampaigns = campaignsCache.filter(c => ((statsCache && statsCache.byCampaign && statsCache.byCampaign[c.id]) || 0) > 0)
+  if (titleEl) titleEl.textContent = `${heading} · ${activeCampaigns.length} Campaign`
+
+  if (!activeCampaigns.length) {
+    el.innerHTML = `<div class="campaign-strip-empty">${esc(empty)}<div><button class="btn btn-ghost btn-sm" onclick="go('campaigns')">ดู Campaign ทั้งหมด ${icon('chevron')}</button></div></div>`
+    return
+  }
+
+  el.innerHTML = activeCampaigns.map((c,i) => {
+    const called = statsCache.byCampaign[c.id] || 0
+    const answered = (statsCache.answeredByCampaign && statsCache.answeredByCampaign[c.id]) || 0
+    const interested = (statsCache.interestedByCampaign && statsCache.interestedByCampaign[c.id]) || 0
+    const callback = (statsCache.callbackByCampaign && statsCache.callbackByCampaign[c.id]) || 0
+    const rate = called ? Math.round(interested / called * 100) : 0
     return `
     <div class="gcard ${grads[i % grads.length]} ${c.status==='paused'?'dim':''}" onclick="go('campaigns')">
       <div class="top-row">
@@ -2113,11 +2189,13 @@ function renderStatsStrip(){
       </div>
       <div>
         <div class="name">${esc(c.name)}</div>
-        <div class="stats">
-          <div><div class="n num">${totalContacts}</div><div class="l">เบอร์ทั้งหมด</div></div>
-          <div><div class="n num">${called}</div><div class="l">โทรแล้ว</div></div>
+        <div class="stats grid2">
+          <div><div class="n num">${called}</div><div class="l">โทร</div></div>
+          <div><div class="n num">${answered}</div><div class="l">รับสาย</div></div>
+          <div><div class="n num">${interested}</div><div class="l">สนใจ</div></div>
+          <div><div class="n num">${callback}</div><div class="l">Callback</div></div>
         </div>
-        <div class="progress"><div class="progress-fill" style="width:${pct}%"></div></div>
+        <div class="conv-line">Conversion <b class="num">${rate}%</b></div>
       </div>
     </div>`
   }).join('')
