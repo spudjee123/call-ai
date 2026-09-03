@@ -16,7 +16,7 @@ require.cache[anthropicPath] = {
   },
 }
 
-const { askClaude } = require('../src/services/claude')
+const { askClaude, askClaudeStream } = require('../src/services/claude')
 
 beforeEach(() => {
   state.createImpl = null
@@ -141,4 +141,110 @@ test('askClaude: [GreetingGen] log ยิงทุก attempt พร้อม st
   assert.match(greetingLogs[0], /stopReason=max_tokens/)
   assert.match(greetingLogs[0], new RegExp(`length=${'ตัดกลางคำ'.length}`))
   assert.match(greetingLogs[1], /stopReason=end_turn/)
+})
+
+// ===== Campaign-Controlled Opening (Design Freeze 2026-09-03) =====
+
+test('askClaude: user instruction เป็นข้อความกลางๆ คงที่ ไม่ inject พฤติกรรมธุรกิจ (ไม่ถามสะดวกคุยไหม/มีอะไรให้ช่วยไหม) ไม่ว่า campaign จะเขียนอะไรมา', async () => {
+  let capturedMessages = null
+  state.createImpl = async (params) => { capturedMessages = params.messages; return textResponse('สวัสดีค่ะ') }
+  await askClaude(makeSession({ direction: 'outbound' }))
+  const userContent = capturedMessages[0].content
+  assert.doesNotMatch(userContent, /สะดวกคุยสักครู่ไหม/, 'ต้องไม่บังคับถามสะดวกคุยไหมอีกต่อไป — ให้ campaign เป็นคนสั่งเอง')
+  assert.doesNotMatch(userContent, /มีอะไรให้ช่วยไหมคะ/)
+  assert.match(userContent, /Campaign Prompt/, 'ต้องบอกให้ยึด Campaign Prompt เป็นหลัก')
+})
+
+test('askClaude: user instruction บอกทิศทางสายเป็นข้อเท็จจริงเท่านั้น (outbound/inbound ต่างกันแค่คำอธิบายทิศทาง ไม่ต่างพฤติกรรม)', async () => {
+  let outboundMsg = null, inboundMsg = null
+  state.createImpl = async (params) => { outboundMsg = params.messages[0].content; return textResponse('สวัสดีค่ะ') }
+  await askClaude(makeSession({ direction: 'outbound' }))
+  state.createImpl = async (params) => { inboundMsg = params.messages[0].content; return textResponse('สวัสดีค่ะ') }
+  await askClaude(makeSession({ direction: 'inbound' }))
+  assert.match(outboundMsg, /AI โทรออกหาลูกค้า/)
+  assert.match(inboundMsg, /ลูกค้าโทรเข้ามาเอง/)
+  // ส่วนที่เหลือของ instruction (คำสั่งหลัก) ต้องเหมือนกันทุกตัวอักษร ต่างกันแค่ท้ายวงเล็บทิศทาง
+  const stripDirection = s => s.replace(/\(สายนี้เป็นสาย.*?\)$/, '')
+  assert.equal(stripDirection(outboundMsg), stripDirection(inboundMsg))
+})
+
+test('askClaude: system prompt (buildOpeningSystemPrompt) ต้องไม่มีกฎธุรกิจของบทสนทนาปกติ (ดึงกลับโปรโมชั่น, [END_CALL] policy) ปนอยู่ — กัน campaign ที่สั่ง "ห้ามพูดโปรโมชั่น" โดนกฎกลางบังคับย้อนกลับ', async () => {
+  let capturedSystem = null
+  state.createImpl = async (params) => { capturedSystem = params.system; return textResponse('สวัสดีค่ะ') }
+  await askClaude(makeSession({ campaign: { script: 'คุณคือทีมบริการหลังการขาย ห้ามพูดโปรโมชั่นเด็ดขาด' } }))
+  assert.doesNotMatch(capturedSystem, /ดึงกลับมาที่โปรโมชั่น/, 'ต้องไม่มีกฎบังคับดึงกลับโปรโมชั่นจาก buildSystemPrompt เดิมปนมาด้วย')
+  assert.doesNotMatch(capturedSystem, /\[END_CALL\]/, 'ต้องไม่มี policy END_CALL ของบทสนทนาปกติปนมาด้วย — Opening เป็นเทิร์นเดียว ไม่เกี่ยวกับการจบสาย')
+  assert.match(capturedSystem, /ห้ามพูดโปรโมชั่นเด็ดขาด/, 'เนื้อหา campaign prompt เต็มต้องยังส่งเข้าไปครบ')
+})
+
+test('askClaude: system prompt ยังคง technical/voice constraint ไว้ (สั้น, ภาษาไทย, ไม่ใช้ markdown, ลงท้ายเพศหญิง)', async () => {
+  let capturedSystem = null
+  state.createImpl = async (params) => { capturedSystem = params.system; return textResponse('สวัสดีค่ะ') }
+  await askClaude(makeSession())
+  assert.match(capturedSystem, /ห้ามใช้ bullet points, markdown/)
+  assert.match(capturedSystem, /ห้ามใช้ ครับ เด็ดขาด/)
+  assert.match(capturedSystem, /ชื่อลูกค้า: จอร์จ/)
+})
+
+test('askClaude: campaign.script และ campaign.system_prompt ว่างเปล่า/whitespace ล้วน → fallback ทันที ไม่เรียก LLM เลย', async () => {
+  let calls = 0
+  state.createImpl = async () => { calls++; return textResponse('ไม่ควรถูกเรียก') }
+  const text = await askClaude(makeSession({ campaign: { script: '   ' } }))
+  assert.equal(calls, 0, 'ไม่ควรเรียก Anthropic เลยถ้าไม่มี context ใช้งานได้')
+  assert.match(text, /จอร์จ/)
+  assert.match(text, /สะดวกคุยสักครู่ไหมคะ/, 'ต้องเป็น outbound fallback เดิม')
+})
+
+test('askClaude (IR finding): script เป็น whitespace ล้วนแต่ system_prompt ใช้งานได้จริง → ต้องเลือก system_prompt ไม่ใช่ fallback (bug เดิม: "   " || "VALID" ยังได้ "   " เพราะ || เช็คแค่ truthy ไม่รู้เรื่อง trim)', async () => {
+  let calls = 0, capturedSystem = null
+  state.createImpl = async (params) => { calls++; capturedSystem = params.system; return textResponse('สวัสดีค่ะ') }
+  const text = await askClaude(makeSession({ campaign: { script: '   ', system_prompt: 'คุณคือทีมบริการหลังการขาย ห้ามพูดโปรโมชั่นเด็ดขาด' } }))
+  assert.equal(calls, 1, 'ต้องเรียก LLM จริง ไม่ใช่ fallback ทั้งที่ system_prompt ใช้งานได้')
+  assert.match(capturedSystem, /ห้ามพูดโปรโมชั่นเด็ดขาด/, 'ต้องใช้เนื้อหาจาก system_prompt ไม่ใช่ whitespace ของ script')
+  assert.equal(text, 'สวัสดีค่ะ')
+})
+
+test('askClaude: Anthropic throw ตอน attempt แรก (เช่น 429/5xx/network) → fallback ทันที ไม่ throw ออกไปให้ผู้เรียกเห็น ไม่ retry', async () => {
+  let calls = 0
+  state.createImpl = async () => { calls++; throw new Error('Request failed with status code 429') }
+  const text = await askClaude(makeSession({ name: 'มด', direction: 'outbound' }))
+  assert.equal(calls, 1, 'throw ไม่ควร retry — ตัดไป fallback ทันทีตาม Design Freeze')
+  assert.match(text, /มด/)
+  assert.match(text, /สะดวกคุยสักครู่ไหมคะ/)
+})
+
+test('askClaude: max_tokens ตอน attempt แรก แล้ว Anthropic throw ตอน retry → fallback ทันที', async () => {
+  let calls = 0
+  state.createImpl = async () => {
+    calls++
+    if (calls === 1) return textResponse('สวัสดีค่ะ...', 'max_tokens')
+    throw new Error('network timeout')
+  }
+  const text = await askClaude(makeSession({ name: 'ปุ๊', direction: 'inbound' }))
+  assert.equal(calls, 2)
+  assert.match(text, /ปุ๊/)
+  assert.match(text, /มีอะไรให้ช่วยไหมคะ/)
+})
+
+test('askClaude: throw ไม่มีทางทำให้คืนค่า empty string — ต้องได้ fallback ที่ใช้พูดได้จริงเสมอ', async () => {
+  state.createImpl = async () => { throw new Error('boom') }
+  const text = await askClaude(makeSession())
+  assert.ok(text && text.length > 0, 'ห้ามคืน empty opening แม้ generation จะล้มเหลวแบบ throw')
+})
+
+test('askClaudeStream(isGreeting=true): ต้องใช้ Opening semantics เดียวกับ requestGreetingOnce() (buildOpeningSystemPrompt + openingInstruction) แม้จะเป็น dead path วันนี้ — กัน "ระบบ Opening สองมาตรฐาน"', async () => {
+  let capturedSystem = null, capturedUserMsg = null
+  state.createImpl = async (params) => {
+    // askClaudeStream ส่ง system เป็น content-block array (มี cache_control) ต่างจาก requestGreetingOnce ที่ส่งเป็น string ตรงๆ
+    capturedSystem = params.system[0].text
+    capturedUserMsg = params.messages[0].content
+    return textResponse('สวัสดีค่ะ')
+  }
+  const gen = askClaudeStream(makeSession({ campaign: { script: 'ห้ามพูดโปรโมชั่นเด็ดขาด' } }), true)
+  const results = []
+  for await (const chunk of gen) results.push(chunk)
+  assert.doesNotMatch(capturedSystem, /ดึงกลับมาที่โปรโมชั่น/, 'isGreeting=true ต้องไม่ใช้ buildSystemPrompt() เดิมที่มีกฎบังคับโปรโมชั่น')
+  assert.doesNotMatch(capturedSystem, /\[END_CALL\]/)
+  assert.doesNotMatch(capturedUserMsg, /สะดวกคุยสักครู่ไหม/, 'ต้องใช้ openingInstruction() ที่เป็นกลาง ไม่ใช่ instruction เดิม')
+  assert.match(capturedUserMsg, /Campaign Prompt/)
 })

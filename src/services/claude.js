@@ -6,13 +6,14 @@ const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
 
 const MAX_HISTORY = 20
 
-// คำสั่งทักทายต่างกันตามทิศทางสาย — outbound คือ AI โทรออกไปหาลูกค้า (ต้องถามว่าสะดวกคุยไหม)
-// inbound คือลูกค้าโทรเข้ามาเอง (ไม่ต้องถามว่าสะดวกไหม เพราะลูกค้าเลือกโทรมาเองอยู่แล้ว — ควรถามว่ามีอะไรให้ช่วย)
-const OUTBOUND_GREETING_INSTRUCTION = 'ทักทายและแนะนำตัวสั้นๆ แล้วถามว่าสะดวกคุยสักครู่ไหม รวม 1-2 ประโยคเท่านั้น'
-const INBOUND_GREETING_INSTRUCTION = 'รับสายลูกค้าที่โทรเข้ามาเอง ทักทายสั้นๆ แนะนำตัวว่าเป็นใคร แล้วถามว่ามีอะไรให้ช่วยไหมคะ รวม 1-2 ประโยคเท่านั้น'
-
-function greetingInstruction(session) {
-  return session.direction === 'inbound' ? INBOUND_GREETING_INSTRUCTION : OUTBOUND_GREETING_INSTRUCTION
+// Campaign-Controlled Opening (Design Freeze 2026-09-03) — เนื้อหาที่ AI พูดตอนเปิดสายต้องขึ้นอยู่กับ Campaign
+// Prompt ทั้งหมด (ทำตาม opening ที่ campaign สั่งไว้ตรงๆ ถ้ามี ไม่งั้น infer จาก role/goal/context ของ campaign เอง)
+// instruction นี้จึงเป็นแค่ technical trigger บอกข้อเท็จจริงเรื่องทิศทางสาย ไม่สั่งพฤติกรรม/เนื้อหาใดๆ ให้ backend
+// ตัดสินใจแทน campaign อีกต่อไป (เดิมมี OUTBOUND/INBOUND_GREETING_INSTRUCTION ที่บังคับ "ถามสะดวกคุยไหม"/"ถามมี
+// อะไรให้ช่วย" ตรงๆ — ย้ายความรับผิดชอบนี้ทั้งหมดไปที่ campaign.script/system_prompt แทน)
+function openingInstruction(session) {
+  const directionNote = session.direction === 'inbound' ? 'ที่ลูกค้าโทรเข้ามาเอง' : 'ที่ AI โทรออกหาลูกค้า'
+  return `สร้างข้อความแรกที่ AI ควรพูดเมื่อเริ่มสายนี้ โดยยึดบทบาท เป้าหมาย บริบท วิธีเปิดสาย และกติกาที่กำหนดไว้ใน Campaign Prompt เป็นหลัก ถ้า Campaign ระบุ Opening ชัดเจนให้ทำตามนั้น ถ้าไม่ได้ระบุ Opening ชัด ให้สร้าง Opening ที่เหมาะสมจาก role/goal/context ของ Campaign ตอบเฉพาะข้อความที่จะพูดจริง (สายนี้เป็นสาย${directionNote})`
 }
 
 // G1 (production defect 2026-08-20) — greeting เคยถูกตัดกลางคำจริงใน production (max_tokens: 60 ไม่พอสำหรับ
@@ -21,8 +22,10 @@ function greetingInstruction(session) {
 // check + fallback ที่ deterministic ด้วย
 const GREETING_MAX_TOKENS = 120
 
-// fallback ต้องแยกตาม direction เหมือน greetingInstruction() เอง — inbound (ลูกค้าโทรเข้ามาเอง) ไม่ควรถาม
-// "สะดวกคุยไหม" (ดูเหตุผลเดิมที่ greetingInstruction ด้านบน) ถ้าใช้ fallback เดียวปนกันจะทำให้ inbound behavior
+// fallback ยังแยกตาม direction เหมือนเดิม (เดิมเหตุผลผูกกับ greetingInstruction() ที่ถูกแทนที่ด้วย
+// openingInstruction() ที่เป็นกลางแล้ว — แต่ fallback เองยังต้อง preserve exact wording เดิมตาม Design Freeze
+// ไม่แตะ) — inbound (ลูกค้าโทรเข้ามาเอง) ไม่ควรถาม
+// "สะดวกคุยไหม" ถ้าใช้ fallback เดียวปนกันจะทำให้ inbound behavior
 // regress เงียบๆ เฉพาะตอน fallback trigger เท่านั้น (เคสที่ test ปกติมักไม่ได้ครอบคลุม)
 function outboundFallbackGreeting(name) {
   return `สวัสดีค่ะคุณ${name} ฟ้าจากพีจีด็อกนะคะ โทรมาทักทายและขอบคุณที่เข้ามาเป็นสมาชิกค่ะ สะดวกคุยสักครู่ไหมคะ`
@@ -41,14 +44,34 @@ function extractGreetingText(response) {
   return response.content?.find(block => block.type === 'text')?.text?.trim() || ''
 }
 
+// Campaign-Controlled Opening — system prompt เฉพาะ Opening แยกจาก buildSystemPrompt() ของบทสนทนาปกติด้านล่าง
+// เพราะ buildSystemPrompt() มีกฎเฉพาะทางธุรกิจของเทิร์นสนทนา (ดึงกลับมาที่โปรโมชั่นทันที, นโยบาย [END_CALL] ที่ผูก
+// กับ flow สมัคร/โปรโมชั่น) ซึ่งจะ override เจตนาของ campaign เองถ้าเอามาใช้กับ Opening ตรงๆ — เช่น campaign บริการ
+// หลังการขายที่สั่ง "ห้ามพูดโปรโมชั่น" จะโดนกฎกลางบังคับดึงกลับโปรโมชั่นอยู่ดี คงไว้เฉพาะกฎที่เป็น technical/voice
+// constraint ล้วนๆ (รูปแบบคำตอบ, ความยาว, การลงท้ายเพศ) ไม่เอากฎที่เป็นพฤติกรรมทางธุรกิจของการสนทนาต่อเนื่องมาด้วย
+function buildOpeningSystemPrompt(campaignPrompt, customerName) {
+  return `${campaignPrompt}
+
+ชื่อลูกค้า: ${customerName}
+คำตอบต้องสั้นมาก ไม่เกิน 1-2 ประโยคเท่านั้น ภาษาไทย เหมาะกับการพูดทางโทรศัพท์ ห้ามใช้ bullet points, markdown, emoji หรือสัญลักษณ์พิเศษ ตอบกระชับที่สุด
+ใช้คำลงท้ายผู้หญิง ค่ะ หรือ คะ เสมอ ห้ามใช้ ครับ เด็ดขาด ห้ามใช้คำว่า ผม เด็ดขาด ให้ใช้คำว่า หนู แทนทุกกรณีโดยไม่มีข้อยกเว้น`
+}
+
+// IR finding (2026-09-03) — campaign.script || campaign.system_prompt เดิมเลือกผิดถ้า script เป็น whitespace
+// ล้วน (truthy แต่ trim แล้วว่าง) ทั้งที่ system_prompt มีเนื้อหาใช้งานได้จริง: '   ' || 'VALID' ยังได้ '   ' เพราะ
+// '||' เช็คแค่ truthy ไม่รู้เรื่อง trim เลย ต้อง trim ทีละตัวก่อนเลือก ไม่ trim หลังเลือกแล้ว
+function resolveCampaignPrompt(campaign) {
+  return (campaign.script || '').trim() || (campaign.system_prompt || '').trim()
+}
+
 async function requestGreetingOnce(session) {
   const { name, campaign } = session
-  const systemPrompt = buildSystemPrompt(campaign.script || campaign.system_prompt, name)
+  const systemPrompt = buildOpeningSystemPrompt(resolveCampaignPrompt(campaign), name)
   const response = await client.messages.create({
     model: 'claude-haiku-4-5-20251001',
     max_tokens: GREETING_MAX_TOKENS,
     system: systemPrompt,
-    messages: [{ role: 'user', content: greetingInstruction(session) }],
+    messages: [{ role: 'user', content: openingInstruction(session) }],
   })
   const text = extractGreetingText(response)
   console.log(`[GreetingGen] stopReason=${response.stop_reason} length=${text.length}`)
@@ -57,19 +80,41 @@ async function requestGreetingOnce(session) {
 
 // ใช้สำหรับ greeting เท่านั้น — Haiku เพราะต้องการ latency ต่ำ
 //
-// completion policy (G1):
-//   attempt 1: end_turn + text        → accept
+// completion + failure policy (G1 + Campaign-Controlled Opening amendment 2026-09-03):
+//   0. Campaign ไม่มี prompt ใช้งานได้เลย (ว่าง/whitespace ล้วน) → fallback ทันที ไม่เรียก LLM แบบไม่มี context
+//   attempt 1: end_turn + text        → accept (Campaign Opening — explicit หรือ inferred แล้วแต่ที่ campaign สั่ง)
 //              max_tokens             → retry ครั้งเดียว
 //              empty text (ไม่ใช่ max_tokens) → fallback ทันที ไม่ retry (deterministic copy ที่ถูกต้องอยู่แล้ว
 //                                        retry เพิ่มแค่เสีย latency โดยไม่ได้ประโยชน์)
-//   attempt 2: complete + text        → accept
-//              max_tokens/empty       → fallback
+//              throw (API/network/429/5xx) → fallback ทันที ไม่ retry — ตั้งใจไม่เพิ่ม retry policy ใหม่ที่ไม่เคยมี
+//                                        (Design Freeze: deterministic ดีกว่า และลูกค้าต้องไม่เจอความเงียบ)
+//   attempt 2 (retry): complete + text → accept
+//              max_tokens/empty/throw  → fallback
 async function askClaude(session) {
-  let result = await requestGreetingOnce(session)
+  const campaignPrompt = resolveCampaignPrompt(session.campaign)
+  if (!campaignPrompt) {
+    console.error('[GreetingGen] Campaign prompt ว่างเปล่า/ใช้งานไม่ได้ — ใช้ fallback ทันที ไม่เรียก LLM')
+    return fallbackGreeting(session)
+  }
+
+  let result
+  try {
+    result = await requestGreetingOnce(session)
+  } catch (err) {
+    console.error('[GreetingGen] API error on attempt 1 — using deterministic fallback:', err.message)
+    return fallbackGreeting(session)
+  }
+
   if (result.stopReason === 'max_tokens') {
     console.error('[GreetingGen] Truncated (max_tokens) — retrying once')
-    result = await requestGreetingOnce(session)
+    try {
+      result = await requestGreetingOnce(session)
+    } catch (err) {
+      console.error('[GreetingGen] API error on retry — using deterministic fallback:', err.message)
+      return fallbackGreeting(session)
+    }
   }
+
   if (result.stopReason === 'max_tokens' || !result.text) {
     console.error(`[GreetingGen] Still incomplete after retry (stopReason=${result.stopReason}, length=${result.text.length}) — using deterministic fallback`)
     return fallbackGreeting(session)
@@ -142,10 +187,17 @@ STT บนสายโทรศัพท์อาจฟังผิดบ้า�
 
 async function* askClaudeStream(session, isGreeting = false, signal = null) {
   const { name, campaign, messages } = session
-  const systemPrompt = buildSystemPrompt(campaign.script || campaign.system_prompt, name)
+  // isGreeting=true ยังไม่มี live caller จริง (dead path ณ ตอนนี้) แต่ต้องใช้ Opening semantics เดียวกับ
+  // requestGreetingOnce() ไม่งั้นจะเหลือ "ระบบ Opening สองมาตรฐาน" ที่ path นี้ยังโดน buildSystemPrompt() เดิม
+  // (มีกฎบังคับโปรโมชั่น) บังคับอยู่ ทั้งที่ requestGreetingOnce() แก้ไปแล้ว — เป็น sleeper bug ถ้ามีใครมาเปิดใช้ path นี้ทีหลัง
+  // isGreeting=false (ongoing conversation) จงใจไม่แตะ — คงนิพจน์เดิม campaign.script || campaign.system_prompt
+  // ไว้ตามที่เป็นมาก่อน Track นี้ทั้งหมด ไม่ใช่ scope ของ Campaign-Controlled Opening
+  const systemPrompt = isGreeting
+    ? buildOpeningSystemPrompt(resolveCampaignPrompt(campaign), name)
+    : buildSystemPrompt(campaign.script || campaign.system_prompt, name)
   const history = messages.slice(-MAX_HISTORY)
   const msgs = isGreeting
-    ? [{ role: 'user', content: greetingInstruction(session) }]
+    ? [{ role: 'user', content: openingInstruction(session) }]
     : history
 
   if (!msgs.length) { yield 'สวัสดีค่ะ'; return }
