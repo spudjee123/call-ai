@@ -44,11 +44,11 @@ test('askClaude: attempt แรกสมบูรณ์ (end_turn + text) → �
   assert.equal(calls, 1)
 })
 
-test('askClaude: request ที่ส่งไป Anthropic จริงต้องมี max_tokens=120 (ล็อก regression ของต้นเหตุ production โดยตรง — เดิมคือ 60)', async () => {
+test('askClaude: request ที่ส่งไป Anthropic จริงต้องมี max_tokens=256 (production incident 2026-09-03: 120 ไม่พอสำหรับ campaign opening ที่เขียนยาว เดิมคือ 60 แล้วเป็น 120 ก่อนหน้านี้)', async () => {
   let capturedMaxTokens = null
   state.createImpl = async (params) => { capturedMaxTokens = params.max_tokens; return textResponse('สวัสดีค่ะคุณจอร์จ สะดวกคุยไหมคะ') }
   await askClaude(makeSession())
-  assert.equal(capturedMaxTokens, 120)
+  assert.equal(capturedMaxTokens, 256)
 })
 
 test('askClaude: attempt แรก max_tokens (ตัดกลางคำ) → retry ครั้งเดียว แล้วสำเร็จ ใช้ผลจาก attempt ที่สอง', async () => {
@@ -193,6 +193,7 @@ test('askClaude: campaign.script และ campaign.system_prompt ว่าง�
   assert.equal(calls, 0, 'ไม่ควรเรียก Anthropic เลยถ้าไม่มี context ใช้งานได้')
   assert.match(text, /จอร์จ/)
   assert.match(text, /สะดวกคุยสักครู่ไหมคะ/, 'ต้องเป็น outbound fallback เดิม')
+  assert.doesNotMatch(text, /พีจีด็อก/, 'fallback ต้องไม่ hardcode ชื่อแบรนด์ (production incident 2026-09-03)')
 })
 
 test('askClaude (IR finding): script เป็น whitespace ล้วนแต่ system_prompt ใช้งานได้จริง → ต้องเลือก system_prompt ไม่ใช่ fallback (bug เดิม: "   " || "VALID" ยังได้ "   " เพราะ || เช็คแค่ truthy ไม่รู้เรื่อง trim)', async () => {
@@ -230,6 +231,16 @@ test('askClaude: throw ไม่มีทางทำให้คืนค่า
   state.createImpl = async () => { throw new Error('boom') }
   const text = await askClaude(makeSession())
   assert.ok(text && text.length > 0, 'ห้ามคืน empty opening แม้ generation จะล้มเหลวแบบ throw')
+})
+
+test('askClaude (production incident 2026-09-03): campaign แบรนด์อื่นที่ไม่ใช่พีจีด็อก โดน max_tokens ทั้ง 2 attempt → fallback ต้องไม่พูดชื่อแบรนด์ใดเลย ไม่ใช่แค่ไม่พูดพีจีด็อก', async () => {
+  let calls = 0
+  state.createImpl = async () => { calls++; return textResponse('สวัสดีค่ะ คุณคือทีม TEST BRAND นะคะ ยาวเกินจน...', 'max_tokens') }
+  const text = await askClaude(makeSession({ name: 'สมหญิง', campaign: { script: 'คุณคือทีม TEST BRAND โทรหาสมาชิก' } }))
+  assert.equal(calls, 2, 'ต้อง retry ครบตามปกติก่อน fallback')
+  assert.doesNotMatch(text, /พีจีด็อก/)
+  assert.doesNotMatch(text, /TEST BRAND/, 'fallback ต้องเป็นกลางจริง ไม่ใช่แค่เอาแบรนด์เก่าออกแล้วเดาแบรนด์ใหม่จาก campaign prompt')
+  assert.match(text, /สมหญิง/)
 })
 
 test('askClaudeStream(isGreeting=true): ต้องใช้ Opening semantics เดียวกับ requestGreetingOnce() (buildOpeningSystemPrompt + openingInstruction) แม้จะเป็น dead path วันนี้ — กัน "ระบบ Opening สองมาตรฐาน"', async () => {

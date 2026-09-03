@@ -88,10 +88,25 @@ function isTransientTtsError(err) {
   return TTS_RETRYABLE_CODES.has(err.code)
 }
 
+// Greeting pregen retry (production incident 2026-09-03) — ElevenLabs 429 ยืนยันจาก production error body จริง
+// ว่าเป็น concurrent-request limit ของ subscription (ปัจจุบันจำกัดที่ 5 requests พร้อมกัน) — สองสายที่เริ่มโทร
+// ออกใกล้กันมาก (pregen ของทั้งคู่ยิงพร้อมกัน) ชนกันได้ง่ายๆ small delay+jitter ก่อน retry ครั้งเดียวช่วยให้พ้น
+// burst สั้นๆ แบบนี้โดยไม่ทำให้ retry ของหลายสายชนกันซ้ำที่จังหวะเดิมเป๊ะๆ (ถ้า delay คงที่ไม่มี jitter) —
+// เฉพาะ pregen เท่านั้น (ไม่แตะ synthesizeSpeechStream ที่ใช้ตอนคุยสดเลย เพื่อไม่เปลี่ยน timing ของ live TTS)
+const PREGEN_RETRY_DELAY_BASE_MS = 200
+const PREGEN_RETRY_DELAY_JITTER_MS = 150
+
 // ไม่เคย throw จาก path นี้เอง (ห้าม logging ทำให้ error path ของ caller พังซ้ำ) และไม่เคยสร้าง error ใหม่ — แค่
 // log แล้วให้ caller เป็นคน rethrow err ตัวเดิมเป๊ะ เพราะ upstream (chunkedTurn.js/audioStream.js) ใช้ err.source/
 // error object เดิมในการจัดหมวด fallback อยู่แล้ว ห้าม log headers/api key หรือ axios config ทั้งก้อนเด็ดขาด
-async function logElevenLabsProviderError(err, { modelId, hasPreviousText, textLength, previousTextLength }) {
+// requestType/attempt (production incident 2026-09-03, TTS 429 investigation) — เพิ่ม field เพื่อแยกได้ว่า
+// error มาจาก path ไหน (pregen ก่อนสายต่อ vs stream ระหว่างคุยสด) และเป็น attempt ที่เท่าไหร่ (เดิม log เดียวกัน
+// ไม่บอกเลยว่าเป็นครั้งแรกหรือหลัง retry แล้ว) errorType/errorCode/requestId ดึงจาก err.response.data.detail
+// จริง — ยืนยันจาก production 429 log ตรงๆ ว่า ElevenLabs ส่ง {"detail":{"type":"rate_limit_error",
+// "code":"concurrent_limit_exceeded","request_id":...}} มาเสมอตอน rate-limit (ข้อความเต็มยังบอกด้วยว่า
+// concurrent limit ของ subscription ปัจจุบันคือ 5 requests พร้อมกัน) — parse แบบ defensive เพราะ error body
+// ของสถานะอื่น (เช่น 5xx บางตัว) อาจไม่ใช่ JSON รูปแบบนี้ ไม่ throw ถ้า parse ไม่ได้ ปล่อย null แทน
+async function logElevenLabsProviderError(err, { modelId, hasPreviousText, textLength, previousTextLength, attempt, requestType }) {
   let responseData = 'unavailable'
   try {
     const body = await readErrorResponseBody(err)
@@ -99,10 +114,24 @@ async function logElevenLabsProviderError(err, { modelId, hasPreviousText, textL
   } catch {
     // เก็บ 'unavailable' ไว้ตามเดิม
   }
+  let errorType = null, errorCode = null, requestId = null
+  try {
+    const parsed = JSON.parse(responseData)
+    errorType = parsed?.detail?.type ?? null
+    errorCode = parsed?.detail?.code ?? null
+    requestId = parsed?.detail?.request_id ?? null
+  } catch {
+    // responseData ไม่ใช่ JSON ที่ parse ได้ (หรือยังเป็น 'unavailable') — ปล่อย null ทั้งหมด ไม่ throw
+  }
   console.error('[TTSProviderError]', JSON.stringify({
     provider: 'elevenlabs',
+    requestType: requestType ?? null,
+    attempt: attempt ?? null,
     status: err.response?.status ?? null,
     statusText: err.response?.statusText ?? null,
+    errorType,
+    errorCode,
+    requestId,
     modelId,
     hasPreviousText,
     textLength,
@@ -125,30 +154,63 @@ function downsample16to8(pcm16k) {
   return out
 }
 
+// Retry-once-on-transient-error (production incident 2026-09-03) — เดิมฟังก์ชันนี้ (ใช้เฉพาะตอน greeting
+// pregen ใน twilio.js) ไม่มี retry เลยสักครั้ง ต่างจาก synthesizeSpeechStream() ด้านล่างที่มี retry ครั้งเดียว
+// สำหรับ transient error อยู่แล้ว — ผลคือ 429 ชั่ววูบตอนสองสายเริ่มโทรพร้อมกัน (ดู PREGEN_RETRY_DELAY_* ด้านบน)
+// ทำให้ pregen fail ทันทีไม่มีทางกู้คืน แล้วไปตกที่ audioStream.js's live-fallback generation แทน (สร้าง Opening
+// ใหม่ + สังเคราะห์เสียงใหม่หลังลูกค้ารับสายไปแล้ว) เกิดเป็นช่วงหน่วง/สะดุดตอนต้นสายที่ได้ยินจริง — reuse
+// isTransientTtsError() ตัวเดียวกับ streaming path ทุกประการ ไม่สร้าง classification ใหม่
 async function synthesizeSpeech(text, voiceId) {
   voiceId = voiceId || DEFAULT_VOICE_ID
   console.log(`[ElevenLabs] Requesting voiceId=${voiceId} text="${text.substring(0, 60)}"`)
 
-  const response = await axios.post(
-    `${BASE_URL}/text-to-speech/${voiceId}?output_format=${OUTPUT_FORMAT}`,
-    {
-      text,
-      model_id: 'eleven_v3',
-      voice_settings: {
-        stability: 0.5,         // ลดจาก 0.85 — เดิมนิ่งเกินจนเสียงราบเรียบไม่มีอารมณ์
-        similarity_boost: 0.90, // สูง = ใกล้เสียงต้นฉบับที่ clone มา
-        style: 0.25,             // เพิ่มจาก 0 — ดึงอารมณ์/บุคลิกจากเสียงต้นฉบับออกมาให้ฟังเป็นธรรมชาติขึ้น
-        use_speaker_boost: true
-      },
+  const requestUrl = `${BASE_URL}/text-to-speech/${voiceId}?output_format=${OUTPUT_FORMAT}`
+  const requestBody = {
+    text,
+    model_id: 'eleven_v3',
+    voice_settings: {
+      stability: 0.5,         // ลดจาก 0.85 — เดิมนิ่งเกินจนเสียงราบเรียบไม่มีอารมณ์
+      similarity_boost: 0.90, // สูง = ใกล้เสียงต้นฉบับที่ clone มา
+      style: 0.25,             // เพิ่มจาก 0 — ดึงอารมณ์/บุคลิกจากเสียงต้นฉบับออกมาให้ฟังเป็นธรรมชาติขึ้น
+      use_speaker_boost: true
     },
-    {
-      headers: {
-        'xi-api-key': API_KEY,
-        'Content-Type': 'application/json',
-      },
-      responseType: 'arraybuffer',
+  }
+  const requestOptions = {
+    headers: {
+      'xi-api-key': API_KEY,
+      'Content-Type': 'application/json',
+    },
+    responseType: 'arraybuffer',
+  }
+
+  let response
+  let attempt = 0
+  for (;;) {
+    attempt++
+    try {
+      response = await axios.post(requestUrl, requestBody, requestOptions)
+      break
+    } catch (err) {
+      const canRetry = attempt === 1 && isTransientTtsError(err)
+      if (canRetry) {
+        const delayMs = PREGEN_RETRY_DELAY_BASE_MS + Math.floor(Math.random() * PREGEN_RETRY_DELAY_JITTER_MS)
+        console.warn(`[ElevenLabs] transient error (${err.response?.status || err.code}) ระหว่าง pregen — retry อีก 1 ครั้งหลัง ${delayMs}ms`)
+        await new Promise(resolve => setTimeout(resolve, delayMs))
+        continue
+      }
+      if (err.code !== 'ERR_CANCELED' && err.name !== 'CanceledError') {
+        await logElevenLabsProviderError(err, {
+          modelId: 'eleven_v3',
+          hasPreviousText: false,
+          textLength: text?.length ?? 0,
+          previousTextLength: 0,
+          attempt,
+          requestType: 'pregen',
+        })
+      }
+      throw err
     }
-  )
+  }
 
   const pcm16k = Buffer.from(response.data)
   console.log(`[ElevenLabs] Got ${pcm16k.length} bytes PCM@16kHz`)
@@ -223,6 +285,8 @@ async function* synthesizeSpeechStream(text, voiceId, signal, previousText) {
           hasPreviousText: Boolean(previousText),
           textLength: text?.length ?? 0,
           previousTextLength: previousText?.length ?? 0,
+          attempt,
+          requestType: 'stream',
         })
       }
       throw err

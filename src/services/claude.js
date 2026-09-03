@@ -20,18 +20,30 @@ function openingInstruction(session) {
 // ประโยคไทยบางประโยค) โดยไม่มี completion check ใดๆ เลย ระบบจึงพูดข้อความที่ตัดกลางคำออกไปให้ลูกค้าฟังตรงๆ
 // เพิ่ม margin (60→120) อย่างเดียวไม่พอ เพราะ prompt/ชื่อลูกค้ายาวขึ้นในอนาคตก็ทำให้เกิดซ้ำได้ — ต้องมี completion
 // check + fallback ที่ deterministic ด้วย
-const GREETING_MAX_TOKENS = 120
+//
+// 120→256 (production incident 2026-09-03) — Campaign-Controlled Opening (2026-09-03) ทำให้ campaign เขียน
+// opening แบบเต็มประโยคของตัวเองได้ (ไม่ถูกบังคับให้สั้น 1-2 ประโยคจาก instruction ตายตัวเหมือนเดิมอีกต่อไป)
+// 120 token ที่ตั้งไว้สำหรับกรณีสั้นเดิม จึงเริ่มไม่พอ — พบจริงจาก [GreetingGen] log บน prod: ทั้ง attempt แรกและ
+// retry โดน max_tokens ตัดที่ length=132/129/135/126 ตัวอักษร (ยังไม่ทันจบประโยคด้วยซ้ำ) ทำให้ตกไปใช้ fallback
+// ทุกครั้งที่ campaign เขียน opening ยาว (เจอซ้ำ 3 ครั้งใน 5 นาทีบน prod วันเดียวกัน) — 256 ให้ margin ประมาณ 2x
+// เหนือจุดตัดที่สังเกตได้จริง โดยไม่ปล่อยเปิดกว้างแบบไม่มีขอบเขต (เช่น 4096) เพราะ system prompt เองก็ยังบังคับ
+// "คำตอบต้องสั้นมาก ไม่เกิน 1-2 ประโยคเท่านั้น" อยู่แล้ว (buildOpeningSystemPrompt ด้านล่าง) — เพิ่ม token แค่กัน
+// ตัดกลางคำ ไม่ได้เชิญให้พูดยาวขึ้น
+const GREETING_MAX_TOKENS = 256
 
-// fallback ยังแยกตาม direction เหมือนเดิม (เดิมเหตุผลผูกกับ greetingInstruction() ที่ถูกแทนที่ด้วย
-// openingInstruction() ที่เป็นกลางแล้ว — แต่ fallback เองยังต้อง preserve exact wording เดิมตาม Design Freeze
-// ไม่แตะ) — inbound (ลูกค้าโทรเข้ามาเอง) ไม่ควรถาม
-// "สะดวกคุยไหม" ถ้าใช้ fallback เดียวปนกันจะทำให้ inbound behavior
-// regress เงียบๆ เฉพาะตอน fallback trigger เท่านั้น (เคสที่ test ปกติมักไม่ได้ครอบคลุม)
+// Fallback brand removal (production incident 2026-09-03) — fallback เดิม hardcode "ฟ้าจากพีจีด็อกนะคะ โทรมา
+// ทักทายและขอบคุณที่เข้ามาเป็นสมาชิกค่ะ" ซึ่งเป็นชื่อแบรนด์/ข้อความทางธุรกิจของ campaign เดียว พอ Campaign-
+// Controlled Opening ทำให้ campaign อื่นเขียน opening ของตัวเองได้ ถ้า generation ล้มแล้ว fallback มาพูดชื่อ
+// แบรนด์เดิมนี้ผิดทันที (พิสูจน์จริงจาก call log — AI พูด "ฟ้าจากพีจีด็อก" ทั้งที่ campaign นั้นไม่ใช่ campaign นี้)
+// แก้โดยตัดเฉพาะส่วนที่เป็นแบรนด์/ธุรกิจออก เหลือแค่โครงประโยคทักทายที่เป็นมารยาทการโทรศัพท์ทั่วไป (ทักทาย
+// + ถามตามทิศทางสาย) ซึ่งไม่ผูกกับแบรนด์ใดเลย — ห้ามใส่ชื่อแบรนด์ใหม่มาแทนเด็ดขาด (นั่นแค่ย้ายปัญหาเดิม ไม่ได้แก้)
+// ส่วนที่เหลือ (ทักทายด้วยชื่อลูกค้า + คำถามท้ายประโยคที่แยกตาม direction) คงไว้เหมือนเดิม preserve behavior เดิม
+// ให้มากที่สุดตามที่ทดสอบไว้แล้ว (regression tests เดิมยังผ่านหมดเพราะ substring ที่เทสเช็คไม่ใช่ส่วนที่ตัดออก)
 function outboundFallbackGreeting(name) {
-  return `สวัสดีค่ะคุณ${name} ฟ้าจากพีจีด็อกนะคะ โทรมาทักทายและขอบคุณที่เข้ามาเป็นสมาชิกค่ะ สะดวกคุยสักครู่ไหมคะ`
+  return `สวัสดีค่ะคุณ${name} สะดวกคุยสักครู่ไหมคะ`
 }
 function inboundFallbackGreeting(name) {
-  return `สวัสดีค่ะคุณ${name} ฟ้าจากพีจีด็อกนะคะ มีอะไรให้ช่วยไหมคะ`
+  return `สวัสดีค่ะคุณ${name} มีอะไรให้ช่วยไหมคะ`
 }
 function fallbackGreeting(session) {
   return session.direction === 'inbound' ? inboundFallbackGreeting(session.name) : outboundFallbackGreeting(session.name)
