@@ -400,6 +400,12 @@ function registerWebSocket(fastify) {
     // interim (same normalized text, or a forward extension of it) within BARGE_CONFIRM_WINDOW_MS does. Reset
     // whenever the pipeline changes, the window expires, or the interim isn't a coherent continuation.
     let bargeCandidate = null
+    // BV2-T (telemetry only) — bargeIn() lives in this outer per-connection scope, one level up from the
+    // 'start' message handler where session.sttProvider is actually resolved into effectiveSttProvider (that
+    // const is scoped to the 'start' handler and NOT visible from here) — mirrored into this outer-scope `let`
+    // right after it's computed so emitBargeDiag (also defined at this outer level, next to bargeIn()) can
+    // label events with the right provider regardless of which scope calls it from.
+    let sttProviderForBargeDiag = 'google'
     // Phase A — Audio Continuity Telemetry (design locked, diagnostic only). recentBargeTimestamps: rolling
     // performance.now() history pruned to the last 10s, read by bargeIn() to derive recentBargeCount5s/10s.
     // pendingAudioContinuityBargeInfo: bridge from bargeIn() (outside processTranscript's closure) into the
@@ -869,9 +875,53 @@ function registerWebSocket(fastify) {
     // candidateConfirmAt, candidateConfirmText } — caller-supplied context about WHY this barge fired, merged
     // into pendingAudioContinuityBargeInfo below alongside clearSentAt/recentBargeCount so the interrupted
     // pipeline's own [AudioContinuity] tail log can read it back. Never affects control flow.
+    // BV2-T (Guarded Barge-in V2, telemetry-only, Design Freeze 2026-09-03) — "dumb" emitter, same contract as
+    // emitSttDiag() (defined later, per-connection 'start' handler scope): only serializes decisions the
+    // candidate-lifecycle branches (onInterim, isSpeaking=true) and bargeIn() below have ALREADY made — never
+    // derives or gates anything itself, zero behavior change. Defined at THIS outer scope (not next to
+    // emitSttDiag) because bargeIn() itself lives here, one level up from the 'start' handler — a nested-scope
+    // definition would not be visible from bargeIn() (caught by test/bargeDiag.test.js during BV2-T
+    // implementation: a nested definition threw "emitBargeDiag is not defined" the first time bargeIn() ran).
+    // Fills the exact gap the Guarded Barge-in V2 audit flagged: the interim 2-signal candidate lifecycle
+    // previously had NO telemetry at all ("interim path is diagnostic-free by design" — old comment this
+    // replaces at its call sites below), so false-barge rate and whether a candidate's text happens to
+    // classify as a Tier1/Tier2 ack (classifyAck() is used here to LABEL the event only, never to gate
+    // anything — B1 decision: "ไม่" stays NORMAL for the NEW interim classification BV2-B may add later; note
+    // "ไม่" is ALREADY in the pre-existing, unrelated TIER1/TIER2_ACKS whitelist for the FINAL-path Design B
+    // defer mechanism, untouched by BV2-T) could not be measured from production logs. ห่อ try/catch เหมือน
+    // emitSttDiag() ทุกประการ — diagnostic failure ต้องไม่กระทบสายจริง
+    //
+    // Events: CANDIDATE_OPENED | REGRESSION | CANDIDATE_RESET | ECHO_SUPPRESSED (all interim-only) | CONFIRMED
+    // (emitted from inside bargeIn() itself — covers both FINAL_TIER1/FINAL and INTERIM_CONFIRM trigger
+    // paths, since both already funnel through bargeIn() with the same continuityInfo shape)
+    const emitBargeDiag = (event, fields) => {
+      try {
+        console.log(`[BARGE_DIAG] ${JSON.stringify({
+          callSid,
+          pipelineId: activePipelineId,
+          provider: sttProviderForBargeDiag,
+          event,
+          ...fields,
+        })}`)
+      } catch (e) {
+        console.error('[BARGE_DIAG] emit failed (non-fatal, ignored):', e.message)
+      }
+    }
+
     function bargeIn(continuityInfo) {
       if (!isSpeaking) return
       console.log('[Barge-in] Customer interrupted — stopping AI audio')
+      // BV2-T — single instrumentation point covers BOTH trigger paths (FINAL_TIER1/FINAL from onTranscript,
+      // INTERIM_CONFIRM from onInterim) since both already pass continuityInfo through here. Only serializes
+      // what continuityInfo's caller already decided; ackTier is a LABEL for later analysis, never a gate.
+      emitBargeDiag('CONFIRMED', {
+        bargeTrigger: continuityInfo?.bargeTrigger ?? null,
+        candidateFirstAt: continuityInfo?.candidateFirstAt ?? null,
+        candidateFirstText: continuityInfo?.candidateFirstText ?? null,
+        candidateConfirmAt: continuityInfo?.candidateConfirmAt ?? null,
+        candidateConfirmText: continuityInfo?.candidateConfirmText ?? null,
+        ackTier: classifyAck(continuityInfo?.candidateConfirmText || ''),
+      })
       bumpGeneration(callState) // C2: invalidate ก่อนทุกอย่าง — ยัง observational, ไม่ได้ใช้ gate การ abort จริงที่อยู่ถัดไป
       clearSilenceTimer()
       silencePromptCount = 0
@@ -1052,6 +1102,7 @@ function registerWebSocket(fastify) {
         // same way for any given call.
         const sttProviderOverrideActive = !!session.sttProvider
         const effectiveSttProvider = sttProviderOverrideActive ? session.sttProvider : 'google'
+        sttProviderForBargeDiag = effectiveSttProvider // BV2-T — mirror into the outer-scope let bargeIn()/emitBargeDiag can actually see
         console.log(`[STTRoute] callSid=${callSid} source=${sttProviderOverrideActive ? 'CAMPAIGN_EXPLICIT' : 'DEFAULT'} provider=${effectiveSttProvider} model=${session.sttModel || 'latest_short'}`)
 
         // L1a: ต้องคำนวณหลัง rollout freeze แล้วเท่านั้น (ดูหมายเหตุที่ค่าคงที่ด้านบนไฟล์)
@@ -2171,6 +2222,12 @@ function registerWebSocket(fastify) {
               coldMutePackets: sttMeta.coldMutePackets,
               // STT-A2 (diagnostic only): key ปรากฏเฉพาะตอน A2 มีข้อมูลจริง — non-A2 calls ต้องไม่มี key นี้เลย
               ...(sttMeta.alternatives ? { alternatives: sttMeta.alternatives } : {}),
+              // BV2-T (telemetry only) — Deepgram's providerMeta (speechFinal/requestId, set in
+              // deepgramSTT.js's handleMessage()) was already threaded through sttRouter.js into sttMeta but
+              // never surfaced in any log before this — additive key, present only when the provider set it
+              // (Deepgram FINAL today; Google's sttMeta has no providerMeta field, so this stays absent for
+              // Google calls, same as the alternatives key above).
+              ...(sttMeta.providerMeta ? { providerMeta: sttMeta.providerMeta } : {}),
               text,
             })}`)
           } catch (e) {
@@ -2364,24 +2421,34 @@ function registerWebSocket(fastify) {
             //      the 2nd interim often arrives before the old heuristic's word-count would even have passed,
             //      it can trigger EARLIER than before, not later.
             const activeRefText = (activeSpokenRef && activeSpokenRef.pipelineId === activePipelineId) ? activeSpokenRef.text : null
-            if (isLikelyPostMarkEcho(interimText, activeRefText)) return // ACTIVE_PLAYBACK_ECHO — no candidate created/advanced, no diagnostic (interim path is diagnostic-free by design, same as before)
+            // BV2-T (telemetry only) — old comment here said "no diagnostic (interim path is diagnostic-free
+            // by design, same as before)"; that gap is exactly what BV2-T closes. Logged BEFORE the existing
+            // `return` — the return itself, and every branch below, is byte-for-byte unchanged.
+            if (isLikelyPostMarkEcho(interimText, activeRefText)) {
+              emitBargeDiag('ECHO_SUPPRESSED', { interimText: truncateForLog(interimText) })
+              return // ACTIVE_PLAYBACK_ECHO — no candidate created/advanced
+            }
 
             const normalized = normalizeForEchoCompare(interimText)
             const noCandidate = !bargeCandidate || bargeCandidate.pipelineId !== activePipelineId || (Date.now() - bargeCandidate.firstAt) > BARGE_CONFIRM_WINDOW_MS
             if (noCandidate) {
               bargeCandidate = { pipelineId: activePipelineId, previousText: normalized, firstAt: Date.now(), firstAtPerf: performance.now() }
+              // ackTier is a LABEL for later analysis only — never gates whether a candidate opens.
+              emitBargeDiag('CANDIDATE_OPENED', { candidateText: truncateForLog(normalized), ackTier: classifyAck(interimText) })
               return
             }
             if (bargeCandidate.previousText.startsWith(normalized) && normalized !== bargeCandidate.previousText) {
               // Regression (STT shrank back, e.g. "1697 ค่ะ" → "1697") — not new evidence, but not discarded
               // either; leave the existing candidate exactly as-is per design (a later coherent interim vs.
               // the ORIGINAL previousText can still confirm).
+              emitBargeDiag('REGRESSION', { candidateText: truncateForLog(bargeCandidate.previousText), regressedText: truncateForLog(normalized) })
               return
             }
             const coherent = normalized === bargeCandidate.previousText || normalized.startsWith(bargeCandidate.previousText)
             if (!coherent) {
               // Not a continuation of the same utterance (e.g. "คิดถึง" → "ระบบ") — reset to a fresh
               // candidate seeded by THIS interim, don't confirm on unrelated fragments.
+              emitBargeDiag('CANDIDATE_RESET', { oldCandidateText: truncateForLog(bargeCandidate.previousText), newCandidateText: truncateForLog(normalized), ackTier: classifyAck(interimText) })
               bargeCandidate = { pipelineId: activePipelineId, previousText: normalized, firstAt: Date.now(), firstAtPerf: performance.now() }
               return
             }
