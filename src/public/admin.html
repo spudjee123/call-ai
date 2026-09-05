@@ -504,6 +504,30 @@
   </div>
 </div>
 
+<div class="overlay" id="smsTemplateEditOverlay">
+  <div class="modal" style="max-width:560px">
+    <div class="modal-head">
+      <div><h3 id="smsTemplateEditModalTitle"></h3></div>
+      <button class="modal-close" onclick="closeSmsTemplateEditModal()">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </div>
+    <div style="padding:20px 22px; overflow-y:auto" id="smsTemplateEditModalBody"></div>
+  </div>
+</div>
+
+<div class="overlay" id="senderNameEditOverlay">
+  <div class="modal" style="max-width:480px">
+    <div class="modal-head">
+      <div><h3 id="senderNameEditModalTitle"></h3></div>
+      <button class="modal-close" onclick="closeSenderNameEditModal()">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </div>
+    <div style="padding:20px 22px" id="senderNameEditModalBody"></div>
+  </div>
+</div>
+
 <div class="overlay" id="confirmOverlay"></div>
 <div class="toast-stack" id="toastStack"></div>
 
@@ -1112,7 +1136,6 @@ const TEMPLATES = {
             <tbody id="smsTemplateTable"><tr><td colspan="3" class="empty">กำลังโหลด...</td></tr></tbody>
           </table>
         </div>
-        <div id="smsTemplatePanel"></div>
       </div>
     </div>`,
 
@@ -1130,7 +1153,6 @@ const TEMPLATES = {
             <tbody id="senderNameTable"><tr><td colspan="2" class="empty">กำลังโหลด...</td></tr></tbody>
           </table>
         </div>
-        <div id="senderNamePanel"></div>
       </div>
     </div>`,
 }
@@ -1329,6 +1351,24 @@ function openCampaignEditModal(title, panelHtml){
 }
 function closeCampaignEditModal(){
   document.getElementById('campaignEditOverlay').classList.remove('open')
+}
+// เปิด modal แก้ไข/สร้าง SMS Template — popup แบบเดียวกับ campaign edit (เดิมเป็น panel แทรกใต้ตาราง)
+function openSmsTemplateEditModal(title, panelHtml){
+  document.getElementById('smsTemplateEditModalTitle').textContent = title
+  document.getElementById('smsTemplateEditModalBody').innerHTML = panelHtml
+  document.getElementById('smsTemplateEditOverlay').classList.add('open')
+}
+function closeSmsTemplateEditModal(){
+  document.getElementById('smsTemplateEditOverlay').classList.remove('open')
+}
+// เปิด modal แก้ไข/สร้าง Sender Name — popup แบบเดียวกับ campaign edit (เดิมเป็น panel แทรกใต้ตาราง)
+function openSenderNameEditModal(title, panelHtml){
+  document.getElementById('senderNameEditModalTitle').textContent = title
+  document.getElementById('senderNameEditModalBody').innerHTML = panelHtml
+  document.getElementById('senderNameEditOverlay').classList.add('open')
+}
+function closeSenderNameEditModal(){
+  document.getElementById('senderNameEditOverlay').classList.remove('open')
 }
 function openCampaignEdit(id){
   const c = campaignsCache.find(x => x.id === id)
@@ -1660,8 +1700,6 @@ function nextSmsTemplateId(){
 }
 function smsTemplateEditPanelHtml(t, isNew){
   return `
-    <div style="margin-top:20px; border-top:1px solid var(--glass-border); padding-top:20px">
-      <h3 style="font-size:14.5px; margin-bottom:16px">${isNew ? 'สร้าง Template ใหม่' : 'แก้ไข: ' + esc(t.name)}</h3>
       <div class="grid-2" style="margin-bottom:16px">
         ${isNew ? `<div class="field"><label>Template ID (รันอัตโนมัติ แก้ไขเองได้)</label><input type="text" id="st_id" placeholder="เช่น tmpl03" value="${esc(t.suggestedId || '')}"></div>` : `<input type="hidden" id="st_id" value="${esc(t.id)}">`}
         <div class="field"><label>ชื่อ Template</label><input type="text" id="st_name" value="${esc(t.name||'')}" placeholder="เช่น ขอบคุณลูกค้าสนใจ"></div>
@@ -1694,10 +1732,9 @@ function smsTemplateEditPanelHtml(t, isNew){
       </div>
       <div class="row">
         <button class="btn btn-accent" onclick="${isNew ? 'createSmsTemplate()' : 'saveSmsTemplate()'}">${isNew ? 'สร้าง Template' : 'บันทึก'}</button>
-        <button class="btn" onclick="document.getElementById('smsTemplatePanel').innerHTML=''">ยกเลิก</button>
+        <button class="btn" onclick="closeSmsTemplateEditModal()">ยกเลิก</button>
         <span class="msg" id="smsTemplateEditMsg" style="font-size:13px; color:var(--text-2)"></span>
-      </div>
-    </div>`
+      </div>`
 }
 // ข้อความไทย (Unicode) ส่งได้แค่ 70 ตัวอักษร/1 SMS (ไม่ใช่ 160 แบบอังกฤษล้วน) — เกินแล้วโดนตัดส่งเป็นหลายข้อความ = โดนคิดเงินเพิ่มเงียบๆ
 function smsSegmentInfo(text){
@@ -1725,14 +1762,13 @@ function updateSmsPreview(){
   if (previewEl) previewEl.textContent = text ? text.replace(/\{name\}/g, 'คุณจอร์จ') : '(พิมพ์ข้อความด้านบนเพื่อดูตัวอย่าง)'
 }
 function openSmsTemplateCreate(){
-  document.getElementById('smsTemplatePanel').innerHTML = smsTemplateEditPanelHtml({ suggestedId: nextSmsTemplateId() }, true)
-  document.getElementById('smsTemplatePanel').scrollIntoView({ behavior: 'smooth', block: 'start' })
+  openSmsTemplateEditModal('สร้าง Template ใหม่', smsTemplateEditPanelHtml({ suggestedId: nextSmsTemplateId() }, true))
   updateSmsPreview()
 }
 function openSmsTemplateEdit(id){
   const t = smsTemplatesCache.find(x => x.id === id)
   if (!t) return
-  document.getElementById('smsTemplatePanel').innerHTML = smsTemplateEditPanelHtml(t, false)
+  openSmsTemplateEditModal('แก้ไข: ' + (t.name || ''), smsTemplateEditPanelHtml(t, false))
   updateSmsPreview()
 }
 async function createSmsTemplate(){
@@ -1749,7 +1785,7 @@ async function createSmsTemplate(){
     const data = await res.json()
     if (!res.ok) { msgEl.textContent = data.error || 'สร้างไม่สำเร็จ'; return }
     toast('สร้าง template แล้ว')
-    document.getElementById('smsTemplatePanel').innerHTML = ''
+    closeSmsTemplateEditModal()
     loadSmsTemplates()
   } catch (e) {}
 }
@@ -1766,7 +1802,7 @@ async function saveSmsTemplate(){
     const data = await res.json()
     if (!res.ok) { msgEl.textContent = data.error || 'บันทึกไม่สำเร็จ'; return }
     toast('บันทึกแล้ว')
-    document.getElementById('smsTemplatePanel').innerHTML = ''
+    closeSmsTemplateEditModal()
     loadSmsTemplates()
   } catch (e) {}
 }
@@ -1784,7 +1820,7 @@ function confirmDeleteSmsTemplate(id){
       const res = await apiFetch(`/api/sms-templates/${encodeURIComponent(id)}`, { method: 'DELETE' })
       if (!res.ok) { const data = await res.json().catch(()=>({})); toast(data.error || 'ลบไม่สำเร็จ', 'danger'); return }
       toast('ลบ template แล้ว', 'danger')
-      document.getElementById('smsTemplatePanel').innerHTML = ''
+      closeSmsTemplateEditModal()
       loadSmsTemplates()
     }
   })
@@ -1839,27 +1875,23 @@ function nextSenderNameId(){
 }
 function senderNameEditPanelHtml(s, isNew){
   return `
-    <div style="margin-top:20px; border-top:1px solid var(--glass-border); padding-top:20px">
-      <h3 style="font-size:14.5px; margin-bottom:16px">${isNew ? 'สร้าง Sender ใหม่' : 'แก้ไข: ' + esc(s.name)}</h3>
       <div class="grid-2" style="margin-bottom:16px">
         ${isNew ? `<div class="field"><label>Sender ID (รันอัตโนมัติ แก้ไขเองได้)</label><input type="text" id="sn_id" placeholder="เช่น snd06" value="${esc(s.suggestedId || '')}"></div>` : `<input type="hidden" id="sn_id" value="${esc(s.id)}">`}
         <div class="field"><label>ชื่อผู้ส่ง (Sendername) — ต้องตรงกับที่ลงทะเบียนไว้กับ ThaiBulkSMS เป๊ะๆ</label><input type="text" id="sn_name" value="${esc(s.name||'')}" placeholder="เช่น PDDOG"></div>
       </div>
       <div class="row">
         <button class="btn btn-accent" onclick="${isNew ? 'createSenderName()' : 'saveSenderName()'}">${isNew ? 'สร้าง Sender' : 'บันทึก'}</button>
-        <button class="btn" onclick="document.getElementById('senderNamePanel').innerHTML=''">ยกเลิก</button>
+        <button class="btn" onclick="closeSenderNameEditModal()">ยกเลิก</button>
         <span class="msg" id="senderNameEditMsg" style="font-size:13px; color:var(--text-2)"></span>
-      </div>
-    </div>`
+      </div>`
 }
 function openSenderNameCreate(){
-  document.getElementById('senderNamePanel').innerHTML = senderNameEditPanelHtml({ suggestedId: nextSenderNameId() }, true)
-  document.getElementById('senderNamePanel').scrollIntoView({ behavior: 'smooth', block: 'start' })
+  openSenderNameEditModal('สร้าง Sender ใหม่', senderNameEditPanelHtml({ suggestedId: nextSenderNameId() }, true))
 }
 function openSenderNameEdit(id){
   const s = senderNamesCache.find(x => x.id === id)
   if (!s) return
-  document.getElementById('senderNamePanel').innerHTML = senderNameEditPanelHtml(s, false)
+  openSenderNameEditModal('แก้ไข: ' + (s.name || ''), senderNameEditPanelHtml(s, false))
 }
 async function createSenderName(){
   const id = document.getElementById('sn_id').value.trim()
@@ -1872,7 +1904,7 @@ async function createSenderName(){
     const data = await res.json()
     if (!res.ok) { msgEl.textContent = data.error || 'สร้างไม่สำเร็จ'; return }
     toast('สร้าง sender แล้ว')
-    document.getElementById('senderNamePanel').innerHTML = ''
+    closeSenderNameEditModal()
     loadSenderNames()
   } catch (e) {}
 }
@@ -1886,7 +1918,7 @@ async function saveSenderName(){
     const data = await res.json()
     if (!res.ok) { msgEl.textContent = data.error || 'บันทึกไม่สำเร็จ'; return }
     toast('บันทึกแล้ว')
-    document.getElementById('senderNamePanel').innerHTML = ''
+    closeSenderNameEditModal()
     loadSenderNames()
   } catch (e) {}
 }
@@ -1904,7 +1936,7 @@ function confirmDeleteSenderName(id){
       const res = await apiFetch(`/api/sender-names/${encodeURIComponent(id)}`, { method: 'DELETE' })
       if (!res.ok) { const data = await res.json().catch(()=>({})); toast(data.error || 'ลบไม่สำเร็จ', 'danger'); return }
       toast('ลบ sender แล้ว', 'danger')
-      document.getElementById('senderNamePanel').innerHTML = ''
+      closeSenderNameEditModal()
       loadSenderNames()
     }
   })
