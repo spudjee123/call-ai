@@ -2,7 +2,7 @@ const twilio = require('twilio')
 const callSessions = require('../utils/callSessions')
 const { askClaude } = require('./claude')
 const { resolveExplicitProvider } = require('./conversationAI')
-const { resolveSttProvider } = require('./sttRouter')
+const { resolveSttProviderForSession } = require('./sttRouter')
 const { synthesizeSpeech } = require('./tts')
 const { sheetsService } = require('./googleSheets')
 const healthMonitor = require('../utils/healthMonitor')
@@ -31,10 +31,13 @@ async function makeOutboundCall(contact, campaign, onCallCreated) {
   // per call" invariant if the campaign is edited while this call is still in progress. null means no
   // explicit choice — existing rollout routing (legacyEarlyTts, etc.) stays completely untouched.
   const explicitProvider = resolveExplicitProvider(campaign)
-  // Dual STT Provider (design frozen 2026-08-31) — same freeze-once invariant as explicitProvider above.
-  // null means no explicit choice — createTranscribeStream() (sttRouter.js) treats that as Google, its
-  // existing default routing.
-  const explicitSttProvider = resolveSttProvider(campaign)
+  // Dual STT Provider / Deepgram-Primary Migration (design frozen 2026-08-31, default changed 2026-09-05)
+  // — same freeze-once invariant as explicitProvider above. resolveSttProviderForSession() ALWAYS returns
+  // a populated { provider, model, source } now — Deepgram when the campaign made no explicit choice,
+  // Google when it explicitly asked for it — so session.sttProvider is never null for a real call anymore.
+  // sttProviderSource ('CAMPAIGN_EXPLICIT' | 'DEFAULT_PRIMARY') rides along purely for [STTRoute] logging
+  // (audioStream.js) — never read for routing itself.
+  const sttResolution = resolveSttProviderForSession(campaign)
 
   const session = {
     callSid: null,
@@ -48,8 +51,9 @@ async function makeOutboundCall(contact, campaign, onCallCreated) {
     twilioNumber,
     llmProvider: explicitProvider?.provider || null,
     llmModel: explicitProvider?.model || null,
-    sttProvider: explicitSttProvider?.provider || null,
-    sttModel: explicitSttProvider?.model || null,
+    sttProvider: sttResolution.provider,
+    sttModel: sttResolution.model,
+    sttProviderSource: sttResolution.source,
   }
 
   // Pre-generate greeting ขณะรอสายต่อ (~3-4s) เพื่อลด silence

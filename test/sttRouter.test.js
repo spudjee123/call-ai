@@ -30,7 +30,7 @@ require.cache[deepgramSttPath] = {
   },
 }
 
-const { resolveSttProvider, createTranscribeStream, GOOGLE_MODEL, DEEPGRAM_MODEL } = require('../src/services/sttRouter')
+const { resolveSttProvider, resolveSttProviderForSession, createTranscribeStream, GOOGLE_MODEL, DEEPGRAM_MODEL } = require('../src/services/sttRouter')
 
 beforeEach(() => {
   state.googleCalls = []
@@ -130,4 +130,94 @@ test('createTranscribeStream: model fallback ถ้า session.sttModel ไม�
   createTranscribeStream({ sttProvider: 'deepgram' }, (t, m) => { receivedDeepgram = m }, () => {}, {})
   state.deepgramCalls[0].onTranscript('x', {})
   assert.equal(receivedDeepgram.model, DEEPGRAM_MODEL)
+})
+
+// ===== Deepgram-Primary STT Migration (design 2026-09-05) — resolveSttProviderForSession() =====
+// Test matrix per the migration task spec. Test 8 (Google path fully functional) and most of Test 9's
+// "sends audio, emits interim/final" are already covered by the existing googleSTT.test.js/
+// deepgramSTT.test.js suites (untouched by this migration) — not duplicated here; this section covers the
+// NEW default-resolution behavior and the dispatch-level proof that it actually reaches the right provider.
+
+test('Test 1 — no provider configured (campaign.stt_provider undefined) → Deepgram, source=DEFAULT_PRIMARY', () => {
+  assert.deepEqual(resolveSttProviderForSession({}), { provider: 'deepgram', model: DEEPGRAM_MODEL, source: 'DEFAULT_PRIMARY' })
+})
+
+test('Test 2 — empty provider (campaign.stt_provider="") → Deepgram, source=DEFAULT_PRIMARY', () => {
+  assert.deepEqual(resolveSttProviderForSession({ stt_provider: '' }), { provider: 'deepgram', model: DEEPGRAM_MODEL, source: 'DEFAULT_PRIMARY' })
+})
+
+test('Test 3 — explicit Deepgram → Deepgram, source=CAMPAIGN_EXPLICIT', () => {
+  assert.deepEqual(resolveSttProviderForSession({ stt_provider: 'deepgram' }), { provider: 'deepgram', model: DEEPGRAM_MODEL, source: 'CAMPAIGN_EXPLICIT' })
+})
+
+test('Test 4 — explicit Google → Google, source=CAMPAIGN_EXPLICIT (the emergency rollback path)', () => {
+  assert.deepEqual(resolveSttProviderForSession({ stt_provider: 'google' }), { provider: 'google', model: GOOGLE_MODEL, source: 'CAMPAIGN_EXPLICIT' })
+})
+
+test('Test 5 — case/whitespace normalization (" DeepGram ") → Deepgram, source=CAMPAIGN_EXPLICIT', () => {
+  assert.deepEqual(resolveSttProviderForSession({ stt_provider: ' DeepGram ' }), { provider: 'deepgram', model: DEEPGRAM_MODEL, source: 'CAMPAIGN_EXPLICIT' })
+})
+
+test('Test 6 — invalid provider ("deepgraam", a typo) → no crash, CONFIG_ERROR diagnostic emitted, deterministic fallback to current default (Deepgram) — never silently misread as either real provider', () => {
+  const originalError = console.error
+  const logs = []
+  console.error = (...args) => logs.push(args.join(' '))
+  let result
+  try {
+    result = resolveSttProviderForSession({ stt_provider: 'deepgraam', id: 'CAMPAIGN_TYPO_TEST' })
+  } finally {
+    console.error = originalError
+  }
+  assert.deepEqual(result, { provider: 'deepgram', model: DEEPGRAM_MODEL, source: 'DEFAULT_PRIMARY' })
+  const configErrorLog = logs.find(l => l.includes('[STTRoute] CONFIG_ERROR'))
+  assert.ok(configErrorLog, 'ต้อง log CONFIG_ERROR เมื่อเจอค่าที่ไม่รู้จัก (ไม่ใช่ blank)')
+  assert.ok(configErrorLog.includes('deepgraam'))
+  assert.ok(configErrorLog.includes('CAMPAIGN_TYPO_TEST'))
+})
+
+test('Test 6b — blank/missing provider ต้องไม่ log CONFIG_ERROR เลย (แยกจาก typo ชัดเจน — blank คือ "ไม่ได้ตั้งใจเลือก" ไม่ใช่ "ตั้งค่าผิด")', () => {
+  const originalError = console.error
+  const logs = []
+  console.error = (...args) => logs.push(args.join(' '))
+  try {
+    resolveSttProviderForSession({})
+    resolveSttProviderForSession({ stt_provider: '' })
+  } finally {
+    console.error = originalError
+  }
+  assert.equal(logs.filter(l => l.includes('CONFIG_ERROR')).length, 0)
+})
+
+test('Test 7 — provider freezes per call: resolveSttProviderForSession() คืน plain object ใหม่ ไม่ผูกกับ campaign object ที่ mutate ทีหลัง (สาย A ที่เริ่มไปแล้วต้องไม่เปลี่ยนตาม), สาย B (เรียกใหม่) เห็นค่าใหม่ทันที', () => {
+  const campaign = { stt_provider: 'deepgram' }
+  const callA = resolveSttProviderForSession(campaign) // สาย A "เริ่ม" ที่ deepgram
+  assert.equal(callA.provider, 'deepgram')
+
+  campaign.stt_provider = 'google' // operator เปลี่ยน config ระหว่างที่สาย A ยัง "active" อยู่ (จำลอง)
+
+  // สาย A ที่ freeze ค่าไปแล้ว (callA) ต้องไม่เปลี่ยนตาม — เป็น plain object แยก ไม่ใช่ live reference
+  assert.equal(callA.provider, 'deepgram', 'สาย A ที่ freeze provider ไปแล้วต้องไม่เปลี่ยนตาม campaign ที่ mutate ทีหลัง')
+
+  // สาย B (เรียกใหม่หลัง config เปลี่ยน) ต้องเห็น google ทันที — kill-switch ทำงานสำหรับสายใหม่
+  const callB = resolveSttProviderForSession(campaign)
+  assert.equal(callB.provider, 'google', 'สายใหม่หลังเปลี่ยน config ต้องใช้ google ทันที (emergency rollback)')
+})
+
+test('Test 9 — default campaign (ไม่ระบุ provider) ผ่าน resolveSttProviderForSession() แล้วเข้า createTranscribeStream() จริง → เรียก Deepgram เท่านั้น ไม่เรียก Google เลย (end-to-end proof ของ default ใหม่)', () => {
+  const resolution = resolveSttProviderForSession({}) // ไม่มี campaign.stt_provider เลย
+  const session = { sttProvider: resolution.provider, sttModel: resolution.model }
+  const stream = createTranscribeStream(session, () => {}, () => {}, {})
+  assert.equal(state.deepgramCalls.length, 1)
+  assert.equal(state.googleCalls.length, 0)
+  assert.equal(stream._fake, 'deepgram')
+})
+
+test('Test 10 — no dual STT: ไม่ว่า config จะเป็นอะไร createTranscribeStream() ต้องเรียก provider เดียวเท่านั้นเสมอ (1 call = 1 active STT provider)', () => {
+  for (const campaign of [{}, { stt_provider: '' }, { stt_provider: 'google' }, { stt_provider: 'deepgram' }, { stt_provider: 'typo' }]) {
+    state.googleCalls = []
+    state.deepgramCalls = []
+    const resolution = resolveSttProviderForSession(campaign)
+    createTranscribeStream({ sttProvider: resolution.provider, sttModel: resolution.model }, () => {}, () => {}, {})
+    assert.equal(state.googleCalls.length + state.deepgramCalls.length, 1, `campaign=${JSON.stringify(campaign)} ต้องเรียก provider เดียวเท่านั้น`)
+  }
 })

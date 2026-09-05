@@ -1160,10 +1160,21 @@ function registerWebSocket(fastify) {
         // Dual STT Provider (design frozen 2026-08-31) — mirrors [LLMRoute] exactly, same
         // source=CAMPAIGN_EXPLICIT|DEFAULT convention, so both routing decisions are queryable from log the
         // same way for any given call.
-        const sttProviderOverrideActive = !!session.sttProvider
-        const effectiveSttProvider = sttProviderOverrideActive ? session.sttProvider : 'google'
+        // Deepgram-Primary Migration (design 2026-09-05) — session.sttProviderSource ('CAMPAIGN_EXPLICIT' |
+        // 'DEFAULT_PRIMARY'), set at session creation by twilio.js/webhook.js via
+        // sttRouter.js's resolveSttProviderForSession(), is now the authoritative source= label: after this
+        // migration session.sttProvider is ALWAYS populated for a real call (Deepgram default or explicit
+        // Google), so the old `!!session.sttProvider` truthiness check would read CAMPAIGN_EXPLICIT for
+        // every single call, including calls that never set stt_provider at all — silently breaking this
+        // log's whole purpose. Sessions that don't set sttProviderSource (the entire existing WS-harness
+        // test suite, which constructs sessions directly and never calls resolveSttProviderForSession())
+        // fall back to that exact old heuristic — unaffected by this migration, byte-for-byte.
+        const sttProviderOverrideActive = session.sttProviderSource
+          ? session.sttProviderSource === 'CAMPAIGN_EXPLICIT'
+          : !!session.sttProvider
+        const effectiveSttProvider = session.sttProvider || 'google'
         sttProviderForBargeDiag = effectiveSttProvider // BV2-T — mirror into the outer-scope let bargeIn()/emitBargeDiag can actually see
-        console.log(`[STTRoute] callSid=${callSid} source=${sttProviderOverrideActive ? 'CAMPAIGN_EXPLICIT' : 'DEFAULT'} provider=${effectiveSttProvider} model=${session.sttModel || 'latest_short'}`)
+        console.log(`[STTRoute] callSid=${callSid} source=${sttProviderOverrideActive ? 'CAMPAIGN_EXPLICIT' : 'DEFAULT_PRIMARY'} provider=${effectiveSttProvider} model=${session.sttModel || 'latest_short'}`)
 
         // L1a: ต้องคำนวณหลัง rollout freeze แล้วเท่านั้น (ดูหมายเหตุที่ค่าคงที่ด้านบนไฟล์)
         const interimFinalizeMs = rollout.useChunkedStreaming ? STT_INTERIM_FINALIZE_MS_CHUNKED : 900

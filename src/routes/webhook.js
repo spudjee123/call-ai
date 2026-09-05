@@ -2,7 +2,7 @@ const twilio = require('twilio')
 const { v4: uuidv4 } = require('uuid')
 const { sheetsService } = require('../services/googleSheets')
 const { resolveExplicitProvider } = require('../services/conversationAI')
-const { resolveSttProvider } = require('../services/sttRouter')
+const { resolveSttProviderForSession } = require('../services/sttRouter')
 const callSessions = require('../utils/callSessions')
 const { synthesizeSpeechWavThai } = require('../services/googleTTS')
 const { twilioSignatureGuard } = require('../utils/twilioSignature')
@@ -89,7 +89,10 @@ module.exports = async function webhookRoutes(fastify) {
     // twilio.js's makeOutboundCall(). See that call site's comment for why this can't be re-read from
     // session.campaign later.
     const explicitProvider = resolveExplicitProvider(campaign)
-    const explicitSttProvider = resolveSttProvider(campaign)
+    // Deepgram-Primary Migration (design 2026-09-05) — see twilio.js's makeOutboundCall for the full
+    // rationale; same treatment here for the inbound path. resolveSttProviderForSession() always returns
+    // a populated result now (Deepgram default, Google when explicit).
+    const sttResolution = resolveSttProviderForSession(campaign)
 
     callSessions.set(callSid, {
       callSid,
@@ -102,8 +105,9 @@ module.exports = async function webhookRoutes(fastify) {
       twilioNumber: to,
       llmProvider: explicitProvider?.provider || null,
       llmModel: explicitProvider?.model || null,
-      sttProvider: explicitSttProvider?.provider || null,
-      sttModel: explicitSttProvider?.model || null,
+      sttProvider: sttResolution.provider,
+      sttModel: sttResolution.model,
+      sttProviderSource: sttResolution.source,
     })
 
     const wsUrl = `${process.env.BASE_URL.replace(/^http/, 'ws')}/stream?callSid=${callSid}`

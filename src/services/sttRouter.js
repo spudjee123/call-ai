@@ -1,6 +1,13 @@
 // Dual STT Provider (Google vs Deepgram Nova-3) — design frozen 2026-08-31. Thin selector, mirrors
 // conversationAI.js's resolveExplicitProvider()/askConversationConditionalStream() pattern exactly:
 // resolve once at session creation, freeze as a scalar, dispatch on the frozen value forever after.
+//
+// Deepgram-Primary STT Migration (design 2026-09-05) — Deepgram is now the default provider for a call
+// with no explicit campaign choice; Google remains fully intact and immediately selectable as an
+// emergency fallback (`stt_provider: 'google'` on any campaign) — see resolveSttProviderForSession()
+// below for exactly where that default decision is made. googleSTT.js itself is NOT touched by this
+// migration at all (git diff on that file stays empty) — same "Google path unmodified" guarantee the
+// original Dual STT Provider design already established.
 const { transcribeStream: googleTranscribeStream } = require('./googleSTT')
 const { transcribeStream: deepgramTranscribeStream, DEEPGRAM_MODEL } = require('./deepgramSTT')
 
@@ -8,16 +15,53 @@ const { transcribeStream: deepgramTranscribeStream, DEEPGRAM_MODEL } = require('
 // back into googleSTT.js, which remains the single source of truth for its own actual request config.
 const GOOGLE_MODEL = 'latest_short'
 
-// Returns null for blank/unrecognized stt_provider — same "null = leave existing routing completely
-// untouched" contract resolveExplicitProvider() already established for llm_provider. An unrecognized
-// value is treated as blank here (never an error) — campaign data can't 500 a call at read time; the
-// REJECT-invalid-values behavior lives at write time in campaign.js's validation instead (mirrors how
-// llm_provider validation was split the same way).
+// Returns null for blank/unrecognized stt_provider — same "null = no explicit campaign choice was made"
+// contract resolveExplicitProvider() already established for llm_provider. This contract is UNCHANGED by
+// the Deepgram-Primary migration below (design 2026-09-05) — callers (resolveSttProviderForSession(), and
+// audioStream.js's [STTRoute] log) still need to tell "explicit" apart from "resolved default" after the
+// fact, which a null-vs-object return makes trivial. What DID change is which provider a null resolves to
+// downstream — that decision now lives in resolveSttProviderForSession() below, not here.
+//
+// An unrecognized NON-BLANK value (typo, or a Sheet row edited directly, bypassing campaign.js's own
+// VALID_STT_PROVIDERS write-time validation) is still never an error here — campaign data can't 500 a call
+// at read time — but is no longer SILENT: logged as CONFIG_ERROR so a typo doesn't quietly and invisibly
+// land on whichever provider happens to be the current default, which would be far more surprising now
+// that the default is Deepgram (a call quietly landing on Deepgram because someone mistyped "google" would
+// be a much worse silent failure than the reverse used to be).
 function resolveSttProvider(campaign) {
   const raw = (campaign?.stt_provider || '').trim().toLowerCase()
   if (raw === 'google') return { provider: 'google', model: GOOGLE_MODEL }
   if (raw === 'deepgram') return { provider: 'deepgram', model: DEEPGRAM_MODEL }
+  if (raw) {
+    console.error(`[STTRoute] CONFIG_ERROR — unrecognized stt_provider="${raw}" (campaignId=${campaign?.id ?? 'unknown'}) — treating as unset, falling back to current default`)
+  }
   return null
+}
+
+// Deepgram-Primary STT Migration (design 2026-09-05) — this is the ONE place the "what does a call get when
+// the campaign didn't ask for anything specific" policy decision lives. Previously that decision was made
+// implicitly by createTranscribeStream()'s own dispatch fallback (`=== 'deepgram' ? deepgram : google`),
+// which defaulted every unrecognized/absent session.sttProvider straight to Google. That fallback is
+// DELIBERATELY left untouched below — this migration instead makes BOTH real session-creation call sites
+// (twilio.js's makeOutboundCall, webhook.js's inbound handler) call this function and freeze an explicit,
+// always-populated { provider, model, source } onto the session, so createTranscribeStream() never actually
+// exercises its own bare fallback for a real call anymore (session.sttProvider is never null/undefined by
+// the time it gets there) — while every OTHER caller of createTranscribeStream() that constructs a session
+// without going through this function (the entire existing test suite's WS-harness sessions) keeps hitting
+// that same old fallback completely unchanged, exactly as before. This is what makes the migration a
+// two-call-site change instead of a routing-dispatch change, and is why the full existing suite needs no
+// updates for this migration.
+//
+// source is 'CAMPAIGN_EXPLICIT' | 'DEFAULT_PRIMARY' — consumed by audioStream.js's [STTRoute] log (Phase 4)
+// so an operator can always tell whether a given call's provider was an explicit choice or the current
+// default, without needing to separately cross-reference the campaign config.
+const DEFAULT_STT_PROVIDER = 'deepgram'
+const DEFAULT_STT_MODEL = DEEPGRAM_MODEL
+
+function resolveSttProviderForSession(campaign) {
+  const explicit = resolveSttProvider(campaign)
+  if (explicit) return { provider: explicit.provider, model: explicit.model, source: 'CAMPAIGN_EXPLICIT' }
+  return { provider: DEFAULT_STT_PROVIDER, model: DEFAULT_STT_MODEL, source: 'DEFAULT_PRIMARY' }
 }
 
 // createTranscribeStream() — the ONLY call site audioStream.js should use instead of calling
@@ -60,4 +104,4 @@ function createTranscribeStream(session, onTranscript, onInterim, options = {}) 
   return googleTranscribeStream(wrappedOnTranscript, onInterim, options)
 }
 
-module.exports = { resolveSttProvider, createTranscribeStream, GOOGLE_MODEL, DEEPGRAM_MODEL }
+module.exports = { resolveSttProvider, resolveSttProviderForSession, createTranscribeStream, GOOGLE_MODEL, DEEPGRAM_MODEL }
