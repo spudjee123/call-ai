@@ -56,4 +56,13 @@ function getSttA2ShadowBucket(callSid) {
   return parseInt(hex, 16) % 100
 }
 
-module.exports = { getRolloutBucket, decideRollout, getLegacyObservedBucket, getLegacyEarlyTtsBucket, getSttA2Bucket, getSttA2ShadowBucket }
+// Opening Hello Guard (BV2-B-adjacent, design locked 2026-09-05) — dedicated helper, same reasoning as the
+// others above: own namespace prefix ("opening-hello-guard:") so this gate's assignment is independent of
+// chunked/L2a/L2b/A2/A2-shadow even for the same callSid. A collision between any two namespaces is
+// statistically normal (%100 buckets) — never assert they differ.
+function getOpeningHelloGuardBucket(callSid) {
+  const hex = crypto.createHash('sha256').update(`opening-hello-guard:${String(callSid)}`).digest('hex').slice(0, 8)
+  return parseInt(hex, 16) % 100
+}
+
+module.exports = { getRolloutBucket, decideRollout, getLegacyObservedBucket, getLegacyEarlyTtsBucket, getSttA2Bucket, getSttA2ShadowBucket, getOpeningHelloGuardBucket }

@@ -692,3 +692,85 @@ test('stale callback ต้องไม่มีสิทธิ์แตะ metr
   assert.equal(turnState.audioCommitted, false)
   assert.deepEqual(socket.sent, [])
 })
+
+// Track A (AudioContinuity wiring fix) — onFrameSent is a NEW, separate hook from onAudioSent (which already
+// existed for watchdog rearm and takes no payload): fires with the actual sent buffer, at the exact same point
+// (post every guard, right after socket.send()), so audioContinuity.js's recordFrameSent(ac, buffer) can finally
+// see frames sent through chunkedTurn.js's speakFixedText()/synthesizeAndSend()/adoptChunkedProducer() — the
+// path production audit confirmed was blind for L2b/chunked traffic (recordFrameSent() was previously only
+// wired into audioStream.js's own hand-rolled CONTROL/L2a inline TTS loops, never into this file at all).
+
+test('Track A) onFrameSent: เรียก 1 ครั้งต่อ 1 เฟรมเสียงที่ส่งจริงผ่าน runChunkedTurn พร้อม buffer จริง', async () => {
+  state.claudeImpl = fakeClaude(['Hello world. '])
+  state.ttsImpl = async function* () { yield Buffer.from('audio-frame-1') }
+  const socket = makeSocket()
+  const { turnMetrics, turnState, callState, generationId } = makeMetricsAndState()
+  const framesSent = []
+  await runChunkedTurn({
+    session: {}, signal: null, socket, streamSid: 'SS1', voiceId: 'v1', turnMetrics, turnState, callState, generationId,
+    onFrameSent: (buf) => framesSent.push(buf),
+  })
+  assert.equal(framesSent.length, 1)
+  assert.equal(framesSent[0].toString(), 'audio-frame-1')
+})
+
+test('Track A) onFrameSent: N เฟรมจริง (หลาย TTS chunk ต่อเทิร์น + หลาย byte-chunk ต่อ TTS call) → เรียกครบ N ครั้งพอดี ไม่มากไม่น้อย (no double-count)', async () => {
+  state.claudeImpl = fakeClaude(['One thing. ', 'Two thing. ', 'Three thing.']) // 3 speech chunks → 3 synthesizeAndSend calls
+  state.ttsImpl = async function* () { yield Buffer.from('a'); yield Buffer.from('b') } // 2 byte-frames per TTS call
+  const socket = makeSocket()
+  const { turnMetrics, turnState, callState, generationId } = makeMetricsAndState()
+  const framesSent = []
+  const audioSentCalls = []
+  await runChunkedTurn({
+    session: {}, signal: null, socket, streamSid: 'SS1', voiceId: 'v1', turnMetrics, turnState, callState, generationId,
+    onAudioSent: () => audioSentCalls.push(1),
+    onFrameSent: (buf) => framesSent.push(buf),
+  })
+  assert.equal(framesSent.length, 6, '3 speech chunks x 2 byte-frames each = 6 เฟรมจริงทั้งหมด')
+  assert.equal(audioSentCalls.length, 6, 'onAudioSent (hook เดิม) ต้องยังนับได้ granularity เดียวกัน — สอง hook เป็นอิสระต่อกัน ไม่ทับ/แย่งกัน')
+  assert.equal(socket.sent.length, 6, 'ต้องตรงกับจำนวน socket.send() จริง ไม่ใช่แค่ตัวนับ')
+})
+
+test('Track A) onFrameSent: generation stale ก่อนส่งเฟรมเลย → ไม่ถูกเรียกแม้แต่ครั้งเดียว (ต้องไม่นับเฟรมที่ไม่มีสิทธิ์ถูกส่งจริง)', async () => {
+  const { turnMetrics, turnState, callState, generationId } = makeMetricsAndState()
+  state.claudeImpl = fakeClaude(['Hello world. '])
+  state.ttsImpl = async function* () {
+    bumpGeneration(callState) // เทิร์นนี้ stale ไปแล้วก่อน audio ก้อนแรกจะมาถึงด้วยซ้ำ
+    yield Buffer.from('a')
+  }
+  const socket = makeSocket()
+  const framesSent = []
+  await runChunkedTurn({
+    session: {}, signal: null, socket, streamSid: 'SS1', voiceId: 'v1', turnMetrics, turnState, callState, generationId,
+    onFrameSent: (buf) => framesSent.push(buf),
+  })
+  assert.deepEqual(framesSent, [])
+  assert.deepEqual(socket.sent, [])
+})
+
+test('Track A) onFrameSent: socket ปิดไปแล้วก่อนส่งเฟรม → ไม่ถูกเรียก', async () => {
+  state.claudeImpl = fakeClaude(['Hello world. '])
+  state.ttsImpl = async function* () { yield Buffer.from('a') }
+  const socket = makeSocket()
+  socket.readyState = 3 // closed — ก่อนแม้แต่ chunk แรกจะเริ่ม TTS
+  const { turnMetrics, turnState, callState, generationId } = makeMetricsAndState()
+  const framesSent = []
+  await runChunkedTurn({
+    session: {}, signal: null, socket, streamSid: 'SS1', voiceId: 'v1', turnMetrics, turnState, callState, generationId,
+    onFrameSent: (buf) => framesSent.push(buf),
+  })
+  assert.deepEqual(framesSent, [])
+})
+
+test('Track A) onFrameSent ผ่าน speakFixedText() โดยตรง (ใช้จริงสำหรับ recovery phrase/follow-up ใน audioStream.js) — เรียกครบตามจำนวนเฟรมจริง', async () => {
+  state.ttsImpl = async function* () { yield Buffer.from('x'); yield Buffer.from('y'); yield Buffer.from('z') }
+  const socket = makeSocket()
+  const { turnMetrics, turnState, callState, generationId } = makeMetricsAndState()
+  const framesSent = []
+  const result = await speakFixedText({
+    text: 'ขออภัยค่ะ', signal: null, socket, streamSid: 'SS1', voiceId: 'v1', turnMetrics, turnState, callState, generationId,
+    onFrameSent: (buf) => framesSent.push(buf),
+  })
+  assert.equal(result.sentCount, 3)
+  assert.equal(framesSent.length, 3)
+})

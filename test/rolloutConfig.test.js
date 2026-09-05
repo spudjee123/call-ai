@@ -1,6 +1,6 @@
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
-const { createRolloutConfig, parseRolloutPercent, classifyLegacyObservedConfig, classifyLegacyEarlyTtsConfig, classifySttA2Config, classifySttA2ShadowConfig } = require('../src/utils/rolloutConfig')
+const { createRolloutConfig, parseRolloutPercent, classifyLegacyObservedConfig, classifyLegacyEarlyTtsConfig, classifySttA2Config, classifySttA2ShadowConfig, classifyOpeningHelloGuardConfig } = require('../src/utils/rolloutConfig')
 
 function delay(ms) { return new Promise(resolve => setTimeout(resolve, ms)) }
 
@@ -688,6 +688,99 @@ test('classifySttA2ShadowConfig: independent จาก legacy_observed_*/legacy_
   assert.deepEqual(classifyLegacyEarlyTtsConfig(rows), { percent: 50, campaignId: 'CAMPAIGN_L2B' })
   assert.deepEqual(classifySttA2Config(rows), { percent: 100, campaignId: 'CAMPAIGN_A2' })
   assert.deepEqual(classifySttA2ShadowConfig(rows), { percent: 30, campaignId: 'CAMPAIGN_A2_SHADOW' })
+})
+
+// ---------------------------------------------------------------------------
+// Opening Hello Guard (Track B, design locked 2026-09-05) — classifyOpeningHelloGuardConfig() — same
+// fail-closed shape as every gate above, own keys/state entirely independent
+// ---------------------------------------------------------------------------
+
+test('classifyOpeningHelloGuardConfig: percent>0 + campaignId ถูกต้องครบคู่ → ใช้ค่านั้นจริง', () => {
+  assert.deepEqual(
+    classifyOpeningHelloGuardConfig([
+      { key: 'opening_hello_guard_percent', value: '100' },
+      { key: 'opening_hello_guard_campaign_id', value: 'CAMPAIGN_OPENING_HELLO_TEST' },
+    ]),
+    { percent: 100, campaignId: 'CAMPAIGN_OPENING_HELLO_TEST' }
+  )
+})
+
+test('classifyOpeningHelloGuardConfig: campaignId="*" (wildcard) ถูกต้อง — parse ผ่านตรงๆ เหมือน L2b/A2 (wildcard semantics อยู่ที่ isCampaignMatched() ฝั่ง audioStream.js ไม่ใช่ตรงนี้)', () => {
+  assert.deepEqual(
+    classifyOpeningHelloGuardConfig([
+      { key: 'opening_hello_guard_percent', value: '50' },
+      { key: 'opening_hello_guard_campaign_id', value: '*' },
+    ]),
+    { percent: 50, campaignId: '*' }
+  )
+})
+
+test('classifyOpeningHelloGuardConfig: percent>0 แต่ไม่มีแถว campaign_id เลย → fail-closed {0, null}', () => {
+  assert.deepEqual(
+    classifyOpeningHelloGuardConfig([{ key: 'opening_hello_guard_percent', value: '100' }]),
+    { percent: 0, campaignId: null }
+  )
+})
+
+test('classifyOpeningHelloGuardConfig: ไม่มีแถวใดๆ เลย (Sheets ยังไม่เคยเพิ่ม key พวกนี้) → {0, null} ปลอดภัยตั้งแต่วันแรก', () => {
+  assert.deepEqual(classifyOpeningHelloGuardConfig([]), { percent: 0, campaignId: null })
+})
+
+test('classifyOpeningHelloGuardConfig: duplicate percent row → invalid, fail-closed', () => {
+  assert.deepEqual(
+    classifyOpeningHelloGuardConfig([
+      { key: 'opening_hello_guard_percent', value: '50' },
+      { key: 'opening_hello_guard_percent', value: '100' },
+      { key: 'opening_hello_guard_campaign_id', value: 'X' },
+    ]),
+    { percent: 0, campaignId: null }
+  )
+})
+
+test('classifyOpeningHelloGuardConfig: duplicate campaign_id row → invalid, fail-closed', () => {
+  assert.deepEqual(
+    classifyOpeningHelloGuardConfig([
+      { key: 'opening_hello_guard_percent', value: '100' },
+      { key: 'opening_hello_guard_campaign_id', value: 'X' },
+      { key: 'opening_hello_guard_campaign_id', value: 'Y' },
+    ]),
+    { percent: 0, campaignId: null }
+  )
+})
+
+test('classifyOpeningHelloGuardConfig: independent จากทุก gate อื่นโดยสิ้นเชิง — มีทั้งหมดในแถวเดียวกันไม่ปนกัน', () => {
+  const rows = [
+    { key: 'legacy_observed_percent', value: '100' },
+    { key: 'legacy_observed_campaign_id', value: 'CAMPAIGN_L2A' },
+    { key: 'legacy_early_tts_percent', value: '50' },
+    { key: 'legacy_early_tts_campaign_id', value: 'CAMPAIGN_L2B' },
+    { key: 'stt_a2_percent', value: '100' },
+    { key: 'stt_a2_campaign_id', value: 'CAMPAIGN_A2' },
+    { key: 'stt_a2_shadow_percent', value: '30' },
+    { key: 'stt_a2_shadow_campaign_id', value: 'CAMPAIGN_A2_SHADOW' },
+    { key: 'opening_hello_guard_percent', value: '10' },
+    { key: 'opening_hello_guard_campaign_id', value: 'CAMPAIGN_OPENING_HELLO' },
+  ]
+  assert.deepEqual(classifyLegacyObservedConfig(rows), { percent: 100, campaignId: 'CAMPAIGN_L2A' })
+  assert.deepEqual(classifyLegacyEarlyTtsConfig(rows), { percent: 50, campaignId: 'CAMPAIGN_L2B' })
+  assert.deepEqual(classifySttA2Config(rows), { percent: 100, campaignId: 'CAMPAIGN_A2' })
+  assert.deepEqual(classifySttA2ShadowConfig(rows), { percent: 30, campaignId: 'CAMPAIGN_A2_SHADOW' })
+  assert.deepEqual(classifyOpeningHelloGuardConfig(rows), { percent: 10, campaignId: 'CAMPAIGN_OPENING_HELLO' })
+})
+
+test('createRolloutConfig().getCurrentOpeningHelloGuardConfig() — fail-closed ทันทีตอน fetch ล้มเหลว ในขณะที่ gate อื่นทุกตัวก็ fail-closed คู่ขนานกัน', async () => {
+  const config = createRolloutConfig({ getRows: async () => { throw new Error('Sheets down') }, refreshIntervalMs: 999999 })
+  const originalError = console.error
+  const originalWarn = console.warn
+  console.error = () => {}
+  console.warn = () => {}
+  try {
+    await config.refresh()
+  } finally {
+    console.error = originalError
+    console.warn = originalWarn
+  }
+  assert.deepEqual(config.getCurrentOpeningHelloGuardConfig(), { percent: 0, campaignId: null })
 })
 
 test('A2.1 Shadow: createRolloutConfig().getCurrentSttA2ShadowConfig() — fail-closed ทันทีตอน fetch ล้มเหลว ในขณะที่ rollout_percent ยัง LKG และ L2a/L2b/A2 ก็ fail-closed คู่ขนานกัน (ห้า policy ทำงานถูกต้องพร้อมกันจาก fetch เดียว)', async () => {

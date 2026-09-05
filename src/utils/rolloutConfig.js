@@ -185,6 +185,41 @@ function classifySttA2ShadowConfig(rows) {
   return { percent, campaignId }
 }
 
+// Opening Hello Guard (BV2-B-adjacent, design locked 2026-09-05) — same fail-closed policy and atomic-snapshot
+// shape as classifyLegacyEarlyTtsConfig()/classifySttA2Config() above, own key names
+// (opening_hello_guard_percent / opening_hello_guard_campaign_id), own cache/log-signature state entirely (see
+// createRolloutConfig() below) — independent kill switch from every other gate. Same "percent>0 requires a
+// valid campaignId" rule. Fail-closed (not last-known-good) because this changes real customer-facing barge-in
+// behavior during the opening greeting, same risk class as L2b's transport change.
+function classifyOpeningHelloGuardConfig(rows) {
+  const percentRows = rows.filter(r => r.key === 'opening_hello_guard_percent')
+  const campaignRows = rows.filter(r => r.key === 'opening_hello_guard_campaign_id')
+
+  let percent = 0
+  if (percentRows.length === 1) {
+    const raw = String(percentRows[0].value ?? '').trim()
+    if (/^\d+$/.test(raw)) {
+      const n = Number(raw)
+      if (n >= 0 && n <= 100) percent = n
+    }
+  }
+
+  let campaignId = null
+  let campaignIdValid = true
+  if (campaignRows.length === 1) {
+    const raw = String(campaignRows[0].value ?? '').trim()
+    campaignId = raw || null
+  } else if (campaignRows.length > 1) {
+    campaignIdValid = false
+  }
+
+  if (percent > 0 && (campaignId == null || !campaignIdValid)) {
+    return { percent: 0, campaignId: null }
+  }
+  if (percent === 0) return { percent: 0, campaignId: null }
+  return { percent, campaignId }
+}
+
 function createRolloutConfig({ getRows = () => sheetsService.getStreamingConfig(), refreshIntervalMs = DEFAULT_REFRESH_INTERVAL_MS } = {}) {
   let cachedPercent = null // null = cold start, ยังไม่เคย fetch สำเร็จเลย
   let lastAttemptAt = null
@@ -200,6 +235,8 @@ function createRolloutConfig({ getRows = () => sheetsService.getStreamingConfig(
   let cachedSttA2Config = { percent: 0, campaignId: null }
   // A2.1 Shadow — cache/policy แยกจากทุก config อื่นโดยสิ้นเชิง รวมถึง A2 เอง (ดู comment ที่ classifySttA2ShadowConfig ด้านบน)
   let cachedSttA2ShadowConfig = { percent: 0, campaignId: null }
+  // Opening Hello Guard — cache/policy แยกจากทุก config อื่นโดยสิ้นเชิง (ดู comment ที่ classifyOpeningHelloGuardConfig ด้านบน)
+  let cachedOpeningHelloGuardConfig = { percent: 0, campaignId: null }
 
   // C6b — log แบบ state-change เท่านั้น ไม่ log ทุกรอบ poll (30s) เพราะจะ spam production logs โดยไม่มีประโยชน์
   // log signature เปลี่ยนเมื่อไหร่ก็ต่อเมื่อผลลัพธ์เปลี่ยนจริง (success→success ค่าเดิม ไม่ log ซ้ำ, error เดิมซ้ำๆ
@@ -242,6 +279,14 @@ function createRolloutConfig({ getRows = () => sheetsService.getStreamingConfig(
   function logOnChangeSttA2Shadow(signature, logFn) {
     if (signature === lastSttA2ShadowLogSignature) return
     lastSttA2ShadowLogSignature = signature
+    logFn()
+  }
+
+  // Opening Hello Guard — signature ของตัวเองอีกชุด แยกจากทุก config อื่น (เหตุผลเดียวกัน)
+  let lastOpeningHelloGuardLogSignature = null
+  function logOnChangeOpeningHelloGuard(signature, logFn) {
+    if (signature === lastOpeningHelloGuardLogSignature) return
+    lastOpeningHelloGuardLogSignature = signature
     logFn()
   }
 
@@ -293,6 +338,14 @@ function createRolloutConfig({ getRows = () => sheetsService.getStreamingConfig(
           `sttA2Shadow:${sttA2ShadowResult.percent}:${sttA2ShadowResult.campaignId}`,
           () => console.log(`[RolloutConfig] stt-a2-shadow config percent=${sttA2ShadowResult.percent} campaignId=${sttA2ShadowResult.campaignId ?? 'null'}`)
         )
+
+        // Opening Hello Guard — เขียนทับ cachedOpeningHelloGuardConfig ทุกรอบเช่นกัน (fail-closed ไม่ใช่ LKG) rows ชุดเดียวกัน ไม่ fetch ซ้ำ
+        const openingHelloGuardResult = classifyOpeningHelloGuardConfig(rows)
+        cachedOpeningHelloGuardConfig = openingHelloGuardResult
+        logOnChangeOpeningHelloGuard(
+          `openingHelloGuard:${openingHelloGuardResult.percent}:${openingHelloGuardResult.campaignId}`,
+          () => console.log(`[RolloutConfig] opening-hello-guard config percent=${openingHelloGuardResult.percent} campaignId=${openingHelloGuardResult.campaignId ?? 'null'}`)
+        )
       } catch (err) {
         // ใช้ last-known-good ต่อไปเฉพาะ rollout_percent ไม่ throw ให้กระทบ caller (ทั้ง background poll และ manual call)
         logOnChange(`failure:${err.message}`, () => console.error(`[RolloutConfig] refresh failed error=${JSON.stringify(err.message)} using_lkg=${cachedPercent ?? 0}`))
@@ -307,6 +360,9 @@ function createRolloutConfig({ getRows = () => sheetsService.getStreamingConfig(
         // A2.1 Shadow — fetch ล้มเหลวเอง ก็ fail-closed เหมือนกัน ไม่ preserve ค่าเดิม
         cachedSttA2ShadowConfig = { percent: 0, campaignId: null }
         logOnChangeSttA2Shadow('sttA2Shadow:fetch_failed', () => console.warn('[RolloutConfig] stt-a2-shadow config fetch failed — fail-closed percent=0'))
+        // Opening Hello Guard — fetch ล้มเหลวเอง ก็ fail-closed เหมือนกัน ไม่ preserve ค่าเดิม
+        cachedOpeningHelloGuardConfig = { percent: 0, campaignId: null }
+        logOnChangeOpeningHelloGuard('openingHelloGuard:fetch_failed', () => console.warn('[RolloutConfig] opening-hello-guard config fetch failed — fail-closed percent=0'))
       } finally {
         refreshInFlight = null
       }
@@ -362,7 +418,13 @@ function createRolloutConfig({ getRows = () => sheetsService.getStreamingConfig(
     return cachedSttA2ShadowConfig
   }
 
-  return { getCurrentRolloutPercent, getCurrentLegacyObservedConfig, getCurrentLegacyEarlyTtsConfig, getCurrentSttA2Config, getCurrentSttA2ShadowConfig, start, stop, refresh }
+  // Opening Hello Guard — atomic snapshot เดียวกัน pattern เป๊ะ แยก state จากทุก config อื่นโดยสิ้นเชิง
+  function getCurrentOpeningHelloGuardConfig() {
+    refreshIfStale()
+    return cachedOpeningHelloGuardConfig
+  }
+
+  return { getCurrentRolloutPercent, getCurrentLegacyObservedConfig, getCurrentLegacyEarlyTtsConfig, getCurrentSttA2Config, getCurrentSttA2ShadowConfig, getCurrentOpeningHelloGuardConfig, start, stop, refresh }
 }
 
-module.exports = { createRolloutConfig, parseRolloutPercent, classifyLegacyObservedConfig, classifyLegacyEarlyTtsConfig, classifySttA2Config, classifySttA2ShadowConfig }
+module.exports = { createRolloutConfig, parseRolloutPercent, classifyLegacyObservedConfig, classifyLegacyEarlyTtsConfig, classifySttA2Config, classifySttA2ShadowConfig, classifyOpeningHelloGuardConfig }

@@ -5,7 +5,7 @@ const { askConversationConditionalStream } = require('../services/conversationAI
 const { synthesizeSpeechStream } = require('../services/tts')
 const healthMonitor = require('../utils/healthMonitor')
 const { createCallState, bumpGeneration, isCurrentGeneration, endCall } = require('../utils/generationGuard')
-const { decideRollout, getLegacyObservedBucket, getLegacyEarlyTtsBucket, getSttA2Bucket, getSttA2ShadowBucket } = require('../utils/rolloutBucket')
+const { decideRollout, getLegacyObservedBucket, getLegacyEarlyTtsBucket, getSttA2Bucket, getSttA2ShadowBucket, getOpeningHelloGuardBucket } = require('../utils/rolloutBucket')
 const { createTurnMetrics, markOnce, computeDerivedMetrics } = require('../utils/turnMetrics')
 const { createAudioContinuity, recordFrameSent, finalizeAudioContinuity, truncateForLog } = require('../utils/audioContinuity')
 const { createTurnState, markTtsPending, markAudioCommitted, markDone, claimFallback } = require('../utils/turnState')
@@ -163,6 +163,26 @@ function classifyAck(rawText) {
   return null
 }
 
+// Opening Hello Guard (BV2-B-adjacent, design locked 2026-09-05, production audit finding 12.8% of all
+// barge-in events, n=64/499) — Thai customers answering a phone call naturally say "ฮัลโหล" without knowing
+// they've reached an AI, which currently trips the SAME 2-signal interim/FINAL barge-in path as a real
+// interruption and cuts the opening greeting off abruptly. This is a NARROW exact-match whitelist (reuses
+// normalizeForClassification — same normalization TIER1/TIER2_ACKS already use, so "ฮัลโหล ครับ"/"ฮัลโหลครับ"
+// collapse to the same key) of greeting-only acknowledgements — NOT a general backchannel/fuzzy classifier.
+// Deliberately does NOT include every STT variant seen in production logs (e.g. transcription artifacts like
+// "ปลาฮัลโหล") — only the 3 forms the audit explicitly confirmed as genuine "answering the phone" utterances.
+// Any text with additional real content (e.g. "ฮัลโหล โทรมาจากไหนครับ") does NOT match this whitelist and falls
+// through to normal barge-in — this function only ever returns a boolean, never gates by itself; the caller
+// (onInterim/onTranscript) decides whether to apply it, gated by BOTH openingGreetingActive AND the
+// openingHelloGuardEnabled rollout flag.
+const OPENING_HELLO_ONLY = new Set(
+  ['ฮัลโหล', 'ฮัลโหลครับ', 'ฮัลโหลค่ะ']
+    .map(normalizeForClassification)
+)
+function isOpeningHelloOnly(rawText) {
+  return OPENING_HELLO_ONLY.has(normalizeForClassification(rawText))
+}
+
 // Lightweight Post-Mark Echo Guard (design locked) — replaces the old "short = suspicious"
 // heuristic (whitespace word-count + char length), which is invalid for Thai: Thai doesn't
 // space-delimit words, so a real, complete short answer like "สะดวกค่ะ" was indistinguishable
@@ -260,7 +280,7 @@ function shouldBlockEndCall(session, aiResponse) {
 // สำหรับเทิร์นเดียวกันนี้ แทนที่จะปล่อยให้ลูกค้าเงียบไปเฉยๆ ไม่ bump generation เพราะนี่คือการกู้ turn เดิม
 // ไม่ใช่ turn ใหม่ — เป็น adapter ระหว่าง legacy transport ([END_CALL] string marker) กับรูปแบบที่ chunked
 // branch ใช้อยู่แล้ว (endCallRequested boolean) ก่อน TTS เสมอ กัน marker หลุดเข้าไปให้ speakFixedText() พูดออกไปจริง
-async function runLegacyFallback({ session, signal, socket, streamSid, voiceId, turnMetrics, turnState, callState, generationId, onAudioSent, onChunkAudioStart }) {
+async function runLegacyFallback({ session, signal, socket, streamSid, voiceId, turnMetrics, turnState, callState, generationId, onAudioSent, onFrameSent, onChunkAudioStart }) {
   let rawText = null
   for await (const chunk of askClaudeStream(session, false, signal)) {
     if (signal.aborted) break
@@ -275,13 +295,13 @@ async function runLegacyFallback({ session, signal, socket, streamSid, voiceId, 
     return { fullText: spokenText, endCallRequested: legacyEndCallRequested, totalSent: 0 }
   }
 
-  const result = await speakFixedText({ text: spokenText, signal, socket, streamSid, voiceId, turnMetrics, turnState, callState, generationId, startingSentCount: 0, onAudioSent, onChunkAudioStart })
+  const result = await speakFixedText({ text: spokenText, signal, socket, streamSid, voiceId, turnMetrics, turnState, callState, generationId, startingSentCount: 0, onAudioSent, onFrameSent, onChunkAudioStart })
   return { fullText: spokenText, endCallRequested: legacyEndCallRequested, totalSent: result.sentCount }
 }
 
 // ใช้ policy เดียวกันไม่ว่า end_call intent จะมาจาก tool call ปกติของ chunked path หรือจาก [END_CALL] marker
 // ที่ normalize มาจาก legacy fallback แล้ว — ทั้งสองทางเข้าที่นี่ในรูป endCallRequested boolean เดียวกันเสมอ
-async function applyChunkedEndCallGuard({ endCallRequested, fullText, totalSent, currentSession, signal, socket, streamSid, voiceId, turnMetrics, turnState, callState, generationId, onChunkAudioStart }) {
+async function applyChunkedEndCallGuard({ endCallRequested, fullText, totalSent, currentSession, signal, socket, streamSid, voiceId, turnMetrics, turnState, callState, generationId, onFrameSent, onChunkAudioStart }) {
   if (!endCallRequested || !shouldBlockEndCall(currentSession, fullText)) {
     return { fullText, endCallRequested, totalSent }
   }
@@ -289,7 +309,7 @@ async function applyChunkedEndCallGuard({ endCallRequested, fullText, totalSent,
   const followUp = 'มีอะไรสอบถามเพิ่มเติมไหมคะ'
   let newTotalSent = totalSent
   try {
-    const followUpResult = await speakFixedText({ text: followUp, signal, socket, streamSid, voiceId, turnMetrics, turnState, callState, generationId, startingSentCount: totalSent, onChunkAudioStart })
+    const followUpResult = await speakFixedText({ text: followUp, signal, socket, streamSid, voiceId, turnMetrics, turnState, callState, generationId, startingSentCount: totalSent, onFrameSent, onChunkAudioStart })
     newTotalSent += followUpResult.sentCount
   } catch (err) {
     if (err.code !== 'ERR_CANCELED' && err.name !== 'CanceledError') {
@@ -417,6 +437,13 @@ function registerWebSocket(fastify) {
     let pendingTranscript = null  // C6c follow-up: barge-in ที่มาถึงตอนเทิร์นเดิมยังไม่ปล่อย sttProcessing — ช่องเดียว, latest-wins (ดูหมายเหตุที่ processTranscript())
     let bargeInPendingFinal = false  // C6c follow-up (STT listening): true หลัง interim trigger bargeIn() ไปแล้ว — บอก onTranscript ว่า final ตัวถัดไปคือประโยคที่พูดแทรกจริง (ดูหมายเหตุที่ onTranscript ด้านล่าง)
     let activePipelineId = 0
+    // Opening Hello Guard — pipelineId assigned to THIS call's opening greeting (set once in playGreeting()).
+    // The guard only ever applies while activePipelineId still equals this AND isSpeaking is still true — no
+    // separate "permanently disabled" flag is needed: once the greeting truly ends (mark received → isSpeaking
+    // false), a real interruption fires (bargeIn() bumps to a new pipeline), or the fallback-unlock timer fires
+    // (isSpeaking false), the equality/isSpeaking check itself goes false and never becomes true again for this
+    // call (pipelineId only ever increases) — see isOpeningGreetingPlaying() below.
+    let openingGreetingPipelineId = null
     let pendingShortAck = null       // Design B: { text, pipelineId, capturedAt } — Tier2 ack ที่ deferred ไว้ระหว่าง AI พูด รอ owned mark/no-audio completion ของ pipeline เดียวกัน
     let processTranscriptDispatch = null  // Design B: ref ไปยัง processTranscript (ประกาศใน start block) ให้ mark handler/no-audio sites อื่นที่อยู่นอก scope นั้นเรียกได้ โดยไม่ต้อง hoist ฟังก์ชันใหญ่ทั้งก้อน
     let prewarmPromise = null    // pre-warmed Claude response Promise<string|null>
@@ -474,6 +501,16 @@ function registerWebSocket(fastify) {
     let sttA2ShadowBucket = null
     let sttA2ShadowPercentAtStart = null
     let sttA2ShadowCampaignMatched = null
+
+    // Opening Hello Guard (design locked 2026-09-05) — false/null safe-by-default before 'start', same pattern
+    // as every other gate above. Independent kill switch (own Sheet keys/bucket namespace) — deliberately NOT
+    // gated on any of chunked/legacyObserved/legacyEarlyTts/sttA2, since this guard applies during the OPENING
+    // GREETING only, a playback phase that happens before any of those conversation-turn routing decisions are
+    // even relevant to the customer's experience.
+    let openingHelloGuardEnabled = false
+    let openingHelloGuardBucket = null
+    let openingHelloGuardPercentAtStart = null
+    let openingHelloGuardCampaignMatched = null
 
     console.log(`[WS] Connected callSid=${callSid}`)
 
@@ -893,7 +930,9 @@ function registerWebSocket(fastify) {
     //
     // Events: CANDIDATE_OPENED | REGRESSION | CANDIDATE_RESET | ECHO_SUPPRESSED (all interim-only) | CONFIRMED
     // (emitted from inside bargeIn() itself — covers both FINAL_TIER1/FINAL and INTERIM_CONFIRM trigger
-    // paths, since both already funnel through bargeIn() with the same continuityInfo shape)
+    // paths, since both already funnel through bargeIn() with the same continuityInfo shape) |
+    // SUPPRESS_OPENING_HELLO (Opening Hello Guard — emitted from onInterim/onTranscript BEFORE bargeIn() would
+    // have been called, at both suppression points; see isOpeningGreetingPlaying()/isOpeningHelloOnly() below)
     const emitBargeDiag = (event, fields) => {
       try {
         console.log(`[BARGE_DIAG] ${JSON.stringify({
@@ -906,6 +945,15 @@ function registerWebSocket(fastify) {
       } catch (e) {
         console.error('[BARGE_DIAG] emit failed (non-fatal, ignored):', e.message)
       }
+    }
+
+    // Opening Hello Guard — true only while the CURRENTLY active pipeline is still the opening greeting's own
+    // pipeline AND it's still actually speaking. Self-resetting by construction (see openingGreetingPipelineId's
+    // own comment above): no separate lifecycle flag needed. Reused identically by both the onInterim
+    // (2-signal candidate) and onTranscript (FINAL) suppression points below, so the two paths can never drift
+    // out of sync on "is this even the opening greeting right now."
+    function isOpeningGreetingPlaying() {
+      return isSpeaking && openingGreetingPipelineId != null && activePipelineId === openingGreetingPipelineId
     }
 
     function bargeIn(continuityInfo) {
@@ -1080,7 +1128,19 @@ function registerWebSocket(fastify) {
         sttA2ShadowPercentAtStart = sttA2ShadowConfig.percent
         sttA2Shadow = sttA2 === true && sttA2ShadowCampaignMatched && sttA2ShadowBucket < sttA2ShadowConfig.percent
 
-        console.log(`[Rollout] callSid=${callSid} bucket=${rollout.bucket} percent=${rollout.percentAtStart} chunked=${rollout.useChunkedStreaming} legacyObserved=${legacyObserved} legacyObservedBucket=${legacyObservedBucket} legacyObservedPercent=${observedConfig.percent} campaignMatched=${legacyObservedCampaignMatched} legacyEarlyTts=${legacyEarlyTts} legacyEarlyTtsBucket=${legacyEarlyTtsBucket} legacyEarlyTtsPercent=${earlyTtsConfig.percent} earlyTtsCampaignMatched=${legacyEarlyTtsCampaignMatched} sttA2=${sttA2} sttA2Bucket=${sttA2Bucket} sttA2Percent=${sttA2Config.percent} sttA2CampaignMatched=${sttA2CampaignMatched} sttA2Shadow=${sttA2Shadow} sttA2ShadowBucket=${sttA2ShadowBucket} sttA2ShadowPercent=${sttA2ShadowConfig.percent} sttA2ShadowCampaignMatched=${sttA2ShadowCampaignMatched}`)
+        // Opening Hello Guard (design locked 2026-09-05) — independent gate, own bucket namespace/Sheet keys,
+        // wildcard-campaign support via isCampaignMatched() (same as legacyEarlyTts/sttA2, unlike the stricter
+        // exact-match legacyObserved/sttA2Shadow) so a rollout can start pinned to one campaignId and later
+        // widen to '*' without a code change. Deliberately NOT chained with chunked/legacyObserved/
+        // legacyEarlyTts/sttA2/sttA2Shadow — this guard applies during the opening greeting, before any of
+        // those turn-routing decisions matter.
+        const openingHelloGuardConfig = rolloutConfig.getCurrentOpeningHelloGuardConfig()
+        openingHelloGuardBucket = getOpeningHelloGuardBucket(callSid)
+        openingHelloGuardCampaignMatched = isCampaignMatched(openingHelloGuardConfig.campaignId, session.campaign?.id)
+        openingHelloGuardPercentAtStart = openingHelloGuardConfig.percent
+        openingHelloGuardEnabled = openingHelloGuardCampaignMatched && openingHelloGuardBucket < openingHelloGuardConfig.percent
+
+        console.log(`[Rollout] callSid=${callSid} bucket=${rollout.bucket} percent=${rollout.percentAtStart} chunked=${rollout.useChunkedStreaming} legacyObserved=${legacyObserved} legacyObservedBucket=${legacyObservedBucket} legacyObservedPercent=${observedConfig.percent} campaignMatched=${legacyObservedCampaignMatched} legacyEarlyTts=${legacyEarlyTts} legacyEarlyTtsBucket=${legacyEarlyTtsBucket} legacyEarlyTtsPercent=${earlyTtsConfig.percent} earlyTtsCampaignMatched=${legacyEarlyTtsCampaignMatched} sttA2=${sttA2} sttA2Bucket=${sttA2Bucket} sttA2Percent=${sttA2Config.percent} sttA2CampaignMatched=${sttA2CampaignMatched} sttA2Shadow=${sttA2Shadow} sttA2ShadowBucket=${sttA2ShadowBucket} sttA2ShadowPercent=${sttA2ShadowConfig.percent} sttA2ShadowCampaignMatched=${sttA2ShadowCampaignMatched} openingHelloGuard=${openingHelloGuardEnabled} openingHelloGuardBucket=${openingHelloGuardBucket} openingHelloGuardPercent=${openingHelloGuardConfig.percent} openingHelloGuardCampaignMatched=${openingHelloGuardCampaignMatched}`)
 
         // Dual Conversation Provider A/B (design locked) — logged unconditionally, every call, so a silent
         // provider mismatch (UI says Gemini, call actually ran Claude) is visible from this ONE line without
@@ -1282,6 +1342,7 @@ function registerWebSocket(fastify) {
                       producer: mySpecHandle.producer, signal, socket, streamSid,
                       voiceId: currentSession.campaign.voice_id, turnMetrics, turnState, callState, generationId,
                       onControl: (control) => { if (control?.type === 'end_call') endCallRequested = true },
+                      onFrameSent: (chunk) => recordFrameSent(audioContinuity, chunk),
                       onChunkAudioStart: (text) => noteActiveSpokenChunk(pipelineId, text),
                     })
                     attempt = { outcome: 'success', result }
@@ -1303,6 +1364,7 @@ function registerWebSocket(fastify) {
                           onControl: (control) => { if (control?.type === 'end_call') endCallRequested = true },
                           onFirstTtsRequest: () => armWatchdog(TTS_FIRST_AUDIO_TIMEOUT_MS, 'TTS_FIRST_AUDIO_TIMEOUT'),
                           onFirstTtsAudio: () => armWatchdog(),
+                          onFrameSent: (chunk) => recordFrameSent(audioContinuity, chunk),
                           onChunkAudioStart: (text) => noteActiveSpokenChunk(pipelineId, text),
                         })
                       },
@@ -1353,6 +1415,7 @@ function registerWebSocket(fastify) {
                       onFirstChunk: () => armWatchdog(),
                       onFirstTtsRequest: () => armWatchdog(TTS_FIRST_AUDIO_TIMEOUT_MS, 'TTS_FIRST_AUDIO_TIMEOUT'),
                       onFirstTtsAudio: () => armWatchdog(),
+                      onFrameSent: (chunk) => recordFrameSent(audioContinuity, chunk),
                       onChunkAudioStart: (text) => noteActiveSpokenChunk(pipelineId, text),
                     }),
                   })
@@ -1370,6 +1433,7 @@ function registerWebSocket(fastify) {
                 const guarded = await applyChunkedEndCallGuard({
                   endCallRequested, fullText, totalSent, currentSession, signal, socket, streamSid,
                   voiceId: currentSession.campaign.voice_id, turnMetrics, turnState, callState, generationId,
+                  onFrameSent: (chunk) => recordFrameSent(audioContinuity, chunk),
                   onChunkAudioStart: (text) => noteActiveSpokenChunk(pipelineId, text),
                 })
                 fullText = guarded.fullText
@@ -1424,6 +1488,7 @@ function registerWebSocket(fastify) {
                         fallbackProgress.totalSent++
                         armWatchdog(FALLBACK_IDLE_TIMEOUT_MS, 'FALLBACK_PARTIAL_TIMEOUT')
                       },
+                      onFrameSent: (chunk) => recordFrameSent(audioContinuity, chunk),
                       onChunkAudioStart: (text) => noteActiveSpokenChunk(pipelineId, text),
                     }),
                   })
@@ -1438,6 +1503,7 @@ function registerWebSocket(fastify) {
                         endCallRequested: fb.endCallRequested, fullText: fb.fullText, totalSent: fb.totalSent,
                         currentSession, signal, socket, streamSid, voiceId: currentSession.campaign.voice_id,
                         turnMetrics, turnState, callState, generationId,
+                        onFrameSent: (chunk) => recordFrameSent(audioContinuity, chunk),
                         onChunkAudioStart: (text) => noteActiveSpokenChunk(pipelineId, text),
                       })
                       fullText = guarded.fullText
@@ -1481,6 +1547,7 @@ function registerWebSocket(fastify) {
                         text: LEGACY_RECOVERY_PHRASE, signal, socket, streamSid,
                         voiceId: currentSession.campaign.voice_id, turnMetrics, turnState, callState, generationId,
                         startingSentCount: totalSent,
+                        onFrameSent: (chunk) => recordFrameSent(audioContinuity, chunk),
                         onChunkAudioStart: (t) => noteActiveSpokenChunk(pipelineId, t),
                       })
                       totalSent += recoveryResult.sentCount
@@ -1493,6 +1560,7 @@ function registerWebSocket(fastify) {
                         text: LEGACY_RECOVERY_PHRASE, signal, socket, streamSid,
                         voiceId: currentSession.campaign.voice_id, turnMetrics, turnState, callState, generationId,
                         startingSentCount: totalSent,
+                        onFrameSent: (chunk) => recordFrameSent(audioContinuity, chunk),
                         onChunkAudioStart: (t) => noteActiveSpokenChunk(pipelineId, t),
                       })
                       totalSent += recoveryResult.sentCount
@@ -1769,6 +1837,7 @@ function registerWebSocket(fastify) {
                           voiceId: currentSession.campaign.voice_id,
                           turnMetrics, turnState, callState, generationId,
                           startingSentCount: totalSent,
+                          onFrameSent: (frame) => recordFrameSent(audioContinuity, frame),
                           onChunkAudioStart: (t) => noteActiveSpokenChunk(pipelineId, t),
                         })
                         inFlightTtsPromise = ttsPromise
@@ -1833,6 +1902,7 @@ function registerWebSocket(fastify) {
                     text: LEGACY_RECOVERY_PHRASE, signal, socket, streamSid,
                     voiceId: currentSession.campaign.voice_id, turnMetrics, turnState, callState, generationId,
                     startingSentCount: totalSent,
+                    onFrameSent: (chunk) => recordFrameSent(audioContinuity, chunk),
                     onChunkAudioStart: (t) => noteActiveSpokenChunk(pipelineId, t),
                   })
                   totalSent += recoveryResult.sentCount
@@ -1970,6 +2040,7 @@ function registerWebSocket(fastify) {
                   text: LEGACY_RECOVERY_PHRASE, signal, socket, streamSid,
                   voiceId: currentSession.campaign.voice_id, turnMetrics, turnState, callState, generationId,
                   startingSentCount: totalSent,
+                  onFrameSent: (chunk) => recordFrameSent(audioContinuity, chunk),
                   onChunkAudioStart: (t) => noteActiveSpokenChunk(pipelineId, t),
                 })
                 totalSent += recoveryResult.sentCount
@@ -2035,6 +2106,7 @@ function registerWebSocket(fastify) {
                   text: LEGACY_RECOVERY_PHRASE, signal, socket, streamSid,
                   voiceId: currentSession.campaign.voice_id, turnMetrics, turnState, callState, generationId,
                   startingSentCount: totalSent,
+                  onFrameSent: (chunk) => recordFrameSent(audioContinuity, chunk),
                   onChunkAudioStart: (t) => noteActiveSpokenChunk(pipelineId, t),
                 })
                 totalSent += recoveryResult.sentCount
@@ -2178,7 +2250,7 @@ function registerWebSocket(fastify) {
         // "diagnostic failure must never affect call flow" — ห่อ try/catch ทั้งก้อน ไม่มีทางโยน error ออกไปกระทบสายจริง
         //
         // Enum: disposition = DELIVERED | DROPPED | DEFERRED, reason = null | POST_MARK_ECHO |
-        // ACTIVE_PLAYBACK_ECHO | TIER2_ACK | PENDING_TRANSCRIPT | BUSY
+        // ACTIVE_PLAYBACK_ECHO | TIER2_ACK | PENDING_TRANSCRIPT | BUSY | OPENING_HELLO_GUARD
         // (SHORT_FRAGMENT_ECHO retired by Active-Playback Speech Guard R1 — replaced by ACTIVE_PLAYBACK_ECHO,
         // which requires echo evidence instead of a whitespace-invalid-for-Thai length heuristic)
         // (BARGE_IN_COOLDOWN retired by Final Cooldown Preservation R1.1 — a FINAL arriving during cooldown
@@ -2328,6 +2400,26 @@ function registerWebSocket(fastify) {
               emitSttDiag(sttMeta, 'DROPPED', 'ACTIVE_PLAYBACK_ECHO', transcript)
               return
             }
+            // Opening Hello Guard (design locked 2026-09-05) — MUST run before bargeIn() (or any of its
+            // destructive side effects: bumpGeneration/abort/Twilio clear) per design: suppressing a false
+            // barge means never entering the cancellation flow for it at all, not partially executing it and
+            // deciding afterward. Only a greeting-only utterance (isOpeningHelloOnly) during the OPENING
+            // GREETING itself (isOpeningGreetingPlaying) is suppressed — meaningful speech containing the same
+            // word (e.g. "ฮัลโหล โทรมาจากไหนครับ") does not match the whitelist at all and falls straight
+            // through to bargeIn() below, unaffected.
+            if (openingHelloGuardEnabled && isOpeningGreetingPlaying() && isOpeningHelloOnly(transcript)) {
+              console.log(`[STT] Opening hello guard — greeting-only utterance during opening, not a real interruption: "${transcript}"`)
+              emitSttDiag(sttMeta, 'DROPPED', 'OPENING_HELLO_GUARD', transcript)
+              emitBargeDiag('SUPPRESS_OPENING_HELLO', {
+                openingGreetingActive: true,
+                openingHelloGuardEnabled: true,
+                openingHelloMatched: true,
+                openingHelloAction: 'SUPPRESS_OPENING_HELLO',
+                bargeTrigger: ackTier === 'TIER1' ? 'FINAL_TIER1' : 'FINAL',
+                candidateConfirmText: truncateForLog(transcript),
+              })
+              return
+            }
             bargeIn({
               bargeTrigger: ackTier === 'TIER1' ? 'FINAL_TIER1' : 'FINAL',
               candidateConfirmAt: performance.now(),
@@ -2457,6 +2549,28 @@ function registerWebSocket(fastify) {
             const continuityCandidateFirstText = truncateForLog(bargeCandidate.previousText)
             const continuityCandidateConfirmText = truncateForLog(normalized)
             bargeCandidate = null
+            // Opening Hello Guard (design locked 2026-09-05) — same principle as the FINAL-path check: must run
+            // BEFORE bargeIn() (before bumpGeneration/abort/clear), so a suppressed candidate never partially
+            // enters the interruption flow. Interim/final symmetry: this uses the exact same
+            // isOpeningGreetingPlaying()/isOpeningHelloOnly() as the FINAL path above, so "ฮัลโหลครับ" is
+            // suppressed identically regardless of which path confirms it first. bargeCandidate is already
+            // cleared above (matches bargeIn()'s own reset) so a fresh candidate can still open on the next
+            // interim if the customer keeps talking — bargeInPendingFinal/bargeInCooldown are deliberately NOT
+            // set here (nothing was actually interrupted, so the FINAL path must not treat the upcoming final
+            // as "the interrupting sentence" — it gets its own independent opening-hello check above instead).
+            if (openingHelloGuardEnabled && isOpeningGreetingPlaying() && isOpeningHelloOnly(normalized)) {
+              emitBargeDiag('SUPPRESS_OPENING_HELLO', {
+                openingGreetingActive: true,
+                openingHelloGuardEnabled: true,
+                openingHelloMatched: true,
+                openingHelloAction: 'SUPPRESS_OPENING_HELLO',
+                bargeTrigger: 'INTERIM_CONFIRM',
+                candidateFirstAt: continuityCandidateFirstAt,
+                candidateFirstText: continuityCandidateFirstText,
+                candidateConfirmText: continuityCandidateConfirmText,
+              })
+              return
+            }
             bargeIn({
               bargeTrigger: 'INTERIM_CONFIRM',
               candidateFirstAt: continuityCandidateFirstAt,
@@ -2503,6 +2617,7 @@ function registerWebSocket(fastify) {
           if (!session || !callActive) return
           isSpeaking = true
           const pipelineId = ++activePipelineId
+          openingGreetingPipelineId = pipelineId // Opening Hello Guard — tag this pipeline as the opening greeting's own
           try {
             if (session.greetingChunks) {
               // ใช้ audio ที่ pre-generate ไว้แล้ว — ส่งได้ทันที

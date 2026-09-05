@@ -80,7 +80,7 @@ const { isCurrentGeneration } = require('../utils/generationGuard')
 // moment/text as the source of truth for "AI audio the customer could actually be hearing/echoing right
 // now" (see activeSpokenRef in audioStream.js) — never the Claude-generated text alone, which may not have
 // reached TTS/Twilio yet.
-async function synthesizeAndSend({ text, signal, socket, streamSid, voiceId, turnMetrics, turnState, isCurrent, startingSentCount, onFirstAudioSent, onAudioSent, onChunkAudioStart, onFirstTtsRequest, onFirstTtsAudio, previousText, onChunkTelemetry }) {
+async function synthesizeAndSend({ text, signal, socket, streamSid, voiceId, turnMetrics, turnState, isCurrent, startingSentCount, onFirstAudioSent, onAudioSent, onFrameSent, onChunkAudioStart, onFirstTtsRequest, onFirstTtsAudio, previousText, onChunkTelemetry }) {
   if (!isCurrent() || signal?.aborted) return 0
 
   const isFirstTtsRequest = turnMetrics.t5 == null
@@ -125,6 +125,12 @@ async function synthesizeAndSend({ text, signal, socket, streamSid, voiceId, tur
       markAudioCommitted(turnState) // ต้องมาก่อน onAudioSent เสมอ — commit คือ source of truth ที่ caller (เช่น fallback's idle watchdog) ใช้ตัดสินใจ ไม่ใช่แค่ "ส่งไปแล้ว"
       if (startingSentCount + sentCount === 0) onFirstAudioSent?.()
       onAudioSent?.() // ทุกก้อน (ไม่ใช่ first-only เหมือน onFirstAudioSent) — granularity เดียวกับ sentCount/totalSent ที่ caller ใช้อยู่แล้ว ไม่ใช่ raw ElevenLabs byte frame
+      // Track A (AudioContinuity wiring fix) — separate from onAudioSent above (that one drives watchdog
+      // rearm at its one call site and takes no payload) so audioContinuity.js's recordFrameSent(ac, buffer)
+      // gets the actual sent buffer for bytesSent/frame-gap tracking, without overloading onAudioSent's
+      // existing no-arg contract. Fires at the exact same point (post guard, post socket.send()) — synchronous,
+      // no network/storage/await, same cost class as the marks around it.
+      onFrameSent?.(audioChunk)
       sentCount++
     }
   } finally {
@@ -143,9 +149,9 @@ async function synthesizeAndSend({ text, signal, socket, streamSid, voiceId, tur
 //
 // หมายเหตุ: ไม่รับ onFirstTtsRequest/onFirstTtsAudio ตอนนี้ — Watchdog C ยังไม่ครอบคลุมการเรียกผ่านทางนี้
 // (follow-up หลัง blocked end_call, หรือ TTS ของ legacy fallback ใน audioStream.js) เป็น gap ที่รู้ไว้ก่อน
-async function speakFixedText({ text, signal, socket, streamSid, voiceId, turnMetrics, turnState, callState, generationId, onFirstAudioSent, onAudioSent, onChunkAudioStart, startingSentCount = 0 }) {
+async function speakFixedText({ text, signal, socket, streamSid, voiceId, turnMetrics, turnState, callState, generationId, onFirstAudioSent, onAudioSent, onFrameSent, onChunkAudioStart, startingSentCount = 0 }) {
   const isCurrent = () => isCurrentGeneration(callState, generationId)
-  const sentCount = await synthesizeAndSend({ text, signal, socket, streamSid, voiceId, turnMetrics, turnState, isCurrent, startingSentCount, onFirstAudioSent, onAudioSent, onChunkAudioStart })
+  const sentCount = await synthesizeAndSend({ text, signal, socket, streamSid, voiceId, turnMetrics, turnState, isCurrent, startingSentCount, onFirstAudioSent, onAudioSent, onFrameSent, onChunkAudioStart })
   return { sentCount }
 }
 
@@ -331,7 +337,7 @@ function createChunkedProducer({ session, signal, getIsValid = () => true }) {
 // architecture ซึ่งเกินสโคปของ incident นี้) — flip กลับเป็น true ได้ทันทีเมื่อยืนยัน root cause แล้วแก้ต้นตอจริง
 const ENABLE_PREVIOUS_TEXT_CONTINUITY = false
 
-async function adoptChunkedProducer({ producer, signal, socket, streamSid, voiceId, turnMetrics, turnState, callState, generationId, onControl, onFirstAudioSent, onAudioSent, onChunkAudioStart, onFirstTtsRequest, onFirstTtsAudio }) {
+async function adoptChunkedProducer({ producer, signal, socket, streamSid, voiceId, turnMetrics, turnState, callState, generationId, onControl, onFirstAudioSent, onAudioSent, onFrameSent, onChunkAudioStart, onFirstTtsRequest, onFirstTtsAudio }) {
   const isCurrent = () => isCurrentGeneration(callState, generationId)
   producer.attachForwarder(control => { if (control?.type === 'end_call') onControl?.(control) })
 
@@ -357,7 +363,7 @@ async function adoptChunkedProducer({ producer, signal, socket, streamSid, voice
       const myPreviousLastSentAt = previousLastSentAt
       const sent = await synthesizeAndSend({
         text: chunk, signal, socket, streamSid, voiceId, turnMetrics, turnState, isCurrent,
-        startingSentCount: totalSent, onFirstAudioSent, onAudioSent, onChunkAudioStart, onFirstTtsRequest, onFirstTtsAudio,
+        startingSentCount: totalSent, onFirstAudioSent, onAudioSent, onFrameSent, onChunkAudioStart, onFirstTtsRequest, onFirstTtsAudio,
         previousText: ENABLE_PREVIOUS_TEXT_CONTINUITY ? previousChunkText : null,
         onChunkTelemetry: (telemetry) => {
           console.log('[ChunkMetrics]', JSON.stringify({
@@ -408,14 +414,14 @@ async function adoptChunkedProducer({ producer, signal, socket, streamSid, voice
 // เดิมทั้งชุดต้องผ่านโดยไม่แก้แม้แต่บรรทัดเดียว) เป็นแค่ createChunkedProducer + adoptChunkedProducer ผูกกันทันที
 // ด้วย generation guard จริง — markOnce(t3/t4) ย้ายมาไว้ตรงนี้ (แทนที่จะอยู่ใน producer loop ตรงๆ แบบเดิม)
 // เพราะ producer ที่ decouple ออกมาไม่รู้จัก turnMetrics แล้ว
-async function runChunkedTurn({ session, signal, socket, streamSid, voiceId, turnMetrics, turnState, callState, generationId, onControl, onFirstAudioSent, onAudioSent, onChunkAudioStart, onFirstDelta, onFirstChunk, onFirstTtsRequest, onFirstTtsAudio }) {
+async function runChunkedTurn({ session, signal, socket, streamSid, voiceId, turnMetrics, turnState, callState, generationId, onControl, onFirstAudioSent, onAudioSent, onFrameSent, onChunkAudioStart, onFirstDelta, onFirstChunk, onFirstTtsRequest, onFirstTtsAudio }) {
   const producer = createChunkedProducer({
     session, signal,
     getIsValid: () => isCurrentGeneration(callState, generationId),
   })
   producer.onFirstDelta(() => { markOnce(turnMetrics, 't3'); onFirstDelta?.() })
   producer.onFirstChunk(() => { markOnce(turnMetrics, 't4'); onFirstChunk?.() })
-  return adoptChunkedProducer({ producer, signal, socket, streamSid, voiceId, turnMetrics, turnState, callState, generationId, onControl, onFirstAudioSent, onAudioSent, onChunkAudioStart, onFirstTtsRequest, onFirstTtsAudio })
+  return adoptChunkedProducer({ producer, signal, socket, streamSid, voiceId, turnMetrics, turnState, callState, generationId, onControl, onFirstAudioSent, onAudioSent, onFrameSent, onChunkAudioStart, onFirstTtsRequest, onFirstTtsAudio })
 }
 
 module.exports = { runChunkedTurn, speakFixedText, createChunkedProducer, adoptChunkedProducer }

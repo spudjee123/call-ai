@@ -1,6 +1,6 @@
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
-const { getRolloutBucket, decideRollout, getLegacyObservedBucket, getLegacyEarlyTtsBucket, getSttA2Bucket, getSttA2ShadowBucket } = require('../src/utils/rolloutBucket')
+const { getRolloutBucket, decideRollout, getLegacyObservedBucket, getLegacyEarlyTtsBucket, getSttA2Bucket, getSttA2ShadowBucket, getOpeningHelloGuardBucket } = require('../src/utils/rolloutBucket')
 
 test('same callSid → bucket เดิมเสมอ ไม่ว่าจะเรียกกี่ครั้ง', () => {
   const a = getRolloutBucket('CA1234567890')
@@ -202,4 +202,38 @@ test('A2.1 Shadow: independent namespace จากทุกตัวเดิม
   const a2Buckets = samples.map(getSttA2Bucket)
   const allIdenticalToA2 = samples.filter((_, i) => shadowBuckets[i] === a2Buckets[i]).length
   assert.ok(allIdenticalToA2 < samples.length, 'ไม่ควรเห็น shadow bucket ชนกับ A2 bucket ทุกตัวอย่าง')
+})
+
+// ---------------------------------------------------------------------------
+// Opening Hello Guard (Track B, design locked 2026-09-05) — getOpeningHelloGuardBucket()
+// ---------------------------------------------------------------------------
+
+test('Opening Hello Guard: getOpeningHelloGuardBucket deterministic + อยู่ในช่วง 0-99', () => {
+  const a = getOpeningHelloGuardBucket('CA_OPEN_1')
+  const b = getOpeningHelloGuardBucket('CA_OPEN_1')
+  assert.equal(a, b)
+  assert.ok(a >= 0 && a <= 99)
+})
+
+test('Opening Hello Guard: fixed known fixtures — hash namespace "opening-hello-guard:" ให้ค่าคงที่ตามที่คำนวณไว้ล่วงหน้า', () => {
+  assert.equal(getOpeningHelloGuardBucket('CA1'), 7)
+  assert.equal(getOpeningHelloGuardBucket('CA2'), 77)
+  assert.equal(getOpeningHelloGuardBucket('CA3'), 93)
+})
+
+test('Opening Hello Guard: getRolloutBucket()/getLegacyObservedBucket()/getLegacyEarlyTtsBucket()/getSttA2Bucket()/getSttA2ShadowBucket() เดิมต้องไม่ถูกกระทบเลย — fixture เดิมยังได้ค่าเดิมเป๊ะ', () => {
+  assert.equal(getRolloutBucket('CA1'), 8)
+  assert.equal(getLegacyObservedBucket('CA1'), 14)
+  assert.equal(getLegacyEarlyTtsBucket('CA1'), 90)
+  assert.equal(getSttA2Bucket('CA1'), 93)
+  assert.equal(getSttA2ShadowBucket('CA1'), 38)
+})
+
+test('Opening Hello Guard: independent namespace จากทุกตัวเดิม — bucket ของ callSid เดียวกันไม่ผูกกัน (ห้าม assert ว่าต้องต่างกันเสมอ — ชนกันได้บังเอิญ)', () => {
+  const samples = ['CA1', 'CA2', 'CA3', 'CA1234567890', 'CA160', 'CA22']
+  const openingBuckets = samples.map(getOpeningHelloGuardBucket)
+  assert.deepEqual(openingBuckets, [7, 77, 93, 33, 0, 57])
+  const shadowBuckets = samples.map(getSttA2ShadowBucket)
+  const allIdenticalToShadow = samples.filter((_, i) => openingBuckets[i] === shadowBuckets[i]).length
+  assert.ok(allIdenticalToShadow < samples.length, 'ไม่ควรเห็น opening-hello-guard bucket ชนกับ shadow bucket ทุกตัวอย่าง')
 })
